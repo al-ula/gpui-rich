@@ -1,0 +1,25 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rich-model",
+    "crates/rich-layout",
+    "crates/rich-gpui",
+    "examples/docs_viewer",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0 OR MIT"
+
+[workspace.dependencies]
+gpui = "0.2.2"
+serde = { version = "1", features = ["derive", "rc"] }
+serde_json = "1"
+smallvec = { version = "1", features = ["serde"] }
+unicode-linebreak = "0.1"
+unicode-segmentation = "1"
+
+rich-model = { path = "crates/rich-model" }
+rich-layout = { path = "crates/rich-layout" }
+rich-gpui = { path = "crates/rich-gpui" }

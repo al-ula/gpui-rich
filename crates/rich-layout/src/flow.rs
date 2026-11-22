@@ -1,0 +1,899 @@
+use crate::block::{BlockLayout, LayoutCache, default_list_marker};
+use crate::geometry::{Point, Rect, pt_to_px};
+use crate::line::HitResult;
+use crate::shaper::{GlyphBackend, TextShaper};
+use rich_model::{
+    Affinity, BlockId, BlockKind, BlockNode, BlockWidth, DocPos, Document, DocumentLayoutConfig,
+    DocumentSelection, HorizontalLayout, ListId, PathSegment,
+};
+use std::collections::HashMap;
+use std::sync::Arc;
+
+/// Fenwick tree (Binary Indexed Tree) storing per-block vertical slot heights.
+/// Provides `O(log N)` prefix sum (`y_of`), `O(log N)` height updates, and `O(log N)` `index_at_y`.
+#[derive(Clone, Debug, Default)]
+pub struct HeightIndex {
+    slots: Vec<f32>,
+    tree: Vec<f32>,
+}
+
+impl HeightIndex {
+    pub fn new(len: usize) -> Self {
+        Self {
+            slots: vec![0.0; len],
+            tree: vec![0.0; len + 1],
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.slots.is_empty()
+    }
+
+    pub fn slot(&self, idx: usize) -> f32 {
+        self.slots[idx]
+    }
+
+    pub fn set_slot(&mut self, idx: usize, new_val: f32) {
+        let clamped = new_val.max(0.0);
+        let delta = clamped - self.slots[idx];
+        if delta.abs() < 1e-5 {
+            return;
+        }
+        self.slots[idx] = clamped;
+        let mut i = idx + 1;
+        while i < self.tree.len() {
+            self.tree[i] += delta;
+            i += i & i.wrapping_neg();
+        }
+    }
+
+    /// Returns the sum of slots `0..count` (the Y offset of block `count`).
+    pub fn prefix_sum(&self, count: usize) -> f32 {
+        let mut i = count.min(self.slots.len());
+        let mut sum = 0.0f32;
+        while i > 0 {
+            sum += self.tree[i];
+            i -= i & i.wrapping_neg();
+        }
+        sum
+    }
+
+    pub fn total_height(&self) -> f32 {
+        self.prefix_sum(self.slots.len())
+    }
+
+    /// Returns the smallest index `idx` such that `prefix_sum(idx + 1) > y` (or `len - 1`).
+    pub fn index_at_y(&self, y: f32) -> usize {
+        if self.slots.is_empty() || y <= 0.0 {
+            return 0;
+        }
+        let n = self.slots.len();
+        let mut idx = 0usize;
+        let mut acc = 0.0f32;
+        let mut bit = 1usize << (usize::BITS - 1 - n.leading_zeros());
+        while bit > 0 {
+            let next = idx + bit;
+            if next <= n && acc + self.tree[next] <= y {
+                idx = next;
+                acc += self.tree[next];
+            }
+            bit >>= 1;
+        }
+        idx.min(n - 1)
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ScrollAnchor {
+    pub block_id: BlockId,
+    pub local_y_offset: f32,
+}
+
+#[derive(Clone, Debug)]
+pub struct VisibleBlock<B: GlyphBackend> {
+    pub block_index: usize,
+    pub id: BlockId,
+    pub x: f32,
+    pub y: f32,
+    pub layout: Arc<BlockLayout<B>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct CanvasHitResult {
+    pub pos: DocPos,
+    pub affinity: Affinity,
+    pub hit: HitResult,
+    pub toggled_heading: Option<BlockId>,
+}
+
+/// Canvas-space horizontal bounds of the continuous infinite-length paper sheet.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct PaperSheetGeometry {
+    pub x: f32,
+    pub top_y: f32,
+    pub width: f32,
+    pub margin_x: f32,
+    pub desk_margin: f32,
+}
+
+/// Resolved horizontal metrics separating viewport-filling reflow from infinite-length paper layout.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HorizontalMetrics {
+    pub canvas_width: f32,
+    pub paper_sheet: Option<PaperSheetGeometry>,
+    pub column_x: f32,
+    pub column_width: f32,
+}
+
+/// Computes horizontal canvas geometry for `Fill` or `Paper` mode.
+pub fn resolve_horizontal_metrics(
+    viewport_width: f32,
+    config: &DocumentLayoutConfig,
+    zoom: f32,
+) -> HorizontalMetrics {
+    match config.horizontal_layout {
+        HorizontalLayout::Fill => {
+            let padding = pt_to_px(config.horizontal_padding_pt, zoom);
+            let column_width = (viewport_width - 2.0 * padding).max(160.0);
+            HorizontalMetrics {
+                canvas_width: viewport_width.max(column_width + 2.0 * padding),
+                paper_sheet: None,
+                column_x: padding,
+                column_width,
+            }
+        }
+        HorizontalLayout::Paper(spec) => {
+            let desk_margin = pt_to_px(spec.desk_margin_pt, zoom);
+            let paper_width = pt_to_px(spec.width_pt, zoom).max(200.0);
+            let margin_x = pt_to_px(spec.margin_x_pt, zoom).min(paper_width * 0.35);
+            let canvas_width = viewport_width.max(paper_width + 2.0 * desk_margin);
+            let sheet_x = ((canvas_width - paper_width) * 0.5).max(desk_margin);
+            let column_width = (paper_width - 2.0 * margin_x).max(120.0);
+            HorizontalMetrics {
+                canvas_width,
+                paper_sheet: Some(PaperSheetGeometry {
+                    x: sheet_x,
+                    top_y: desk_margin,
+                    width: paper_width,
+                    margin_x,
+                    desk_margin,
+                }),
+                column_x: sheet_x + margin_x,
+                column_width,
+            }
+        }
+    }
+}
+
+/// Resolves `(origin_x, max_width)` for a block within the active [`HorizontalLayout`].
+pub fn resolve_block_horizontal_span(
+    viewport_width: f32,
+    config: &DocumentLayoutConfig,
+    width_mode: BlockWidth,
+    zoom: f32,
+) -> (f32, f32) {
+    let metrics = resolve_horizontal_metrics(viewport_width, config, zoom);
+    match metrics.paper_sheet {
+        Some(sheet) => match width_mode {
+            BlockWidth::Column => (metrics.column_x, metrics.column_width),
+            BlockWidth::Wide => {
+                let inset = sheet.margin_x * 0.5;
+                (sheet.x + inset, (sheet.width - 2.0 * inset).max(120.0))
+            }
+            BlockWidth::Full => {
+                let inset = sheet.margin_x * 0.25;
+                (sheet.x + inset, (sheet.width - 2.0 * inset).max(120.0))
+            }
+        },
+        None => (metrics.column_x, metrics.column_width),
+    }
+}
+
+/// Computes which top-level blocks are visible under collapsible heading rules.
+pub fn compute_visibility_mask(doc: &Document) -> Vec<bool> {
+    let mut visible = vec![true; doc.blocks.len()];
+    let mut collapsed_level: Option<u8> = None;
+
+    for (idx, block) in doc.blocks.iter().enumerate() {
+        match &block.kind {
+            BlockKind::Heading {
+                level, collapsed, ..
+            } => {
+                if let Some(cur_level) = collapsed_level {
+                    if *level <= cur_level {
+                        collapsed_level = if *collapsed { Some(*level) } else { None };
+                        visible[idx] = true;
+                    } else {
+                        visible[idx] = false;
+                    }
+                } else {
+                    visible[idx] = true;
+                    if *collapsed {
+                        collapsed_level = Some(*level);
+                    }
+                }
+            }
+            _ => {
+                if collapsed_level.is_some() {
+                    visible[idx] = false;
+                }
+            }
+        }
+    }
+    visible
+}
+
+/// Precomputes display markers (`•`, `1.`, `a.`, `☐`, `☑`) for top-level list items.
+pub fn compute_list_markers(doc: &Document) -> Vec<Option<String>> {
+    let mut markers = vec![None; doc.blocks.len()];
+    let mut counters: HashMap<(ListId, u8), usize> = HashMap::new();
+
+    for (idx, block) in doc.blocks.iter().enumerate() {
+        if let BlockKind::ListItem {
+            list_id,
+            kind,
+            indent_level,
+            checked,
+            ..
+        } = &block.kind
+        {
+            // Reset deeper sub-list counters whenever a parent level increments.
+            counters.retain(|&(lid, lvl), _| lid != *list_id || lvl <= *indent_level);
+            let entry = counters.entry((*list_id, *indent_level)).or_insert(0);
+            *entry += 1;
+            markers[idx] = Some(default_list_marker(*kind, *indent_level, *entry, *checked));
+        }
+    }
+    markers
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BlockMetrics {
+    content_height: f32,
+    space_before: f32,
+    space_after: f32,
+    measured: bool,
+}
+
+/// Non-paginated continuous document flow manager with virtualized layout and scroll anchoring.
+pub struct FlowLayout<B: GlyphBackend> {
+    pub cache: LayoutCache<B>,
+    height_index: HeightIndex,
+    metrics: Vec<BlockMetrics>,
+    visibility: Vec<bool>,
+    list_markers: Vec<Option<String>>,
+    block_ids: Vec<BlockId>,
+    id_to_index: HashMap<BlockId, usize>,
+    leaf_order: HashMap<BlockId, usize>,
+    top_padding_px: f32,
+    bottom_padding_px: f32,
+    last_column_width: f32,
+    last_zoom: f32,
+    last_horizontal_layout: HorizontalLayout,
+}
+
+impl<B: GlyphBackend> Default for FlowLayout<B> {
+    fn default() -> Self {
+        Self {
+            cache: LayoutCache::default(),
+            height_index: HeightIndex::default(),
+            metrics: Vec::new(),
+            visibility: Vec::new(),
+            list_markers: Vec::new(),
+            block_ids: Vec::new(),
+            id_to_index: HashMap::new(),
+            leaf_order: HashMap::new(),
+            top_padding_px: 0.0,
+            bottom_padding_px: 0.0,
+            last_column_width: 0.0,
+            last_zoom: 1.0,
+            last_horizontal_layout: HorizontalLayout::default(),
+        }
+    }
+}
+
+impl<B: GlyphBackend> FlowLayout<B> {
+    pub fn total_height(&self) -> f32 {
+        self.top_padding_px + self.height_index.total_height() + self.bottom_padding_px
+    }
+
+    pub fn block_y(&self, block_idx: usize) -> f32 {
+        self.top_padding_px + self.height_index.prefix_sum(block_idx)
+    }
+
+    pub fn block_y_by_id(&self, id: BlockId) -> Option<f32> {
+        let &idx = self.id_to_index.get(&id)?;
+        Some(self.block_y(idx))
+    }
+
+    pub fn is_visible(&self, block_idx: usize) -> bool {
+        self.visibility.get(block_idx).copied().unwrap_or(false)
+    }
+
+    /// Synchronizes structural metadata and height estimates with `doc`.
+    pub fn sync_document(&mut self, doc: &Document, viewport_width: f32, zoom: f32) {
+        let horizontal = resolve_horizontal_metrics(viewport_width, &doc.config, zoom);
+        let top_desk = horizontal
+            .paper_sheet
+            .map(|sheet| sheet.top_y)
+            .unwrap_or(0.0);
+        self.top_padding_px = top_desk + pt_to_px(doc.config.vertical_padding_pt, zoom);
+        self.bottom_padding_px = pt_to_px(doc.config.vertical_padding_pt * 2.0, zoom);
+
+        let geometry_changed = (horizontal.column_width - self.last_column_width).abs() > 0.5
+            || (zoom - self.last_zoom).abs() > 0.001
+            || doc.config.horizontal_layout != self.last_horizontal_layout;
+        self.last_column_width = horizontal.column_width;
+        self.last_zoom = zoom;
+        self.last_horizontal_layout = doc.config.horizontal_layout;
+
+        let prev_metrics: HashMap<BlockId, BlockMetrics> = self
+            .block_ids
+            .iter()
+            .copied()
+            .zip(self.metrics.iter().copied())
+            .collect();
+
+        self.visibility = compute_visibility_mask(doc);
+        self.list_markers = compute_list_markers(doc);
+        self.block_ids = doc.blocks.iter().map(|b| b.id).collect();
+        self.id_to_index.clear();
+        for (i, id) in self.block_ids.iter().copied().enumerate() {
+            self.id_to_index.insert(id, i);
+        }
+        self.leaf_order.clear();
+        for (order_index, leaf_block) in doc.collect_leaf_blocks().into_iter().enumerate() {
+            self.leaf_order.insert(leaf_block.id, order_index);
+        }
+
+        self.metrics.clear();
+        self.metrics.reserve(doc.blocks.len());
+
+        for block in &doc.blocks {
+            let (_, max_w) =
+                resolve_block_horizontal_span(viewport_width, &doc.config, block.width_mode, zoom);
+            if let Some(cached) = self.cache.get_cached(block.id, block.version, max_w, zoom) {
+                self.metrics.push(BlockMetrics {
+                    content_height: cached.height,
+                    space_before: cached.space_before_px,
+                    space_after: cached.space_after_px,
+                    measured: true,
+                });
+            } else if !geometry_changed
+                && let Some(prev) = prev_metrics.get(&block.id)
+            {
+                self.metrics.push(*prev);
+            } else {
+                self.metrics.push(estimate_block_metrics(
+                    block,
+                    &doc.stylesheet,
+                    max_w,
+                    zoom,
+                ));
+            }
+        }
+
+        self.rebuild_height_index();
+    }
+
+    pub fn capture_anchor(&self, scroll_y: f32) -> Option<ScrollAnchor> {
+        if self.block_ids.is_empty() {
+            return None;
+        }
+        let content_y = (scroll_y - self.top_padding_px).max(0.0);
+        let mut idx = self.height_index.index_at_y(content_y);
+        while idx < self.block_ids.len() && !self.is_visible(idx) {
+            idx += 1;
+        }
+        if idx >= self.block_ids.len() {
+            return None;
+        }
+        let block_top = self.block_y(idx);
+        Some(ScrollAnchor {
+            block_id: self.block_ids[idx],
+            local_y_offset: scroll_y - block_top,
+        })
+    }
+
+    pub fn restore_anchor(&self, anchor: ScrollAnchor, viewport_height: f32) -> f32 {
+        let max_scroll = (self.total_height() - viewport_height).max(0.0);
+        if let Some(top) = self.block_y_by_id(anchor.block_id) {
+            (top + anchor.local_y_offset).clamp(0.0, max_scroll)
+        } else {
+            0.0
+        }
+    }
+
+    /// Ensures all blocks inside `[scroll_y - overscan, scroll_y + viewport_h + overscan]`
+    /// are measured and returns them in visual top-to-bottom order.
+    pub fn layout_visible_blocks<S: TextShaper<Backend = B>>(
+        &mut self,
+        doc: &Document,
+        scroll_y: f32,
+        viewport_width: f32,
+        viewport_height: f32,
+        overscan: f32,
+        zoom: f32,
+        shaper: &mut S,
+    ) -> Vec<VisibleBlock<B>> {
+        if doc.blocks.is_empty() {
+            return Vec::new();
+        }
+        let horizontal = resolve_horizontal_metrics(viewport_width, &doc.config, zoom);
+        if self.block_ids.len() != doc.blocks.len()
+            || (horizontal.column_width - self.last_column_width).abs() > 0.5
+            || (zoom - self.last_zoom).abs() > 0.001
+            || doc.config.horizontal_layout != self.last_horizontal_layout
+        {
+            self.sync_document(doc, viewport_width, zoom);
+        }
+
+        let start_y = (scroll_y - overscan - self.top_padding_px).max(0.0);
+        let end_y = (scroll_y + viewport_height + overscan - self.top_padding_px).max(0.0);
+
+        let start_idx = self.height_index.index_at_y(start_y);
+        let mut idx = start_idx;
+        let mut measured_indices = Vec::new();
+
+        while idx < doc.blocks.len() {
+            let y_rel = self.height_index.prefix_sum(idx);
+            if y_rel > end_y && !measured_indices.is_empty() {
+                break;
+            }
+            if self.is_visible(idx) {
+                let block = &doc.blocks[idx];
+                let (x, max_w) = resolve_block_horizontal_span(
+                    viewport_width,
+                    &doc.config,
+                    block.width_mode,
+                    zoom,
+                );
+                let marker = self.list_markers[idx].as_deref();
+                let layout = self.cache.get_or_layout(
+                    block,
+                    marker,
+                    &doc.stylesheet,
+                    &doc.config,
+                    max_w,
+                    zoom,
+                    shaper,
+                );
+                let changed = !self.metrics[idx].measured
+                    || (self.metrics[idx].content_height - layout.height).abs() > 0.05;
+                if changed {
+                    self.metrics[idx] = BlockMetrics {
+                        content_height: layout.height,
+                        space_before: layout.space_before_px,
+                        space_after: layout.space_after_px,
+                        measured: true,
+                    };
+                    self.update_slot_and_prev_neighbor(idx);
+                }
+                measured_indices.push((idx, x, layout));
+            }
+            idx += 1;
+        }
+
+        measured_indices
+            .into_iter()
+            .map(|(block_index, x, layout)| VisibleBlock {
+                block_index,
+                id: doc.blocks[block_index].id,
+                x,
+                y: self.block_y(block_index),
+                layout,
+            })
+            .collect()
+    }
+
+    pub fn hit_test_canvas<S: TextShaper<Backend = B>>(
+        &mut self,
+        canvas_point: Point,
+        doc: &Document,
+        viewport_width: f32,
+        zoom: f32,
+        shaper: &mut S,
+    ) -> Option<CanvasHitResult> {
+        if doc.blocks.is_empty() {
+            return None;
+        }
+        let content_y = (canvas_point.y - self.top_padding_px).max(0.0);
+        let mut idx = self.height_index.index_at_y(content_y);
+        while idx < doc.blocks.len() && !self.is_visible(idx) {
+            idx += 1;
+        }
+        if idx >= doc.blocks.len() {
+            idx = (0..doc.blocks.len()).rev().find(|&i| self.is_visible(i))?;
+        }
+
+        let block = &doc.blocks[idx];
+        let (bx, max_w) =
+            resolve_block_horizontal_span(viewport_width, &doc.config, block.width_mode, zoom);
+        let by = self.block_y(idx);
+        let marker = self.list_markers[idx].as_deref();
+        let layout = self.cache.get_or_layout(
+            block,
+            marker,
+            &doc.stylesheet,
+            &doc.config,
+            max_w,
+            zoom,
+            shaper,
+        );
+        let local = Point::new(canvas_point.x - bx, canvas_point.y - by);
+
+        // Check heading collapse chevron click first.
+        if let crate::block::BlockLayoutKind::Heading { chevron_rect, .. } = &layout.kind
+            && chevron_rect.contains(local)
+        {
+            return Some(CanvasHitResult {
+                pos: DocPos::top_level(block.id, 0),
+                affinity: Affinity::Downstream,
+                hit: HitResult {
+                    offset: 0,
+                    affinity: Affinity::Downstream,
+                    inline_object: None,
+                    link: None,
+                },
+                toggled_heading: Some(block.id),
+            });
+        }
+
+        if let Some(hit) = layout.hit_test_local(local) {
+            return Some(CanvasHitResult {
+                pos: DocPos::top_level(block.id, hit.offset),
+                affinity: hit.affinity,
+                hit,
+                toggled_heading: None,
+            });
+        }
+
+        match &layout.kind {
+            crate::block::BlockLayoutKind::Blockquote { children, .. } => {
+                if let Some(child) = nearest_child_for_y(children, local.y) {
+                    let child_local = Point::new(local.x - child.x, local.y - child.y);
+                    if let Some(hit) = child.layout.hit_test_local(child_local) {
+                        let mut pos = DocPos::top_level(block.id, hit.offset);
+                        pos.path.push(PathSegment::Block(child.layout.id));
+                        return Some(CanvasHitResult {
+                            pos,
+                            affinity: hit.affinity,
+                            hit,
+                            toggled_heading: None,
+                        });
+                    }
+                }
+            }
+            crate::block::BlockLayoutKind::Table(table) => {
+                let target_cell = table
+                    .cells
+                    .iter()
+                    .find(|cell| cell.rect.contains(local))
+                    .or_else(|| {
+                        table.cells.iter().min_by(|left, right| {
+                            let left_dist = rect_distance_sq(left.rect, local);
+                            let right_dist = rect_distance_sq(right.rect, local);
+                            left_dist.total_cmp(&right_dist)
+                        })
+                    });
+                if let Some(cell) = target_cell {
+                    let cell_local = Point::new(local.x - cell.rect.x, local.y - cell.rect.y);
+                    if let Some(child) = nearest_child_for_y(&cell.children, cell_local.y) {
+                        let child_local =
+                            Point::new(cell_local.x - child.x, cell_local.y - child.y);
+                        if let Some(hit) = child.layout.hit_test_local(child_local) {
+                            let mut path = smallvec::SmallVec::new();
+                            path.push(PathSegment::TableCell {
+                                table_id: block.id,
+                                row: cell.row,
+                                col: cell.col,
+                            });
+                            path.push(PathSegment::Block(child.layout.id));
+                            return Some(CanvasHitResult {
+                                pos: DocPos {
+                                    path,
+                                    offset: hit.offset,
+                                },
+                                affinity: hit.affinity,
+                                hit,
+                                toggled_heading: None,
+                            });
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        None
+    }
+
+    /// Computes canvas-space selection rectangles for the visible blocks.
+    pub fn selection_rects_for_visible(
+        &self,
+        selection: &DocumentSelection,
+        visible_blocks: &[VisibleBlock<B>],
+    ) -> Vec<Rect> {
+        let mut rects = Vec::new();
+        match selection {
+            DocumentSelection::Text { anchor, focus, .. } => {
+                if anchor == focus {
+                    return rects;
+                }
+                let Some(anchor_leaf_id) = anchor.leaf_block_id() else {
+                    return rects;
+                };
+                let Some(focus_leaf_id) = focus.leaf_block_id() else {
+                    return rects;
+                };
+                let Some(&anchor_order) = self.leaf_order.get(&anchor_leaf_id) else {
+                    return rects;
+                };
+                let Some(&focus_order) = self.leaf_order.get(&focus_leaf_id) else {
+                    return rects;
+                };
+
+                let ((start_order, start_offset), (end_order, end_offset)) =
+                    if (anchor_order, anchor.offset) <= (focus_order, focus.offset) {
+                        ((anchor_order, anchor.offset), (focus_order, focus.offset))
+                    } else {
+                        ((focus_order, focus.offset), (anchor_order, anchor.offset))
+                    };
+
+                let mut leaf_paragraphs = Vec::new();
+                for visible in visible_blocks {
+                    collect_leaf_paragraphs(
+                        &visible.layout,
+                        visible.x,
+                        visible.y,
+                        &mut leaf_paragraphs,
+                    );
+                }
+
+                for leaf in leaf_paragraphs {
+                    let Some(&leaf_order) = self.leaf_order.get(&leaf.block_id) else {
+                        continue;
+                    };
+                    if leaf_order < start_order || leaf_order > end_order {
+                        continue;
+                    }
+                    let block_len = leaf
+                        .paragraph
+                        .lines
+                        .last()
+                        .map(|line| line.doc_range.end)
+                        .unwrap_or(0);
+                    let range = if start_order == end_order {
+                        start_offset..end_offset
+                    } else if leaf_order == start_order {
+                        start_offset..block_len
+                    } else if leaf_order == end_order {
+                        0..end_offset
+                    } else {
+                        0..block_len
+                    };
+                    let trailing = leaf_order < end_order;
+                    for rect in leaf.paragraph.selection_rects(range, trailing) {
+                        rects.push(rect.translate(leaf.origin_x, leaf.origin_y));
+                    }
+                }
+            }
+            DocumentSelection::TableCells {
+                table_id,
+                anchor_cell,
+                focus_cell,
+            } => {
+                let row_min = anchor_cell.0.min(focus_cell.0);
+                let row_max = anchor_cell.0.max(focus_cell.0);
+                let col_min = anchor_cell.1.min(focus_cell.1);
+                let col_max = anchor_cell.1.max(focus_cell.1);
+                for visible in visible_blocks {
+                    if visible.id != *table_id {
+                        continue;
+                    }
+                    if let crate::block::BlockLayoutKind::Table(table) = &visible.layout.kind {
+                        for cell in &table.cells {
+                            if cell.row >= row_min
+                                && cell.row <= row_max
+                                && cell.col >= col_min
+                                && cell.col <= col_max
+                            {
+                                rects.push(cell.rect.translate(visible.x, visible.y));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        rects
+    }
+
+    pub fn caret_rect_in_visible(
+        &self,
+        pos: &DocPos,
+        affinity: Affinity,
+        visible_blocks: &[VisibleBlock<B>],
+    ) -> Option<Rect> {
+        let top_id = pos.top_level_block_id()?;
+        let leaf_id = pos.leaf_block_id()?;
+        let visible = visible_blocks.iter().find(|entry| entry.id == top_id)?;
+        let mut leaf_paragraphs = Vec::new();
+        collect_leaf_paragraphs(&visible.layout, visible.x, visible.y, &mut leaf_paragraphs);
+        let target = leaf_paragraphs
+            .into_iter()
+            .find(|leaf| leaf.block_id == leaf_id)?;
+        Some(
+            target
+                .paragraph
+                .caret_rect(pos.offset, affinity)
+                .translate(target.origin_x, target.origin_y),
+        )
+    }
+
+    fn rebuild_height_index(&mut self) {
+        self.height_index = HeightIndex::new(self.metrics.len());
+        for i in 0..self.metrics.len() {
+            let slot = self.compute_slot_height(i);
+            self.height_index.set_slot(i, slot);
+        }
+    }
+
+    fn update_slot_and_prev_neighbor(&mut self, idx: usize) {
+        let slot = self.compute_slot_height(idx);
+        self.height_index.set_slot(idx, slot);
+        if let Some(prev) = self.prev_visible(idx) {
+            let prev_slot = self.compute_slot_height(prev);
+            self.height_index.set_slot(prev, prev_slot);
+        }
+    }
+
+    fn compute_slot_height(&self, idx: usize) -> f32 {
+        if !self.is_visible(idx) {
+            return 0.0;
+        }
+        let m = self.metrics[idx];
+        let gap = if let Some(next) = self.next_visible(idx) {
+            m.space_after.max(self.metrics[next].space_before)
+        } else {
+            0.0
+        };
+        m.content_height + gap
+    }
+
+    fn next_visible(&self, idx: usize) -> Option<usize> {
+        ((idx + 1)..self.visibility.len()).find(|&i| self.visibility[i])
+    }
+
+    fn prev_visible(&self, idx: usize) -> Option<usize> {
+        (0..idx).rev().find(|&i| self.visibility[i])
+    }
+}
+
+struct LeafParagraphRef<'layout, B: GlyphBackend> {
+    block_id: BlockId,
+    origin_x: f32,
+    origin_y: f32,
+    paragraph: &'layout crate::line::ParagraphLayout<B>,
+}
+
+fn collect_leaf_paragraphs<'layout, B: GlyphBackend>(
+    layout: &'layout BlockLayout<B>,
+    origin_x: f32,
+    origin_y: f32,
+    out: &mut Vec<LeafParagraphRef<'layout, B>>,
+) {
+    if let Some(paragraph) = layout.paragraph() {
+        let content_origin = layout.content_origin();
+        out.push(LeafParagraphRef {
+            block_id: layout.id,
+            origin_x: origin_x + content_origin.x,
+            origin_y: origin_y + content_origin.y,
+            paragraph,
+        });
+        return;
+    }
+    match &layout.kind {
+        crate::block::BlockLayoutKind::Blockquote { children, .. } => {
+            for child in children {
+                collect_leaf_paragraphs(
+                    &child.layout,
+                    origin_x + child.x,
+                    origin_y + child.y,
+                    out,
+                );
+            }
+        }
+        crate::block::BlockLayoutKind::Table(table) => {
+            for cell in &table.cells {
+                for child in &cell.children {
+                    collect_leaf_paragraphs(
+                        &child.layout,
+                        origin_x + cell.rect.x + child.x,
+                        origin_y + cell.rect.y + child.y,
+                        out,
+                    );
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn nearest_child_for_y<B: GlyphBackend>(
+    children: &[crate::block::PlacedChildBlock<B>],
+    local_y: f32,
+) -> Option<&crate::block::PlacedChildBlock<B>> {
+    if children.is_empty() {
+        return None;
+    }
+    for child in children {
+        if local_y >= child.y && local_y <= child.y + child.layout.height {
+            return Some(child);
+        }
+    }
+    if local_y < children[0].y {
+        children.first()
+    } else {
+        children.last()
+    }
+}
+
+fn rect_distance_sq(rect: Rect, point: Point) -> f32 {
+    let clamped_x = point.x.clamp(rect.x, rect.right());
+    let clamped_y = point.y.clamp(rect.y, rect.bottom());
+    let dx = point.x - clamped_x;
+    let dy = point.y - clamped_y;
+    dx * dx + dy * dy
+}
+
+fn estimate_block_metrics(
+    block: &BlockNode,
+    sheet: &rich_model::StyleSheet,
+    max_width: f32,
+    zoom: f32,
+) -> BlockMetrics {
+    let space_before = pt_to_px(block.style.resolved_space_before(sheet), zoom);
+    let space_after = pt_to_px(block.style.resolved_space_after(sheet), zoom);
+    let base_line = pt_to_px(16.0, zoom);
+
+    let est_height = match &block.kind {
+        BlockKind::Paragraph(c) | BlockKind::ListItem { content: c, .. } => {
+            let chars_per_line = (max_width / pt_to_px(6.5, zoom)).max(12.0);
+            let lines = ((c.len().max(1) as f32) / chars_per_line).ceil().max(1.0);
+            lines * base_line
+        }
+        BlockKind::Heading { level, content, .. } => {
+            let scale = match level {
+                1 => 2.0,
+                2 => 1.6,
+                3 => 1.35,
+                _ => 1.15,
+            };
+            let chars_per_line = (max_width / pt_to_px(6.5 * scale, zoom)).max(8.0);
+            let lines = ((content.len().max(1) as f32) / chars_per_line)
+                .ceil()
+                .max(1.0);
+            lines * base_line * scale
+        }
+        BlockKind::CodeBlock { content, .. } => {
+            let lines = content.text.lines().count().max(1) as f32;
+            lines * pt_to_px(15.0, zoom) + pt_to_px(24.0, zoom)
+        }
+        BlockKind::Blockquote(children) => {
+            (children.len().max(1) as f32) * base_line * 1.4
+        }
+        BlockKind::Table(t) => (t.rows.len().max(1) as f32) * pt_to_px(30.0, zoom),
+        BlockKind::HorizontalRule => pt_to_px(12.0, zoom),
+    };
+
+    BlockMetrics {
+        content_height: est_height,
+        space_before,
+        space_after,
+        measured: false,
+    }
+}
