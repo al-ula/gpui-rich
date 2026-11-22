@@ -1,4 +1,5 @@
-use crate::inline::InlineContent;
+use crate::components::{PLACEHOLDER_KIND, PlaceholderKind};
+use crate::inline::{ChipKind, InlineContent, InlineObject};
 use crate::payload::CustomPayload;
 use crate::selection::{DocPos, PathSegment};
 use crate::style::{
@@ -7,6 +8,7 @@ use crate::style::{
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
+use std::collections::BTreeMap;
 use std::sync::Arc;
 
 /// Built-in semantic kind identifiers for [`BlockKind`].
@@ -141,6 +143,9 @@ pub struct TableRow {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TableBlock {
     pub columns: Vec<ColumnSpec>,
+    /// Advisory semantics keyed by visual column; paste and typing are never rejected.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub column_kinds: BTreeMap<usize, PlaceholderKind>,
     pub rows: Vec<TableRow>,
     pub border_style: TableBorderStyle,
 }
@@ -156,6 +161,48 @@ pub struct TableCellPlacement {
 }
 
 impl TableBlock {
+    /// Returns the typed columns whose nonempty body cell does not match the expected chip kind.
+    pub fn cell_column_mismatches(&self, row: usize, visual_col: usize) -> Vec<usize> {
+        if self.column_kinds.is_empty() {
+            return Vec::new();
+        }
+        let (_, placements, occupancy) = self.resolve_grid();
+        let Some(placement) = occupancy.get(row).and_then(|slots| slots.get(visual_col))
+            .and_then(|slot| slot.and_then(|index| placements.get(index))) else {
+            return Vec::new();
+        };
+        let row = &self.rows[placement.row_index];
+        if row.is_header {
+            return Vec::new();
+        }
+        let cell = &row.cells[placement.cell_index];
+        let mut actual = None;
+        let mut mixed = false;
+        for block in &cell.blocks {
+            let Some(content) = block.kind.inline_content() else { mixed = true; break; };
+            if content.text.trim().is_empty() { continue; }
+            let [entry] = content.objects.as_slice() else { mixed = true; break; };
+            if content.text.trim() != "\u{fffc}" || actual.is_some() { mixed = true; break; }
+            actual = match &entry.object {
+                InlineObject::Custom { kind, data } if kind.as_ref() == PLACEHOLDER_KIND => {
+                    data.as_json().get("kind").and_then(serde_json::Value::as_str).and_then(PlaceholderKind::from_name)
+                }
+                InlineObject::SmartChip { kind: ChipKind::Date, .. } => Some(PlaceholderKind::Date),
+                InlineObject::SmartChip { kind: ChipKind::Person, .. } => Some(PlaceholderKind::Person),
+                InlineObject::SmartChip { kind: ChipKind::Document, .. } => Some(PlaceholderKind::File),
+                _ => None,
+            };
+            if actual.is_none() { mixed = true; break; }
+        }
+        if actual.is_none() && !mixed {
+            return Vec::new();
+        }
+        self.column_kinds
+            .range(placement.visual_col..placement.visual_col + placement.colspan)
+            .filter_map(|(&column, &expected)| (mixed || actual != Some(expected)).then_some(column))
+            .collect()
+    }
+
     /// Returns the number of visual grid columns spanned by this table.
     pub fn grid_col_count(&self) -> usize {
         let row_count = self.rows.len();
@@ -538,6 +585,12 @@ pub struct Document {
     pub config: DocumentLayoutConfig,
     pub stylesheet: StyleSheet,
     pub blocks: Vec<BlockNode>,
+    #[serde(default)]
+    pub anchors: crate::anchors::AnchorStore,
+    #[serde(default)]
+    pub components: crate::components::ComponentStore,
+    #[serde(default)]
+    pub ordered_lists: crate::structure_edit::OrderedListState,
     next_block_id: u64,
 }
 
@@ -553,6 +606,9 @@ impl Document {
             config: DocumentLayoutConfig::default(),
             stylesheet: StyleSheet::default(),
             blocks: Vec::new(),
+            anchors: crate::anchors::AnchorStore::default(),
+            components: crate::components::ComponentStore::default(),
+            ordered_lists: crate::structure_edit::OrderedListState::default(),
             next_block_id: 1,
         }
     }
@@ -566,7 +622,11 @@ impl Document {
     pub fn push_block(&mut self, block: BlockNode) -> BlockId {
         let id = block.id;
         self.next_block_id = self.next_block_id.max(id.0 + 1);
-        self.blocks.push(block);
+        if crate::anchors::is_footnote_body(&block) {
+            self.blocks.push(block);
+        } else {
+            self.blocks.insert(self.content_end_index(), block);
+        }
         id
     }
 
@@ -710,35 +770,31 @@ impl Document {
     /// Collects text-bearing leaf blocks currently visible under collapsible heading rules.
     pub fn collect_visible_leaf_blocks(&self) -> Vec<&BlockNode> {
         let mut leaves = Vec::new();
-        let mut collapsed_level: Option<u8> = None;
-
-        for block in &self.blocks {
-            let visible = if let Some(heading) = block.kind.heading_data() {
-                if let Some(current_level) = collapsed_level {
-                    if heading.level <= current_level {
-                        collapsed_level = if heading.collapsed {
-                            Some(heading.level)
-                        } else {
-                            None
-                        };
-                        true
-                    } else {
-                        false
-                    }
-                } else {
-                    if heading.collapsed {
-                        collapsed_level = Some(heading.level);
-                    }
-                    true
-                }
-            } else {
-                collapsed_level.is_none()
-            };
+        for (block, visible) in self.blocks.iter().zip(self.top_level_visibility()) {
             if visible {
                 collect_leaves_in_slice(std::slice::from_ref(block), &mut leaves);
             }
         }
         leaves
+    }
+
+    /// Reports visibility in top-level block order; footnote bodies are outside heading sections.
+    pub fn top_level_visibility(&self) -> impl Iterator<Item = bool> + '_ {
+        let mut collapsed_level = None;
+        let footnotes = self.content_end_index();
+        self.blocks.iter().enumerate().map(move |(index, block)| {
+            if index >= footnotes {
+                return true;
+            }
+            let Some(heading) = block.kind.heading_data() else {
+                return collapsed_level.is_none();
+            };
+            if collapsed_level.is_some_and(|level| heading.level > level) {
+                return false;
+            }
+            collapsed_level = heading.collapsed.then_some(heading.level);
+            true
+        })
     }
 
     /// Finds the enclosing [`ContainerTarget`] and child index of `block_id`.

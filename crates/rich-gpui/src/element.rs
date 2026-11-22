@@ -226,9 +226,34 @@ impl Element for RichDocumentElement {
             let max_scroll_x = (horizontal.canvas_width - viewport_width).max(0.0);
             view.scroll_x = view.scroll_x.clamp(0.0, max_scroll_x);
 
-            let anchor = view.flow.capture_anchor(view.scroll_y);
+            let pending_reveal = view.pending_reveal.take();
+            let anchor = if pending_reveal.is_none() {
+                view.flow.capture_anchor(view.scroll_y)
+            } else {
+                None
+            };
             let mut shaper = GpuiShaper::with_extensions(window, &view.extensions)
+                .with_components(&view.document.components)
                 .with_optional_font_resolver(view.font_resolver.as_deref());
+            if let Some(pos) = pending_reveal {
+                if viewport_width <= 1.0 || viewport_height <= 1.0 {
+                    view.pending_reveal = Some(pos);
+                } else if let Some(rect) = view.flow.measure_caret_rect(
+                    &view.document, &pos, Affinity::Downstream, viewport_width, view.zoom, &mut shaper,
+                ) {
+                    let max_y = (view.flow.total_height() - viewport_height).max(0.0);
+                    if rect.x < view.scroll_x {
+                        view.scroll_x = rect.x.clamp(0.0, max_scroll_x);
+                    } else if rect.right() > view.scroll_x + viewport_width {
+                        view.scroll_x = (rect.right() - viewport_width).clamp(0.0, max_scroll_x);
+                    }
+                    if rect.y < view.scroll_y {
+                        view.scroll_y = rect.y.clamp(0.0, max_y);
+                    } else if rect.bottom() > view.scroll_y + viewport_height {
+                        view.scroll_y = (rect.bottom() - viewport_height).clamp(0.0, max_y);
+                    }
+                }
+            }
             let visible = view.flow.layout_visible_blocks(
                 &view.document,
                 view.scroll_y,
@@ -257,13 +282,14 @@ impl Element for RichDocumentElement {
                 HashMap::new();
             let mut decoration_overlays = Vec::new();
 
-            if !view.decoration_providers.is_empty() {
+            if !view.decoration_providers.is_empty() || !view.navigation.search.matches.is_empty() {
                 let leaf_paragraphs = collect_visible_leaf_paragraphs(&visible);
                 for leaf in leaf_paragraphs {
                     let Some(block) = view.document.find_block(leaf.block_id) else {
                         continue;
                     };
                     let mut aggregated = BlockDecorations::default();
+                    aggregated.inline.extend(view.navigation.decorations(leaf.block_id));
                     let context = DecorationContext {
                         document: &view.document,
                         block,
@@ -684,7 +710,12 @@ impl Element for RichDocumentElement {
 
         let popover_element = pending_chip_popover.map(|(popover, anchor_rect)| {
             let popover_w = 224.0f32;
-            let popover_h = 84.0f32;
+            let dropdown = crate::view::editor_components::build_dropdown_options(
+                &popover, self.view.clone(), &theme, cx,
+            );
+            let popover_h = dropdown.as_ref().map_or(84.0, |(_, count)| {
+                (14.0 + *count as f32 * 29.0).min(240.0)
+            });
             let anchor_bounds = rect_to_bounds(anchor_rect);
             let anchor_left: f32 = anchor_bounds.origin.x.into();
             let anchor_bottom: f32 = (anchor_bounds.origin.y + anchor_bounds.size.height).into();
@@ -699,12 +730,9 @@ impl Element for RichDocumentElement {
             } else {
                 (anchor_top - popover_h - 6.0).max(origin_y + 8.0)
             };
-            let mut element = build_smart_chip_popover_element(
-                &popover,
-                &theme,
-                self.view.clone(),
-                popover_w,
-                popover_h,
+            let mut element = dropdown.map_or_else(
+                || build_smart_chip_popover_element(&popover, &theme, self.view.clone(), popover_w, popover_h),
+                |(menu, _)| menu,
             );
             let available = size(
                 AvailableSpace::Definite(px(popover_w)),

@@ -709,6 +709,7 @@ fn parse_markdown_blocks(lines: &[&str], document: &mut Document) -> Vec<BlockNo
                 BlockKind::table(TableBlock {
                     columns: vec![ColumnSpec::Auto; col_count],
                     rows: table_rows,
+                    column_kinds: Default::default(),
                     border_style: TableBorderStyle::default(),
                 }),
                 BlockStyle::default(),

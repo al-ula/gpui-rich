@@ -36,6 +36,19 @@ use std::sync::Arc;
 use std::time::Duration;
 use unicode_segmentation::UnicodeSegmentation;
 
+#[path = "editor_anchors.rs"]
+mod editor_anchors;
+#[path = "editor_clipboard.rs"]
+mod editor_clipboard;
+#[path = "editor_components.rs"]
+pub(crate) mod editor_components;
+#[path = "editor_grid.rs"]
+mod editor_grid;
+#[path = "editor_navigation.rs"]
+mod editor_navigation;
+#[path = "editor_structure.rs"]
+mod editor_structure;
+
 /// GPUI keymap context attached to [`RichDocumentView`].
 pub const RICH_DOCUMENT_KEY_CONTEXT: &str = "RichDocument";
 
@@ -363,6 +376,10 @@ pub struct RichDocumentView {
     pub open_external_links: bool,
     pub ime_preedit: Option<ImePreedit>,
     pub extensions: ExtensionRegistry,
+    pub(crate) navigation: editor_navigation::NavigationState,
+    pub(crate) pending_reveal: Option<DocPos>,
+    input_rules: bool,
+    pending_input_rule_undo: Option<editor_structure::InputRuleUndo>,
     pub(crate) font_resolver: Option<Box<FontResolver>>,
     pub(crate) decoration_providers: Vec<(DecorationProviderId, Box<dyn DecorationProvider>)>,
     pub(crate) last_viewport_bounds: Bounds<Pixels>,
@@ -392,6 +409,7 @@ pub struct RichDocumentView {
     drag_anchor_pos: Option<DocPos>,
     pending_link: Option<String>,
     pending_chip: Option<ActiveSmartChipPopover>,
+    pending_footnote: Option<rich_model::AnchorId>,
 }
 
 impl EventEmitter<RichDocumentEvent> for RichDocumentView {}
@@ -416,6 +434,10 @@ impl RichDocumentView {
             open_external_links: true,
             ime_preedit: None,
             extensions: ExtensionRegistry::new(),
+            navigation: editor_navigation::NavigationState::default(),
+            pending_reveal: None,
+            input_rules: false,
+            pending_input_rule_undo: None,
             font_resolver: None,
             decoration_providers: Vec::new(),
             last_viewport_bounds: Bounds::default(),
@@ -445,6 +467,7 @@ impl RichDocumentView {
             drag_anchor_pos: None,
             pending_link: None,
             pending_chip: None,
+            pending_footnote: None,
         }
     }
 
@@ -559,6 +582,9 @@ impl RichDocumentView {
         self.scroll_x = 0.0;
         self.scroll_y = 0.0;
         self.ime_preedit = None;
+        self.navigation = editor_navigation::NavigationState::default();
+        self.pending_reveal = None;
+        self.pending_input_rule_undo = None;
         self.selected_image = None;
         self.image_resize_drag = None;
         self.active_chip_popover = None;
@@ -566,6 +592,12 @@ impl RichDocumentView {
         self.update_selection(None, cx);
         self.resync_layout_with_anchor(None);
         cx.notify();
+    }
+
+    /// Enables reversible list markers typed at the start of a paragraph.
+    pub fn with_input_rules(mut self, enabled: bool) -> Self {
+        self.input_rules = enabled;
+        self
     }
 
     /// Applies an incoming CRDT [`SyncDelta`] through `bridge` without recording into local undo
@@ -1028,6 +1060,13 @@ impl RichDocumentView {
             return rejection;
         }
 
+        if !matches!(
+            current_command,
+            RichCommand::InsertText(_)
+                | RichCommand::Delete { direction: MoveDirection::Backward, unit: MoveUnit::Grapheme }
+        ) {
+            self.pending_input_rule_undo = None;
+        }
         let outcome = self.execute_command(&current_command, cx);
         cx.emit(RichDocumentEvent::CommandExecuted {
             command: current_command,
@@ -1221,8 +1260,9 @@ impl RichDocumentView {
                 let Some(fragment) = self.selected_fragment() else {
                     return CommandOutcome::NoOp;
                 };
-                let plain_text = fragment.to_plain_text_with(&self.extensions);
-                let html = fragment.to_html_with(&self.extensions);
+                let formatter = editor_clipboard::ComponentClipboardFormatter::new(self);
+                let plain_text = fragment.to_plain_text_with(&formatter);
+                let html = fragment.to_html_with(&formatter);
                 let metadata = serde_json::json!({ CLIPBOARD_HTML_METADATA_KEY: html }).to_string();
                 cx.write_to_clipboard(ClipboardItem::new_string_with_metadata(
                     plain_text, metadata,
@@ -1320,6 +1360,7 @@ impl RichDocumentView {
             RichCommand::PasteHtml { html, plain_text } => {
                 self.execute_paste_html(html, plain_text.as_deref(), cx)
             }
+            RichCommand::PasteText(text) => self.execute_paste_text(text, cx),
             RichCommand::SetTableColumns { table_id, columns } => {
                 self.execute_set_table_columns(*table_id, columns.clone(), cx)
             }
@@ -1334,6 +1375,11 @@ impl RichDocumentView {
             RichCommand::NavigateTableCell { forward } => {
                 self.execute_navigate_table_cell(*forward, cx)
             }
+            RichCommand::Navigation(command) => self.execute_navigation_command_inner(command, cx),
+            RichCommand::Grid(command) => self.execute_grid_command(command, cx),
+            RichCommand::Component(command) => editor_components::execute_component_command(self, command, cx),
+            RichCommand::Structure(command) => self.execute_structure_command(command, cx),
+            RichCommand::Anchor(command) => self.execute_anchor_command(command, cx),
             RichCommand::Custom { id, payload, .. } => self.execute_custom_command(id, payload, cx),
         }
     }
@@ -1493,6 +1539,17 @@ impl RichDocumentView {
                 };
                 (pos, Affinity::Downstream)
             }
+            MoveUnit::Paragraph => {
+                let target = match direction {
+                    MoveDirection::Backward | MoveDirection::Up => rich_model::NavigationTarget::PreviousParagraph,
+                    MoveDirection::Forward | MoveDirection::Down => rich_model::NavigationTarget::NextParagraph,
+                };
+                let Some(position) = rich_model::navigate_target(&self.document, &target, Some(&focus)) else {
+                    return CommandOutcome::NoOp;
+                };
+                self.pending_reveal = Some(position.clone());
+                (position, Affinity::Downstream)
+            }
         };
 
         let next_selection = if extend_selection {
@@ -1523,6 +1580,13 @@ impl RichDocumentView {
     }
 
     fn execute_insert_text(&mut self, raw_text: &str, cx: &mut Context<Self>) -> CommandOutcome {
+        if self.input_rules && self.try_apply_input_rule(raw_text, cx) {
+            return CommandOutcome::Executed;
+        }
+        self.execute_insert_text_inner(raw_text, cx)
+    }
+
+    fn execute_insert_text_inner(&mut self, raw_text: &str, cx: &mut Context<Self>) -> CommandOutcome {
         let normalized = raw_text.replace("\r\n", "\n").replace('\r', "\n");
         let Some((anchor, focus, stored_marks)) = self.active_text_selection() else {
             return CommandOutcome::NoOp;
@@ -1732,6 +1796,14 @@ impl RichDocumentView {
         cx: &mut Context<Self>,
     ) -> CommandOutcome {
         self.ime_preedit = None;
+        if matches!(self.selection, Some(DocumentSelection::TableCells { .. })) {
+            return self.execute_grid_command(&rich_model::GridCommand::ClearSelection, cx);
+        }
+        if direction == MoveDirection::Backward && unit == MoveUnit::Grapheme
+            && self.try_undo_input_rule(cx)
+        {
+            return CommandOutcome::Executed;
+        }
         let Some((anchor, focus, _)) = self.active_text_selection() else {
             return CommandOutcome::NoOp;
         };
@@ -2608,12 +2680,28 @@ impl RichDocumentView {
         self.ime_preedit = None;
         self.history.break_coalescing();
 
-        let fragment = ClipboardFragment::from_html(html);
+        let mut fragment = ClipboardFragment::from_html(html);
         if fragment.is_empty() {
             return match plain_fallback {
-                Some(fallback) if !fallback.is_empty() => self.execute_insert_text(fallback, cx),
+                Some(fallback) if !fallback.is_empty() => self.execute_paste_text(fallback, cx),
                 _ => CommandOutcome::NoOp,
             };
+        }
+
+        let component_step = editor_clipboard::import_component_definitions(
+            &self.document.components, &mut fragment,
+        ).map(|components| Step::SetComponents { components });
+        let rectangle = matches!(self.selection, Some(DocumentSelection::TableCells { .. }));
+        let in_table = rectangle || self.selection.as_ref().is_some_and(|selection| match selection {
+            DocumentSelection::Text { focus, .. } => table_cell_of(focus).is_some(),
+            _ => false,
+        });
+        if in_table && let [ClipboardBlock::Table(table)] = fragment.blocks.as_slice() {
+            return self.execute_grid_paste(table, component_step, cx);
+        }
+        if rectangle {
+            let plain = plain_fallback.map_or_else(|| fragment.to_plain_text(), ToOwned::to_owned);
+            return self.execute_grid_command(&rich_model::GridCommand::PasteTsv { text: plain }, cx);
         }
 
         let Some((anchor, focus, _)) = self.active_text_selection() else {
@@ -2637,15 +2725,15 @@ impl RichDocumentView {
             let plain = plain_fallback
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| fragment.to_plain_text_with(&self.extensions));
-            return self.execute_insert_text(&plain, cx);
+            return self.execute_paste_text(&plain, cx);
         }
 
-        // Fast path: single plain/rich paragraph inserts inline directly into the active block.
-        if fragment.blocks.len() == 1
+        if fragment.is_open_inline()
             && let Some(ClipboardBlock::Paragraph { content, .. }) = fragment.blocks.first()
         {
             let inserted_len = content.len();
             let mut steps = delete_steps;
+            steps.extend(component_step);
             if inserted_len > 0 {
                 steps.push(Step::InsertContent {
                     block_id: first_block_id,
@@ -2699,11 +2787,11 @@ impl RichDocumentView {
             return CommandOutcome::NoOp;
         }
 
-        let mut steps = Vec::new();
+        let mut steps: Vec<_> = component_step.into_iter().collect();
         let mut caret_block_id = first_block_id;
         let mut caret_offset = split_offset;
 
-        let merge_first_into_current = split_offset > 0
+        let merge_first_into_current = fragment.start_open
             && pasted_nodes
                 .first()
                 .and_then(|node| node.kind.inline_content())
@@ -2730,16 +2818,30 @@ impl RichDocumentView {
             caret_offset = split_offset + first_len;
 
             if pasted_nodes.is_empty() {
-                if !trailing_after_caret.is_empty() {
-                    steps.push(Step::InsertContent {
-                        block_id: first_block_id,
-                        offset: caret_offset,
-                        content: trailing_after_caret,
+                if fragment.end_open {
+                    if !trailing_after_caret.is_empty() {
+                        steps.push(Step::RestoreInlineContent {
+                            block_id: first_block_id,
+                            offset: caret_offset,
+                            content: trailing_after_caret,
+                        });
+                    }
+                } else {
+                    let tail_id = self.document.alloc_block_id();
+                    steps.push(Step::InsertBlockIn {
+                        target,
+                        index: start_index + 1,
+                        block: BlockNode::new(
+                            tail_id, BlockKind::paragraph(trailing_after_caret), BlockStyle::default(),
+                        ),
                     });
+                    caret_block_id = tail_id;
+                    caret_offset = 0;
                 }
             } else {
                 let mut trailing_attached = false;
-                if let Some(last_node) = pasted_nodes.last_mut()
+                if fragment.end_open
+                    && let Some(last_node) = pasted_nodes.last_mut()
                     && let Some(last_inline) = last_node.kind.inline_content_mut()
                 {
                     caret_block_id = last_node.id;
@@ -2749,7 +2851,7 @@ impl RichDocumentView {
                     }
                     trailing_attached = true;
                 }
-                if !trailing_attached && !trailing_after_caret.is_empty() {
+                if !trailing_attached && (!trailing_after_caret.is_empty() || !fragment.end_open) {
                     let tail_id = self.document.alloc_block_id();
                     pasted_nodes.push(BlockNode::new(
                         tail_id,
@@ -2790,7 +2892,7 @@ impl RichDocumentView {
 
             let replace_current_block = split_offset == 0;
             let mut trailing_attached = false;
-            if replace_current_block
+            if fragment.end_open
                 && let Some(last_node) = pasted_nodes.last_mut()
                 && let Some(last_inline) = last_node.kind.inline_content_mut()
             {
@@ -2810,6 +2912,9 @@ impl RichDocumentView {
                 caret_block_id = tail_id;
                 caret_offset = 0;
                 trailing_attached = true;
+            } else if replace_current_block && !fragment.end_open {
+                caret_block_id = first_block_id;
+                caret_offset = 0;
             } else if let Some((fallback_id, fallback_offset)) =
                 last_text_pos_in_nodes(&pasted_nodes)
             {
@@ -2825,7 +2930,7 @@ impl RichDocumentView {
                     block: node,
                 });
             }
-            if replace_current_block && (trailing_attached || trailing_after_caret.is_empty()) {
+            if replace_current_block && trailing_attached {
                 steps.push(Step::RemoveBlockIn {
                     target,
                     index: insert_index + pasted_count,
@@ -3851,6 +3956,7 @@ impl RichDocumentView {
         if self.selection == next_selection {
             return false;
         }
+        self.pending_reveal = None;
         self.selection = next_selection;
         cx.emit(RichDocumentEvent::SelectionChanged {
             selection: self.selection.clone(),
@@ -3860,6 +3966,7 @@ impl RichDocumentView {
     }
 
     fn notify_transaction_applied(&mut self, change_set: ChangeSet, cx: &mut Context<Self>) {
+        self.refresh_search_matches();
         for (_, middleware) in &mut self.middleware {
             middleware.after_transaction(&change_set, &self.document, self.selection.as_ref());
         }
@@ -3894,13 +4001,13 @@ impl RichDocumentView {
     /// Extracts the plain UTF-8 text covered by the current selection (TSV for multi-cell table selections).
     pub fn selected_plain_text(&self) -> Option<String> {
         let fragment = self.selected_fragment()?;
-        Some(fragment.to_plain_text_with(&self.extensions))
+        Some(fragment.to_plain_text_with(&editor_clipboard::ComponentClipboardFormatter::new(self)))
     }
 
     /// Extracts normalized semantic HTML (`text/html`) covering the current selection.
     pub fn selected_html(&self) -> Option<String> {
         let fragment = self.selected_fragment()?;
-        Some(fragment.to_html_with(&self.extensions))
+        Some(fragment.to_html_with(&editor_clipboard::ComponentClipboardFormatter::new(self)))
     }
 
     fn apply_zoom(&mut self, target_zoom: f32, cx: &mut Context<Self>) -> CommandOutcome {
@@ -4037,6 +4144,7 @@ impl RichDocumentView {
         }
 
         let mut shaper = GpuiShaper::with_extensions(window, &self.extensions)
+            .with_components(&self.document.components)
             .with_optional_font_resolver(self.font_resolver.as_deref());
         let Some(hit) = self.flow.hit_test_canvas(
             canvas_point,
@@ -4090,6 +4198,9 @@ impl RichDocumentView {
             Some((block_id, object_id, entry.object.clone()))
         });
 
+        self.pending_footnote = clicked_object.as_ref().and_then(|(_, _, object)| {
+            rich_model::footnote_reference_id(object)
+        });
         self.pending_chip = None;
         match clicked_object {
             Some((block_id, object_id, InlineObject::Image { .. })) if self.policy.editable => {
@@ -4115,6 +4226,18 @@ impl RichDocumentView {
                     kind,
                     label,
                     accent,
+                });
+            }
+            Some((block_id, object_id, InlineObject::Custom { kind, data }))
+                if kind.as_ref() == rich_model::DROPDOWN_KIND =>
+            {
+                self.selected_image = None;
+                self.pending_chip = Some(ActiveSmartChipPopover {
+                    block_id,
+                    object_id,
+                    kind: ChipKind::Tag,
+                    label: self.document.components.inline_fallback(&kind, &data.to_json()),
+                    accent: None,
                 });
             }
             _ => {
@@ -4237,6 +4360,7 @@ impl RichDocumentView {
         }
 
         let mut shaper = GpuiShaper::with_extensions(window, &self.extensions)
+            .with_components(&self.document.components)
             .with_optional_font_resolver(self.font_resolver.as_deref());
         let hit = self.flow.hit_test_canvas(
             canvas_point,
@@ -4402,6 +4526,9 @@ impl RichDocumentView {
             self.dispatch_command(RichCommand::OpenLink(href), cx);
         } else {
             self.pending_link = None;
+        }
+        if let Some(id) = self.pending_footnote.take() && !self.drag_moved {
+            self.dispatch_command(RichCommand::Anchor(rich_model::AnchorCommand::RevealFootnote { id }), cx);
         }
         self.drag_moved = false;
     }
@@ -4748,6 +4875,7 @@ impl EntityInputHandler for RichDocumentView {
 
         let viewport_width: f32 = bounds.size.width.into();
         let mut shaper = GpuiShaper::with_extensions(window, &self.extensions)
+            .with_components(&self.document.components)
             .with_optional_font_resolver(self.font_resolver.as_deref());
         let canvas_rect = self.flow.range_bounds_in_block(
             block_id,
@@ -4778,6 +4906,7 @@ impl EntityInputHandler for RichDocumentView {
         let canvas_point = self.window_point_to_canvas(position);
         let viewport_width: f32 = self.last_viewport_bounds.size.width.into();
         let mut shaper = GpuiShaper::with_extensions(window, &self.extensions)
+            .with_components(&self.document.components)
             .with_optional_font_resolver(self.font_resolver.as_deref());
         let hit = self.flow.hit_test_canvas(
             canvas_point,
@@ -5087,13 +5216,13 @@ impl Render for RichDocumentView {
                     if let Some(html) = extract_clipboard_html(&item) {
                         this.dispatch_command(RichCommand::PasteHtml { html, plain_text }, cx);
                     } else if let Some(text) = plain_text {
-                        this.dispatch_command(RichCommand::InsertText(text), cx);
+                        this.dispatch_command(RichCommand::PasteText(text), cx);
                     }
                 }
             }))
             .on_action(cx.listener(|this, _: &PastePlainText, _window, cx| {
                 if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                    this.dispatch_command(RichCommand::InsertText(text), cx);
+                    this.dispatch_command(RichCommand::PasteText(text), cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &SelectAll, _window, cx| {

@@ -403,7 +403,22 @@ impl InlineContent {
     }
 
     /// Inserts a previously captured `InlineContent` slice at `offset`.
+    /// Inserts captured content as a copy, assigning destination-local object IDs.
     pub fn insert_content(&mut self, offset: usize, slice: &InlineContent) {
+        self.insert_content_with_identity(offset, slice, false);
+    }
+
+    /// Restores removed content with its original object IDs (for undo).
+    pub fn insert_content_preserving_object_ids(&mut self, offset: usize, slice: &InlineContent) {
+        self.insert_content_with_identity(offset, slice, true);
+    }
+
+    fn insert_content_with_identity(
+        &mut self,
+        offset: usize,
+        slice: &InlineContent,
+        preserve_object_ids: bool,
+    ) {
         if slice.is_empty() {
             return;
         }
@@ -417,12 +432,19 @@ impl InlineContent {
             }
         }
         for obj in &slice.objects {
+            let id = if preserve_object_ids {
+                self.next_object_id = self.next_object_id.max(obj.id.0.saturating_add(1));
+                obj.id
+            } else {
+                let id = InlineObjectId(self.next_object_id);
+                self.next_object_id = self.next_object_id.saturating_add(1);
+                id
+            };
             self.objects.push(InlineObjectEntry {
-                id: obj.id,
+                id,
                 byte_offset: offset + obj.byte_offset,
                 object: obj.object.clone(),
             });
-            self.next_object_id = self.next_object_id.max(obj.id.0 + 1);
         }
         self.objects.sort_by_key(|e| e.byte_offset);
 
@@ -623,5 +645,34 @@ impl InlineContent {
             }
         }
         self.spans = merged;
+    }
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn copied_objects_get_fresh_ids_and_restore_can_preserve_identity() {
+        let mut source = InlineContent::empty();
+        let source_id = source.push_object(
+            InlineObject::custom("test", CustomPayload::default()),
+            InlineStyle::default(),
+        );
+        let copied = source.slice(0..source.len());
+
+        let mut destination = InlineContent::empty();
+        let existing_id = destination.push_object(
+            InlineObject::custom("test", CustomPayload::default()),
+            InlineStyle::default(),
+        );
+        destination.insert_content(destination.len(), &copied);
+        let copied_id = destination.objects[1].id;
+        assert_ne!(copied_id, existing_id);
+        assert_eq!(destination.object_by_id(existing_id).unwrap().byte_offset, 0);
+        assert_eq!(destination.object_by_id(copied_id).unwrap().byte_offset, 3);
+
+        let mut restored = InlineContent::empty();
+        restored.insert_content_preserving_object_ids(0, &copied);
+        assert_eq!(restored.objects[0].id, source_id);
     }
 }

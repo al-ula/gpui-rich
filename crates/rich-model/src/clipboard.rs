@@ -5,6 +5,7 @@ use crate::block::{
     BlockKind, BlockNode, ColumnSpec, Document, ListId, ListKind, NumberStyle, TableBlock,
     TableBorderStyle, TableCell, TableRow, block_kinds,
 };
+use crate::components::PlaceholderKind;
 use crate::inline::{
     ChipKind, InlineContent, InlineObject, InlineVAlign, OBJECT_REPLACEMENT_CHAR,
 };
@@ -14,7 +15,7 @@ use crate::style::{
     BaselineShift, BlockStyle, FontWeight, InlineStyle, LinkTarget, RgbaColor, SharedStr, StyleId,
     TextAlign, UnderlineKind,
 };
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Custom node clipboard fallback formatter implemented by host registries (such as `ExtensionRegistry`).
 pub trait ClipboardCustomFormatter {
@@ -93,6 +94,7 @@ pub enum ClipboardBlock {
 #[derive(Clone, Debug, PartialEq)]
 pub struct ClipboardTable {
     pub rows: Vec<ClipboardTableRow>,
+    pub column_kinds: BTreeMap<usize, PlaceholderKind>,
 }
 
 /// Portable table row inside a [`ClipboardTable`].
@@ -114,6 +116,10 @@ pub struct ClipboardTableCell {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct ClipboardFragment {
     pub blocks: Vec<ClipboardBlock>,
+    /// The leading block boundary was not selected; this fragment starts inside its text.
+    pub start_open: bool,
+    /// The trailing block boundary was not selected; this fragment ends inside its text.
+    pub end_open: bool,
 }
 
 impl ClipboardFragment {
@@ -132,7 +138,7 @@ impl ClipboardFragment {
                 align: TextAlign::Left,
             })
             .collect();
-        Self { blocks }
+        Self { blocks, start_open: false, end_open: false }
     }
 
     /// Serializes this fragment as plain UTF-8 text (TSV for tables) with default custom fallbacks.
@@ -158,7 +164,13 @@ impl ClipboardFragment {
     /// Serializes this fragment as normalized semantic HTML using `formatter` for custom nodes.
     pub fn to_html_with(&self, formatter: &dyn ClipboardCustomFormatter) -> String {
         let mut output = String::new();
-        write_blocks_html(&self.blocks, formatter, &mut output);
+        if self.is_open_inline()
+            && let Some(ClipboardBlock::Paragraph { content, .. }) = self.blocks.first()
+        {
+            write_inline_html(content, formatter, &mut output);
+        } else {
+            write_blocks_html(&self.blocks, formatter, &mut output);
+        }
         output
     }
 
@@ -166,9 +178,22 @@ impl ClipboardFragment {
     pub fn from_html(html: &str) -> Self {
         let body = extract_html_fragment_slice(html);
         let tokens = tokenize_html(body);
+        let has_block_boundary = tokens.iter().any(|token| match token {
+            HtmlToken::StartTag { name, .. } | HtmlToken::EndTag { name } => matches!(
+                name.as_str(),
+                "p" | "div" | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+                    | "blockquote" | "pre" | "ul" | "ol" | "table" | "hr"
+            ),
+            HtmlToken::Text(_) => false,
+        });
         let mut parser = HtmlFragmentParser::new();
         parser.parse(&tokens);
-        parser.finish()
+        let mut fragment = parser.finish();
+        if !has_block_boundary && matches!(fragment.blocks.as_slice(), [ClipboardBlock::Paragraph { .. }]) {
+            fragment.start_open = true;
+            fragment.end_open = true;
+        }
+        fragment
     }
 
     /// Builds a fragment capturing every top-level block of `document`.
@@ -179,6 +204,8 @@ impl ClipboardFragment {
                 .iter()
                 .map(block_node_to_clipboard_block)
                 .collect(),
+            start_open: false,
+            end_open: false,
         }
     }
 
@@ -189,6 +216,17 @@ impl ClipboardFragment {
             .iter()
             .map(|block| clipboard_block_to_node(block, document, &mut list_id_map))
             .collect()
+    }
+    /// Builds a structured fragment from already-normalized blocks.
+    pub fn from_blocks(blocks: Vec<ClipboardBlock>) -> Self {
+        Self { blocks, start_open: false, end_open: false }
+    }
+
+    /// Whether both edges can merge into surrounding text without paragraph boundaries.
+    pub fn is_open_inline(&self) -> bool {
+        self.start_open
+            && self.end_open
+            && matches!(self.blocks.as_slice(), [ClipboardBlock::Paragraph { .. }])
     }
 }
 
@@ -205,40 +243,58 @@ impl Document {
                 focus_cell,
             } => {
                 let table = self.find_block(*table_id)?.kind.table_block()?;
-                let row_min = anchor_cell.0.min(focus_cell.0);
-                let row_max = anchor_cell.0.max(focus_cell.0);
-                let col_min = anchor_cell.1.min(focus_cell.1);
-                let col_max = anchor_cell.1.max(focus_cell.1);
+                let (col_count, placements, occupancy) = table.resolve_grid();
+                if col_count == 0 || table.rows.is_empty() {
+                    return None;
+                }
+                let mut row_min = anchor_cell.0.min(focus_cell.0).min(table.rows.len() - 1);
+                let mut row_max = anchor_cell.0.max(focus_cell.0).min(table.rows.len() - 1);
+                let mut col_min = anchor_cell.1.min(focus_cell.1).min(col_count - 1);
+                let mut col_max = anchor_cell.1.max(focus_cell.1).min(col_count - 1);
+                loop {
+                    let previous = (row_min, row_max, col_min, col_max);
+                    for row in row_min..=row_max {
+                        for col in col_min..=col_max {
+                            let Some(placement_index) = occupancy[row][col] else {
+                                continue;
+                            };
+                            let placement = placements[placement_index];
+                            row_min = row_min.min(placement.row_index);
+                            row_max = row_max.max(placement.row_index + placement.rowspan - 1);
+                            col_min = col_min.min(placement.visual_col);
+                            col_max = col_max.max(placement.visual_col + placement.colspan - 1);
+                        }
+                    }
+                    if previous == (row_min, row_max, col_min, col_max) {
+                        break;
+                    }
+                }
                 let mut rows = Vec::new();
                 for row_index in row_min..=row_max {
-                    let Some(row) = table.rows.get(row_index) else {
-                        continue;
-                    };
+                    let row = &table.rows[row_index];
                     let mut cells = Vec::new();
-                    let mut col_cursor = 0usize;
-                    for cell in &row.cells {
-                        let span = cell.colspan.max(1) as usize;
-                        if col_cursor >= col_min && col_cursor <= col_max {
-                            let blocks = cell
-                                .blocks
-                                .iter()
-                                .map(block_node_to_clipboard_block)
-                                .collect();
-                            cells.push(ClipboardTableCell {
-                                colspan: cell.colspan,
-                                rowspan: cell.rowspan,
-                                blocks,
-                            });
-                        }
-                        col_cursor += span;
+                    for placement in placements.iter().filter(|placement| {
+                        placement.row_index == row_index
+                            && placement.visual_col <= col_max
+                            && placement.visual_col + placement.colspan > col_min
+                    }) {
+                        let cell = &row.cells[placement.cell_index];
+                        cells.push(ClipboardTableCell {
+                            colspan: cell.colspan,
+                            rowspan: cell.rowspan,
+                            blocks: cell.blocks.iter().map(block_node_to_clipboard_block).collect(),
+                        });
                     }
-                    rows.push(ClipboardTableRow {
-                        is_header: row.is_header,
-                        cells,
-                    });
+                    rows.push(ClipboardTableRow { is_header: row.is_header, cells });
                 }
                 Some(ClipboardFragment {
-                    blocks: vec![ClipboardBlock::Table(ClipboardTable { rows })],
+                    blocks: vec![ClipboardBlock::Table(ClipboardTable {
+                        rows,
+                        column_kinds: table.column_kinds.range(col_min..=col_max)
+                            .map(|(&column, &kind)| (column - col_min, kind)).collect(),
+                    })],
+                    start_open: false,
+                    end_open: false,
                 })
             }
             DocumentSelection::Text { anchor, focus, .. } => {
@@ -257,9 +313,92 @@ impl Document {
                     } else {
                         ((focus_index, focus.offset), (anchor_index, anchor.offset))
                     };
-
+                let anchor_cell_path = anchor.path.iter().rev().find_map(|segment| match segment {
+                    crate::selection::PathSegment::TableCell { table_id, row, col } => {
+                        Some((*table_id, *row, *col))
+                    }
+                    crate::selection::PathSegment::Block(_) => None,
+                });
+                let focus_cell_path = focus.path.iter().rev().find_map(|segment| match segment {
+                    crate::selection::PathSegment::TableCell { table_id, row, col } => {
+                        Some((*table_id, *row, *col))
+                    }
+                    crate::selection::PathSegment::Block(_) => None,
+                });
+                let same_table_cell =
+                    anchor_cell_path.is_some() && anchor_cell_path == focus_cell_path;
+                let crosses_table_cells = anchor_cell_path.is_some()
+                    && focus_cell_path.is_some()
+                    && anchor_cell_path != focus_cell_path;
+                let mut full_structures = Vec::new();
+                let mut root_leaf_start = 0usize;
+                for root in &self.blocks {
+                    let leaf_count = block_text_leaf_count(root);
+                    let root_leaf_end = root_leaf_start + leaf_count;
+                    let covers_start = root_leaf_start > start_index
+                        || (root_leaf_start == start_index && start_offset == 0);
+                    let covers_end = root_leaf_end <= end_index
+                        || (root_leaf_end == end_index + 1
+                            && leaves[end_index]
+                                .kind
+                                .inline_content()
+                                .is_some_and(|inline| end_offset >= inline.len()));
+                    if leaf_count == 0 {
+                        if root_leaf_start > start_index && root_leaf_start <= end_index {
+                            full_structures.push((
+                                root_leaf_start,
+                                root_leaf_end,
+                                block_node_to_clipboard_block(root),
+                            ));
+                        }
+                    } else if covers_start
+                        && covers_end
+                        && (matches!(root.kind, BlockKind::Container { .. })
+                            || (!same_table_cell && matches!(root.kind, BlockKind::Grid { .. })))
+                    {
+                        full_structures.push((
+                            root_leaf_start,
+                            root_leaf_end,
+                            block_node_to_clipboard_block(root),
+                        ));
+                    } else if leaf_count > 0
+                        && root_leaf_start <= end_index
+                        && root_leaf_end > start_index
+                        && (matches!(root.kind, BlockKind::Container { .. })
+                            || (!same_table_cell && matches!(root.kind, BlockKind::Grid { .. })))
+                    {
+                        let mut cursor = root_leaf_start;
+                        if let Some(fragment) = extract_partial_node(
+                            root,
+                            &mut cursor,
+                            start_index,
+                            start_offset,
+                            end_index,
+                            end_offset,
+                            crosses_table_cells,
+                        ) {
+                            full_structures.push((
+                                root_leaf_start.max(start_index),
+                                root_leaf_end.min(end_index + 1),
+                                fragment,
+                            ));
+                        }
+                    }
+                    root_leaf_start = root_leaf_end;
+                }
                 let mut blocks = Vec::new();
                 for index in start_index..=end_index {
+                    for (_, _, structure) in
+                        full_structures.iter().filter(|(start, _, _)| *start == index)
+                    {
+                        blocks.push(structure.clone());
+                    }
+                    if full_structures
+                        .iter()
+                        .any(|(start, end, _)| index >= *start && index < *end)
+                    {
+                        continue;
+                    }
                     let Some(block) = leaves.get(index) else {
                         continue;
                     };
@@ -321,7 +460,25 @@ impl Document {
                 if blocks.is_empty() {
                     None
                 } else {
-                    Some(ClipboardFragment { blocks })
+                    let start_len = leaves[start_index]
+                        .kind
+                        .inline_content()
+                        .map_or(0, |inline| inline.len());
+                    let end_len = leaves[end_index]
+                        .kind
+                        .inline_content()
+                        .map_or(0, |inline| inline.len());
+                    let start_open = if start_index == end_index {
+                        true
+                    } else {
+                        start_offset > 0 && start_offset < start_len
+                    };
+                    let end_open = if start_index == end_index {
+                        true
+                    } else {
+                        end_offset > 0 && end_offset < end_len
+                    };
+                    Some(ClipboardFragment { blocks, start_open, end_open })
                 }
             }
         }
@@ -396,6 +553,7 @@ fn block_node_to_clipboard_block(block: &BlockNode) -> ClipboardBlock {
             }
         }
         BlockKind::Grid { table, .. } => ClipboardBlock::Table(ClipboardTable {
+            column_kinds: table.column_kinds.clone(),
             rows: table
                 .rows
                 .iter()
@@ -427,6 +585,193 @@ fn block_node_to_clipboard_block(block: &BlockNode) -> ClipboardBlock {
                 }
             }
         }
+    }
+}
+fn block_text_leaf_count(block: &BlockNode) -> usize {
+    match &block.kind {
+        BlockKind::Text { .. } => 1,
+        BlockKind::Container { children, .. } => children.iter().map(block_text_leaf_count).sum(),
+        BlockKind::Grid { table, .. } => table
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .flat_map(|cell| &cell.blocks)
+            .map(block_text_leaf_count)
+            .sum(),
+        BlockKind::Leaf { .. } => 0,
+    }
+}
+fn extract_partial_node(
+    block: &BlockNode,
+    cursor: &mut usize,
+    start_index: usize,
+    start_offset: usize,
+    end_index: usize,
+    end_offset: usize,
+    whole_cells: bool,
+) -> Option<ClipboardBlock> {
+    match &block.kind {
+        BlockKind::Text { .. } => {
+            let index = *cursor;
+            *cursor += 1;
+            if !(start_index..=end_index).contains(&index) {
+                return None;
+            }
+            let inline = block.kind.inline_content()?;
+            let slice_start = if index == start_index {
+                clamp_char_boundary(&inline.text, start_offset)
+            } else {
+                0
+            };
+            let slice_end = if index == end_index {
+                clamp_char_boundary(&inline.text, end_offset).max(slice_start)
+            } else {
+                inline.len()
+            };
+            Some(clipboard_text_block(block, inline.slice(slice_start..slice_end)))
+        }
+        BlockKind::Container {
+            kind,
+            data,
+            children,
+        } => {
+            let mut extracted = Vec::new();
+            for child in children {
+                let child_count = block_text_leaf_count(child);
+                if child_count == 0 {
+                    if *cursor > start_index && *cursor <= end_index {
+                        extracted.push(block_node_to_clipboard_block(child));
+                    }
+                    continue;
+                }
+                let child_start = *cursor;
+                if let Some(fragment) = extract_partial_node(
+                    child,
+                    cursor,
+                    start_index,
+                    start_offset,
+                    end_index,
+                    end_offset,
+                    whole_cells,
+                ) {
+                    extracted.push(fragment);
+                } else {
+                    *cursor = child_start + child_count;
+                }
+            }
+            if extracted.is_empty() {
+                None
+            } else if kind.as_ref() == block_kinds::BLOCKQUOTE {
+                Some(ClipboardBlock::Blockquote(extracted))
+            } else {
+                Some(ClipboardBlock::CustomContainer {
+                    kind: kind.clone(),
+                    data: data.clone(),
+                    children: extracted,
+                })
+            }
+        }
+        BlockKind::Grid { table, .. } => {
+            let mut rows = Vec::with_capacity(table.rows.len());
+            for row in &table.rows {
+                let mut cells = Vec::new();
+                for cell in &row.cells {
+                    let cell_start = *cursor;
+                    let cell_count: usize =
+                        cell.blocks.iter().map(block_text_leaf_count).sum();
+                    if whole_cells {
+                        if cell_count > 0
+                            && cell_start <= end_index
+                            && cell_start + cell_count > start_index
+                        {
+                            cells.push(ClipboardTableCell {
+                                colspan: cell.colspan,
+                                rowspan: cell.rowspan,
+                                blocks: cell.blocks.iter().map(block_node_to_clipboard_block).collect(),
+                            });
+                        }
+                        *cursor += cell_count;
+                        continue;
+                    }
+                    let mut cell_blocks = Vec::new();
+                    for child in &cell.blocks {
+                        let child_count = block_text_leaf_count(child);
+                        if child_count == 0 {
+                            if *cursor > start_index && *cursor <= end_index {
+                                cell_blocks.push(block_node_to_clipboard_block(child));
+                            }
+                        } else if let Some(fragment) = extract_partial_node(
+                            child,
+                            cursor,
+                            start_index,
+                            start_offset,
+                            end_index,
+                            end_offset,
+                            whole_cells,
+                        ) {
+                            cell_blocks.push(fragment);
+                        } else {
+                            *cursor += child_count;
+                        }
+                    }
+                    if !cell_blocks.is_empty() {
+                        cells.push(ClipboardTableCell {
+                            colspan: cell.colspan,
+                            rowspan: cell.rowspan,
+                            blocks: cell_blocks,
+                        });
+                    }
+                }
+                rows.push(ClipboardTableRow {
+                    is_header: row.is_header,
+                    cells,
+                });
+            }
+            Some(ClipboardBlock::Table(ClipboardTable { rows, column_kinds: Default::default() }))
+        }
+        BlockKind::Leaf { .. } => {
+            if *cursor > start_index && *cursor <= end_index {
+                Some(block_node_to_clipboard_block(block))
+            } else {
+                None
+            }
+        }
+    }
+}
+
+fn clipboard_text_block(block: &BlockNode, content: InlineContent) -> ClipboardBlock {
+    let align = block.style.align;
+    if block.kind.is_paragraph() {
+        ClipboardBlock::Paragraph { content, align }
+    } else if let Some(heading) = block.kind.heading_data() {
+        ClipboardBlock::Heading {
+            level: heading.level,
+            content,
+            align,
+        }
+    } else if let Some(item) = block.kind.list_item_data() {
+        ClipboardBlock::ListItem {
+            list_group: item.list_id.0,
+            kind: item.kind,
+            indent_level: item.indent_level,
+            checked: item.checked,
+            content,
+            align,
+        }
+    } else if let Some(code) = block.kind.code_block_data() {
+        ClipboardBlock::CodeBlock {
+            language: code.language.clone(),
+            content,
+        }
+    } else if let BlockKind::Text { kind, data, .. } = &block.kind {
+        ClipboardBlock::CustomText {
+            kind: kind.clone(),
+            data: data.clone(),
+            content,
+            align,
+        }
+    } else {
+        ClipboardBlock::Paragraph { content, align }
     }
 }
 
@@ -561,6 +906,7 @@ fn clipboard_block_to_node(
                 id,
                 BlockKind::table(TableBlock {
                     columns: vec![ColumnSpec::Auto; column_count],
+                    column_kinds: table.column_kinds.clone(),
                     rows,
                     border_style: TableBorderStyle::default(),
                 }),
@@ -826,7 +1172,18 @@ fn write_single_block_html(
             output.push_str("</code></pre>");
         }
         ClipboardBlock::Table(table) => {
-            output.push_str("<table><tbody>");
+            output.push_str("<table");
+            if !table.column_kinds.is_empty() {
+                output.push_str(" data-rich-column-kinds=\"");
+                for (index, (column, kind)) in table.column_kinds.iter().enumerate() {
+                    if index > 0 { output.push(','); }
+                    output.push_str(&column.to_string());
+                    output.push(':');
+                    output.push_str(kind.as_str());
+                }
+                output.push('"');
+            }
+            output.push_str("><tbody>");
             for row in &table.rows {
                 output.push_str("<tr>");
                 let cell_tag = if row.is_header { "th" } else { "td" };
@@ -1403,6 +1760,7 @@ struct ListContext {
 
 struct TableBuildState {
     rows: Vec<ClipboardTableRow>,
+    column_kinds: BTreeMap<usize, PlaceholderKind>,
     current_row: Option<ClipboardTableRow>,
     current_cell: Option<(u16, u16, Vec<ClipboardBlock>)>,
 }
@@ -1469,6 +1827,8 @@ impl HtmlFragmentParser {
         }
         ClipboardFragment {
             blocks: self.blocks,
+            start_open: false,
+            end_open: false,
         }
     }
 
@@ -1739,6 +2099,11 @@ impl HtmlFragmentParser {
                 self.flush_current_block();
                 self.table_stack.push(TableBuildState {
                     rows: Vec::new(),
+                    column_kinds: attr_value(attrs, "data-rich-column-kinds").unwrap_or_default()
+                        .split(',').filter_map(|pair| {
+                            let (column, kind) = pair.split_once(':')?;
+                            Some((column.parse().ok()?, PlaceholderKind::from_name(kind)?))
+                        }).collect(),
                     current_row: None,
                     current_cell: None,
                 });
@@ -2000,7 +2365,7 @@ fn finish_table_state(mut state: TableBuildState) -> ClipboardTable {
     {
         state.rows.push(row);
     }
-    ClipboardTable { rows: state.rows }
+    ClipboardTable { rows: state.rows, column_kinds: state.column_kinds }
 }
 
 fn inline_style_for_tag(
@@ -2046,30 +2411,30 @@ fn apply_css_inline_style(css: &str, style: &mut InlineStyle) {
         let value_lower = value.to_ascii_lowercase();
         match prop.as_str() {
             "font-weight" => {
-                if value_lower == "bold" || value_lower == "bolder" {
+                if value_lower == "normal" || value_lower == "lighter" {
+                    style.weight = Some(FontWeight(400));
+                } else if value_lower == "bold" || value_lower == "bolder" {
                     style.weight = Some(FontWeight::BOLD);
-                } else if let Ok(numeric) = value_lower.parse::<u16>()
-                    && numeric >= 600
-                {
-                    style.weight = Some(FontWeight(numeric));
+                } else if let Ok(numeric) = value_lower.parse::<u16>() {
+                    style.weight = Some(FontWeight(numeric.clamp(1, 1000)));
                 }
             }
-            "font-style" if value_lower == "italic" || value_lower == "oblique" => {
-                style.italic = Some(true);
+            "font-style" => {
+                style.italic = Some(value_lower == "italic" || value_lower == "oblique");
             }
             "text-decoration" | "text-decoration-line" => {
                 if value_lower.contains("underline") {
                     style.underline = Some(UnderlineKind::Solid);
                 }
-                if value_lower.contains("line-through") {
-                    style.strikethrough = Some(true);
-                }
+                style.strikethrough = Some(value_lower.contains("line-through"));
             }
             "vertical-align" => {
                 if value_lower == "super" {
                     style.baseline_shift = Some(BaselineShift::Superscript);
                 } else if value_lower == "sub" {
                     style.baseline_shift = Some(BaselineShift::Subscript);
+                } else if value_lower == "baseline" {
+                    style.baseline_shift = Some(BaselineShift::Normal);
                 }
             }
             "color" => {
@@ -2212,4 +2577,241 @@ fn clamp_char_boundary(text: &str, offset: usize) -> usize {
         clamped -= 1;
     }
     clamped
+}
+#[cfg(test)]
+mod clipboard_tests {
+    use super::*;
+
+    #[test]
+    fn explicit_css_font_weight_overrides_semantic_tag_defaults() {
+        let fragment = ClipboardFragment::from_html(
+            "<p><b style=\"font-weight:normal\">regular</b> <span style=\"font-weight:400\">plain</span> <span style=\"font-weight:700\">bold</span></p>",
+        );
+        let ClipboardBlock::Paragraph { content, .. } = &fragment.blocks[0] else {
+            panic!("expected paragraph");
+        };
+        assert_eq!(content.style_at(0).weight, Some(FontWeight(400)));
+        assert_eq!(content.style_at(8).weight, Some(FontWeight(400)));
+        assert_eq!(content.style_at(15).weight, Some(FontWeight(700)));
+    }
+    #[test]
+    fn html_paragraph_boundaries_and_inline_edges_are_distinct() {
+        let inline = ClipboardFragment::from_html("<span>selected</span>");
+        assert!(inline.is_open_inline());
+        assert_eq!(inline.to_html(), "selected");
+
+        let paragraph = ClipboardFragment::from_html("<p>selected</p>");
+        assert!(!paragraph.is_open_inline());
+    }
+
+    #[test]
+    fn table_copy_uses_visual_occupancy_beside_rowspans() {
+        let mut document = Document::new();
+        let table_id = document.alloc_block_id();
+        let mut make_cell = |text: &str, rowspan: u16| {
+            let cell_id = document.alloc_block_id();
+            let paragraph_id = document.alloc_block_id();
+            let mut cell = TableCell::simple(
+                cell_id,
+                vec![BlockNode::new(
+                    paragraph_id,
+                    BlockKind::paragraph(InlineContent::plain(text)),
+                    BlockStyle::default(),
+                )],
+            );
+            cell.rowspan = rowspan;
+            cell
+        };
+        let table = TableBlock {
+            columns: vec![ColumnSpec::Auto; 2],
+            rows: vec![
+                TableRow {
+                    is_header: false,
+                    cells: vec![make_cell("A", 2), make_cell("B", 1)],
+                },
+                TableRow {
+                    is_header: false,
+                    cells: vec![make_cell("C", 1)],
+                },
+            ],
+            column_kinds: Default::default(),
+            border_style: TableBorderStyle::default(),
+        };
+        drop(make_cell);
+        document.push_block(BlockNode::new(
+            table_id,
+            BlockKind::table(table),
+            BlockStyle::default(),
+        ));
+        let fragment = document
+            .extract_selection_fragment(&DocumentSelection::TableCells {
+                table_id,
+                anchor_cell: (0, 1),
+                focus_cell: (1, 1),
+            })
+            .unwrap();
+        let ClipboardBlock::Table(table) = &fragment.blocks[0] else {
+            panic!("expected table");
+        };
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(
+            block_to_plain_text(&table.rows[0].cells[0].blocks[0], &DefaultClipboardFormatter),
+            "B"
+        );
+        assert_eq!(
+            block_to_plain_text(&table.rows[1].cells[0].blocks[0], &DefaultClipboardFormatter),
+            "C"
+        );
+        let expanded = document
+            .extract_selection_fragment(&DocumentSelection::TableCells {
+                table_id,
+                anchor_cell: (1, 0),
+                focus_cell: (1, 0),
+            })
+            .unwrap();
+        let ClipboardBlock::Table(expanded_table) = &expanded.blocks[0] else {
+            panic!("expected expanded table");
+        };
+        assert_eq!(expanded_table.rows[0].cells[0].rowspan, 2);
+    }
+    #[test]
+    fn selection_extraction_preserves_structural_nodes_and_atomic_blocks() {
+        let mut document = Document::new();
+        let before_id =
+            document.add_paragraph(InlineContent::plain("before"), BlockStyle::default());
+        let container_id = document.alloc_block_id();
+        let first_child_id = document.alloc_block_id();
+        let second_child_id = document.alloc_block_id();
+        document.push_block(BlockNode::new(
+            container_id,
+            BlockKind::blockquote(vec![
+                BlockNode::new(
+                    first_child_id,
+                    BlockKind::paragraph(InlineContent::plain("inside one")),
+                    BlockStyle::default(),
+                ),
+                BlockNode::new(
+                    second_child_id,
+                    BlockKind::paragraph(InlineContent::plain("inside two")),
+                    BlockStyle::default(),
+                ),
+            ]),
+            BlockStyle::default(),
+        ));
+        document.add_horizontal_rule();
+        let table_id = document.alloc_block_id();
+        let cell_id = document.alloc_block_id();
+        let cell_paragraph_id = document.alloc_block_id();
+        let table = TableBlock {
+            columns: vec![ColumnSpec::Auto],
+            rows: vec![TableRow {
+                is_header: false,
+                cells: vec![TableCell::simple(
+                    cell_id,
+                    vec![BlockNode::new(
+                        cell_paragraph_id,
+                        BlockKind::paragraph(InlineContent::plain("table cell")),
+                        BlockStyle::default(),
+                    )],
+                )],
+            }],
+            column_kinds: Default::default(),
+            border_style: TableBorderStyle::default(),
+        };
+        document.push_block(BlockNode::new(
+            table_id,
+            BlockKind::table(table),
+            BlockStyle::default(),
+        ));
+        let after_id =
+            document.add_paragraph(InlineContent::plain("after"), BlockStyle::default());
+        let selection = DocumentSelection::Text {
+            anchor: document.doc_pos_for_block(before_id, 0).unwrap(),
+            focus: document.doc_pos_for_block(after_id, 5).unwrap(),
+            affinity: crate::selection::Affinity::Downstream,
+            goal_x: None,
+            stored_marks: None,
+        };
+        let fragment = document.extract_selection_fragment(&selection).unwrap();
+        assert!(matches!(fragment.blocks[1], ClipboardBlock::Blockquote(_)));
+        assert!(matches!(fragment.blocks[2], ClipboardBlock::HorizontalRule));
+        assert!(matches!(fragment.blocks[3], ClipboardBlock::Table(_)));
+        assert_eq!(
+            fragment.to_plain_text(),
+            "before\ninside one\ninside two\n---\ntable cell\nafter"
+        );
+    }
+    #[test]
+    fn selection_ending_at_next_block_start_keeps_the_boundary_closed() {
+        let mut document = Document::new();
+        let first_id =
+            document.add_paragraph(InlineContent::plain("first"), BlockStyle::default());
+        let second_id =
+            document.add_paragraph(InlineContent::plain("second"), BlockStyle::default());
+        let selection = DocumentSelection::Text {
+            anchor: document.doc_pos_for_block(first_id, 0).unwrap(),
+            focus: document.doc_pos_for_block(second_id, 0).unwrap(),
+            affinity: crate::selection::Affinity::Downstream,
+            goal_x: None,
+            stored_marks: None,
+        };
+        let fragment = document.extract_selection_fragment(&selection).unwrap();
+        assert!(!fragment.end_open);
+        assert!(!fragment.is_open_inline());
+    }
+    #[test]
+    fn selection_inside_both_paragraph_edges_is_open() {
+        let mut document = Document::new();
+        let first_id =
+            document.add_paragraph(InlineContent::plain("first text"), BlockStyle::default());
+        let second_id =
+            document.add_paragraph(InlineContent::plain("second text"), BlockStyle::default());
+        let selection = DocumentSelection::Text {
+            anchor: document.doc_pos_for_block(first_id, 2).unwrap(),
+            focus: document.doc_pos_for_block(second_id, 4).unwrap(),
+            affinity: crate::selection::Affinity::Downstream,
+            goal_x: None,
+            stored_marks: None,
+        };
+        let fragment = document.extract_selection_fragment(&selection).unwrap();
+        assert!(fragment.start_open);
+        assert!(fragment.end_open);
+        assert!(!fragment.is_open_inline());
+    }
+    #[test]
+    fn partial_container_copy_keeps_tree_and_trims_text_edges() {
+        let mut document = Document::new();
+        let first_id = document.alloc_block_id();
+        let second_id = document.alloc_block_id();
+        let container_id = document.alloc_block_id();
+        document.push_block(BlockNode::new(
+            container_id,
+            BlockKind::blockquote(vec![
+                BlockNode::new(
+                    first_id,
+                    BlockKind::paragraph(InlineContent::plain("first")),
+                    BlockStyle::default(),
+                ),
+                BlockNode::new(
+                    second_id,
+                    BlockKind::paragraph(InlineContent::plain("second")),
+                    BlockStyle::default(),
+                ),
+            ]),
+            BlockStyle::default(),
+        ));
+        let selection = DocumentSelection::Text {
+            anchor: document.doc_pos_for_block(first_id, 2).unwrap(),
+            focus: document.doc_pos_for_block(second_id, 3).unwrap(),
+            affinity: crate::selection::Affinity::Downstream,
+            goal_x: None,
+            stored_marks: None,
+        };
+        let fragment = document.extract_selection_fragment(&selection).unwrap();
+        let ClipboardBlock::Blockquote(children) = &fragment.blocks[0] else {
+            panic!("expected a trimmed blockquote");
+        };
+        assert_eq!(block_to_plain_text(&children[0], &DefaultClipboardFormatter), "rst");
+        assert_eq!(block_to_plain_text(&children[1], &DefaultClipboardFormatter), "sec");
+    }
 }

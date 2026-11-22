@@ -1,6 +1,6 @@
 use crate::block::{BlockLayout, LayoutCache, default_list_marker};
 use crate::geometry::{Point, Rect, pt_to_px};
-use crate::line::{HitResult, LineFragment};
+use crate::line::{HitResult, LineFragment, ParagraphLayout};
 use crate::shaper::{GlyphBackend, TextShaper};
 use rich_model::{
     Affinity, BlockId, BlockKind, BlockNode, BlockWidth, DocPos, Document, DocumentLayoutConfig,
@@ -247,33 +247,7 @@ pub fn resolve_block_horizontal_span(
 
 /// Computes which top-level blocks are visible under collapsible heading rules.
 pub fn compute_visibility_mask(doc: &Document) -> Vec<bool> {
-    let mut visible = vec![true; doc.blocks.len()];
-    let mut collapsed_level: Option<u8> = None;
-
-    for (idx, block) in doc.blocks.iter().enumerate() {
-        if let Some(heading) = block.kind.heading_data() {
-            if let Some(cur_level) = collapsed_level {
-                if heading.level <= cur_level {
-                    collapsed_level = if heading.collapsed {
-                        Some(heading.level)
-                    } else {
-                        None
-                    };
-                    visible[idx] = true;
-                } else {
-                    visible[idx] = false;
-                }
-            } else {
-                visible[idx] = true;
-                if heading.collapsed {
-                    collapsed_level = Some(heading.level);
-                }
-            }
-        } else if collapsed_level.is_some() {
-            visible[idx] = false;
-        }
-    }
-    visible
+    doc.top_level_visibility().collect()
 }
 
 /// Precomputes display markers (`•`, `1.`, `a.`, `☐`, `☑`) for top-level list items.
@@ -392,6 +366,7 @@ impl<B: GlyphBackend> FlowLayout<B> {
             .collect();
 
         self.visibility = compute_visibility_mask(doc);
+        self.cache.sync_ordered_markers(doc);
         self.list_markers = compute_list_markers(doc);
         self.block_ids = doc.blocks.iter().map(|b| b.id).collect();
         self.id_to_index.clear();
@@ -476,15 +451,7 @@ impl<B: GlyphBackend> FlowLayout<B> {
         if doc.blocks.is_empty() {
             return Vec::new();
         }
-        let horizontal = resolve_horizontal_metrics(viewport_width, &doc.config, zoom);
-        if self.block_ids.len() != doc.blocks.len()
-            || (horizontal.column_width - self.last_column_width).abs() > 0.5
-            || (zoom - self.last_zoom).abs() > 0.001
-            || doc.config.horizontal_layout != self.last_horizontal_layout
-            || doc.config.active_margins_pt() != self.last_margins_pt
-        {
-            self.sync_document(doc, viewport_width, zoom);
-        }
+        self.sync_geometry_if_needed(doc, viewport_width, zoom);
 
         let start_y = (scroll_y - overscan - self.top_padding_px).max(0.0);
         let end_y = (scroll_y + viewport_height + overscan - self.top_padding_px).max(0.0);
@@ -542,6 +509,60 @@ impl<B: GlyphBackend> FlowLayout<B> {
                 layout,
             })
             .collect()
+    }
+
+    fn sync_geometry_if_needed(&mut self, doc: &Document, viewport_width: f32, zoom: f32) {
+        let horizontal = resolve_horizontal_metrics(viewport_width, &doc.config, zoom);
+        if self.block_ids.len() != doc.blocks.len()
+            || (horizontal.column_width - self.last_column_width).abs() > 0.5
+            || (zoom - self.last_zoom).abs() > 0.001
+            || doc.config.horizontal_layout != self.last_horizontal_layout
+            || doc.config.active_margins_pt() != self.last_margins_pt
+        {
+            self.sync_document(doc, viewport_width, zoom);
+        }
+    }
+    /// Measures the top-level block containing `pos`, including off-screen nested table cells,
+    /// and returns the resulting canvas-space caret rectangle.
+    pub fn measure_caret_rect<S: TextShaper<Backend = B>>(
+        &mut self,
+        doc: &Document,
+        pos: &DocPos,
+        affinity: Affinity,
+        viewport_width: f32,
+        zoom: f32,
+        shaper: &mut S,
+    ) -> Option<Rect> {
+        self.sync_geometry_if_needed(doc, viewport_width, zoom);
+        let top_id = pos.top_level_block_id()?;
+        let leaf_id = pos.leaf_block_id()?;
+        let idx = *self.id_to_index.get(&top_id)?;
+        if !self.is_visible(idx) {
+            return None;
+        }
+        let block = doc.blocks.get(idx)?;
+        let (block_x, max_w) =
+            resolve_block_horizontal_span(viewport_width, &doc.config, block.width_mode, zoom);
+        let marker = self.list_markers.get(idx).and_then(Option::as_deref);
+        let layout = self.cache.get_or_layout(
+            block,
+            marker,
+            &doc.stylesheet,
+            &doc.config,
+            max_w,
+            zoom,
+            shaper,
+        );
+        self.metrics[idx] = BlockMetrics {
+            content_height: layout.height,
+            space_before: layout.space_before_px,
+            space_after: layout.space_after_px,
+            measured: true,
+        };
+        self.update_slot_and_prev_neighbor(idx);
+        let (paragraph, origin) =
+            find_leaf_paragraph(&layout, leaf_id, Point::new(block_x, self.block_y(idx)))?;
+        Some(paragraph.caret_rect(pos.offset, affinity).translate(origin.x, origin.y))
     }
 
     pub fn hit_test_canvas<S: TextShaper<Backend = B>>(
@@ -796,29 +817,29 @@ impl<B: GlyphBackend> FlowLayout<B> {
                 let row_max = anchor_cell.0.max(focus_cell.0);
                 let col_min = anchor_cell.1.min(focus_cell.1);
                 let col_max = anchor_cell.1.max(focus_cell.1);
-                for visible in visible_blocks {
-                    if visible.id != *table_id {
-                        continue;
-                    }
-                    if let Some(table) = visible.layout.table_layout() {
-                        let content_origin = visible.layout.content_origin();
+                if let Some((table, origin)) = visible_blocks.iter().find_map(|visible| {
+                    find_table_layout(&visible.layout, *table_id, Point::new(visible.x, visible.y))
+                }) {
+                    let (mut top, mut bottom, mut left, mut right) = (row_min, row_max, col_min, col_max);
+                    loop {
+                        let previous = (top, bottom, left, right);
                         for cell in &table.cells {
-                            let cell_row_end =
-                                cell.row + (cell.rowspan.max(1) as usize).saturating_sub(1);
-                            let cell_col_end =
-                                cell.col + (cell.colspan.max(1) as usize).saturating_sub(1);
-                            if cell_row_end >= row_min
-                                && cell.row <= row_max
-                                && cell_col_end >= col_min
-                                && cell.col <= col_max
-                            {
-                                rects.push(cell.rect.translate(
-                                    visible.x + content_origin.x,
-                                    visible.y + content_origin.y,
-                                ));
+                            let last_row = cell.row + usize::from(cell.rowspan.max(1)) - 1;
+                            let last_col = cell.col + usize::from(cell.colspan.max(1)) - 1;
+                            if last_row >= top && cell.row <= bottom && last_col >= left && cell.col <= right {
+                                top = top.min(cell.row);
+                                bottom = bottom.max(last_row);
+                                left = left.min(cell.col);
+                                right = right.max(last_col);
                             }
                         }
+                        if previous == (top, bottom, left, right) {
+                            break;
+                        }
                     }
+                    rects.extend(table.cells.iter().filter(|cell| {
+                        (top..=bottom).contains(&cell.row) && (left..=right).contains(&cell.col)
+                    }).map(|cell| cell.rect.translate(origin.x, origin.y)));
                 }
             }
         }
@@ -1211,6 +1232,55 @@ fn collect_leaf_paragraphs<'layout, B: GlyphBackend>(
             }
         }
     }
+}
+
+fn find_leaf_paragraph<B: GlyphBackend>(
+    layout: &BlockLayout<B>,
+    id: BlockId,
+    origin: Point,
+) -> Option<(&ParagraphLayout<B>, Point)> {
+    let content = layout.content_origin();
+    if layout.id == id {
+        return Some((layout.paragraph()?, Point::new(origin.x + content.x, origin.y + content.y)));
+    }
+    if let Some(children) = layout.children() {
+        return children.iter().find_map(|child| {
+            find_leaf_paragraph(&child.layout, id, Point::new(origin.x + child.x, origin.y + child.y))
+        });
+    }
+    layout.table_layout()?.cells.iter().find_map(|cell| {
+        cell.children.iter().find_map(|child| {
+            find_leaf_paragraph(&child.layout, id, Point::new(
+                origin.x + content.x + cell.rect.x + child.x,
+                origin.y + content.y + cell.rect.y + child.y,
+            ))
+        })
+    })
+}
+
+fn find_table_layout<B: GlyphBackend>(
+    layout: &BlockLayout<B>,
+    id: BlockId,
+    origin: Point,
+) -> Option<(&crate::block::TableLayout<B>, Point)> {
+    if let Some(children) = layout.children() {
+        return children.iter().find_map(|child| {
+            find_table_layout(&child.layout, id, Point::new(origin.x + child.x, origin.y + child.y))
+        });
+    }
+    let table = layout.table_layout()?;
+    let content = layout.content_origin();
+    let origin = Point::new(origin.x + content.x, origin.y + content.y);
+    if layout.id == id {
+        return Some((table, origin));
+    }
+    table.cells.iter().find_map(|cell| {
+        cell.children.iter().find_map(|child| {
+            find_table_layout(&child.layout, id, Point::new(
+                origin.x + cell.rect.x + child.x, origin.y + cell.rect.y + child.y,
+            ))
+        })
+    })
 }
 
 fn hit_test_layout_recursive<B: GlyphBackend>(

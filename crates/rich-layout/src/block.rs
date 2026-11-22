@@ -2,7 +2,8 @@ use crate::geometry::{Insets, Point, Rect, pt_to_px};
 use crate::line::{HitResult, ParagraphLayout, layout_paragraph};
 use crate::shaper::{GlyphBackend, TextShaper};
 use rich_model::{
-    BlockId, BlockKind, BlockNode, CellVAlign, ColumnSpec, CustomPayload, DocumentLayoutConfig,
+    BlockId, BlockKind, BlockNode, CellVAlign, ColumnSpec, CustomPayload, Document,
+    DocumentLayoutConfig,
     ListKind, NumberStyle, RgbaColor, SharedStr, StyleSheet, TableBlock, TableBorderStyle,
     block_kinds,
 };
@@ -179,6 +180,8 @@ struct CacheKey {
 pub struct LayoutCache<B: GlyphBackend> {
     entries: HashMap<CacheKey, Arc<BlockLayout<B>>>,
     latest_by_id: HashMap<BlockId, CacheKey>,
+    ordered_markers: HashMap<BlockId, Arc<str>>,
+    footnote_numbers: Arc<HashMap<rich_model::AnchorId, u32>>,
 }
 
 impl<B: GlyphBackend> Default for LayoutCache<B> {
@@ -186,6 +189,8 @@ impl<B: GlyphBackend> Default for LayoutCache<B> {
         Self {
             entries: HashMap::new(),
             latest_by_id: HashMap::new(),
+            ordered_markers: HashMap::new(),
+            footnote_numbers: Arc::default(),
         }
     }
 }
@@ -200,6 +205,65 @@ impl<B: GlyphBackend> LayoutCache<B> {
     pub fn clear(&mut self) {
         self.entries.clear();
         self.latest_by_id.clear();
+        self.ordered_markers.clear();
+        self.footnote_numbers = Arc::default();
+    }
+
+    pub(crate) fn sync_ordered_markers(&mut self, document: &Document) {
+        let next = rich_model::ordered_list_markers(document);
+        let next_notes = if document.anchors.footnotes().next().is_some() {
+            document.anchors.footnote_number_map(document)
+        } else {
+            HashMap::new()
+        };
+        let changed_notes = (next_notes != *self.footnote_numbers).then_some(&next_notes);
+        fn invalidate_changed<B: GlyphBackend>(
+            cache: &mut LayoutCache<B>,
+            next: &HashMap<BlockId, String>,
+            changed_notes: Option<&HashMap<rich_model::AnchorId, u32>>,
+            block: &BlockNode,
+        ) -> bool {
+            let mut changed = cache.ordered_markers.get(&block.id).map(AsRef::as_ref)
+                != next.get(&block.id).map(String::as_str);
+            if let Some(numbers) = changed_notes
+                && let Some(inline) = block.kind.inline_content()
+            {
+                changed |= inline.objects.iter().any(|entry| {
+                    rich_model::footnote_reference_id(&entry.object).is_some_and(|id| {
+                        cache.footnote_numbers.get(&id) != numbers.get(&id)
+                    })
+                });
+            }
+            match &block.kind {
+                BlockKind::Container { children, .. } => {
+                    for child in children {
+                        changed |= invalidate_changed(cache, next, changed_notes, child);
+                    }
+                }
+                BlockKind::Grid { table, .. } => {
+                    for child in table.rows.iter().flat_map(|row| &row.cells).flat_map(|cell| &cell.blocks) {
+                        changed |= invalidate_changed(cache, next, changed_notes, child);
+                    }
+                }
+                _ => {}
+            }
+            if changed {
+                cache.invalidate_block(block.id);
+            }
+            changed
+        }
+        for block in &document.blocks {
+            invalidate_changed(self, &next, changed_notes, block);
+        }
+        if changed_notes.is_some() {
+            self.footnote_numbers = Arc::new(next_notes);
+        }
+        self.ordered_markers = next.into_iter().map(|(id, marker)| {
+            let marker = self.ordered_markers.remove(&id)
+                .filter(|previous| previous.as_ref() == marker)
+                .unwrap_or_else(|| Arc::from(marker));
+            (id, marker)
+        }).collect();
     }
 
     pub fn get_cached(
@@ -245,9 +309,11 @@ impl<B: GlyphBackend> LayoutCache<B> {
             return Arc::clone(cached);
         }
 
+        shaper.set_footnote_numbers(&self.footnote_numbers);
+        let ordered_marker = self.ordered_markers.get(&block.id).cloned();
         let layout = Arc::new(layout_block(
             block,
-            list_marker,
+            ordered_marker.as_deref().or(list_marker),
             sheet,
             config,
             max_width,
@@ -603,18 +669,7 @@ fn layout_table<S: TextShaper>(
     cache: &mut LayoutCache<S::Backend>,
     shaper: &mut S,
 ) -> TableLayout<S::Backend> {
-    let col_count = table
-        .columns
-        .len()
-        .max(
-            table
-                .rows
-                .iter()
-                .map(|r| r.cells.iter().map(|c| c.colspan.max(1) as usize).sum())
-                .max()
-                .unwrap_or(1),
-        )
-        .max(1);
+    let (col_count, placements, _) = table.resolve_grid();
 
     let column_widths = resolve_column_widths(&table.columns, col_count, max_width, zoom);
     let total_width: f32 = column_widths.iter().sum();
@@ -649,25 +704,16 @@ fn layout_table<S: TextShaper>(
         children: Vec<PlacedChildBlock<B>>,
     }
 
-    let mut occupied = vec![vec![false; col_count]; row_count];
-    let mut measured = Vec::new();
+    let mut placements = placements.into_iter().peekable();
+    let mut measured = Vec::with_capacity(placements.len());
 
     for (r_idx, row) in table.rows.iter().enumerate() {
-        let mut c_cursor = 0usize;
-        for (cell_index, cell) in row.cells.iter().enumerate() {
-            while c_cursor < col_count && occupied[r_idx][c_cursor] {
-                c_cursor += 1;
-            }
-            if c_cursor >= col_count {
-                break;
-            }
-            let colspan = (cell.colspan.max(1) as usize).min(col_count - c_cursor);
-            let rowspan = (cell.rowspan.max(1) as usize).min(row_count - r_idx);
-            for rr in r_idx..(r_idx + rowspan) {
-                for cc in c_cursor..(c_cursor + colspan) {
-                    occupied[rr][cc] = true;
-                }
-            }
+        while let Some(placement) = placements.next_if(|placement| placement.row_index == r_idx) {
+            let cell_index = placement.cell_index;
+            let cell = &row.cells[cell_index];
+            let c_cursor = placement.visual_col;
+            let colspan = placement.colspan;
+            let rowspan = placement.rowspan;
 
             let cell_x = col_x[c_cursor];
             let cell_w = col_x[c_cursor + colspan] - cell_x;
@@ -719,7 +765,6 @@ fn layout_table<S: TextShaper>(
                 background: cell.background,
                 children,
             });
-            c_cursor += colspan;
         }
     }
 

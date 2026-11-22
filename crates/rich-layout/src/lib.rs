@@ -168,6 +168,7 @@ mod tests {
                     ),
                 ],
             }],
+            column_kinds: Default::default(),
             border_style: TableBorderStyle::default(),
         };
 
@@ -508,6 +509,7 @@ mod tests {
                         ),
                     ],
                 }],
+                column_kinds: Default::default(),
                 border_style: TableBorderStyle::default(),
             }),
             BlockStyle::default(),

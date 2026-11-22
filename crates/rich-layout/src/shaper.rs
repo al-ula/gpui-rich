@@ -130,6 +130,17 @@ pub trait TextShaper {
 
     fn measure_inline_object(&mut self, obj: &InlineObject, zoom: f32) -> InlineBoxMetrics;
 
+    /// Resolves a display-only atom without changing its backing document identity.
+    fn resolve_inline_object(&self, _object: &InlineObject) -> Option<InlineObject> {
+        None
+    }
+
+    fn set_footnote_numbers(
+        &mut self,
+        _numbers: &std::sync::Arc<std::collections::HashMap<rich_model::AnchorId, u32>>,
+    ) {
+    }
+
     /// Measures a custom leaf block (`BlockKind::Leaf`) inside `max_width` pixels at `zoom`.
     fn measure_custom_block(
         &mut self,

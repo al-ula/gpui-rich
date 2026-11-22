@@ -24,6 +24,7 @@ pub enum MoveDirection {
 pub enum MoveUnit {
     Grapheme,
     Word,
+    Paragraph,
     Line,
     LineBoundary,
     DocumentBoundary,
@@ -106,6 +107,7 @@ pub enum RichCommand {
         html: String,
         plain_text: Option<String>,
     },
+    PasteText(String),
 
     // Phase 3 interactive table commands
     SetTableColumns {
@@ -125,6 +127,12 @@ pub enum RichCommand {
     NavigateTableCell {
         forward: bool,
     },
+
+    Navigation(crate::navigation::NavigationCommand),
+    Grid(crate::grid_edit::GridCommand),
+    Component(crate::components::ComponentCommand),
+    Structure(crate::structure_edit::StructureCommand),
+    Anchor(crate::anchors::AnchorCommand),
 
     /// Host-defined custom command routed through policy gating, middleware, and `ExtensionRegistry`.
     Custom {
@@ -161,6 +169,7 @@ impl RichCommand {
             | Self::ToggleList(_)
             | Self::SetTextAlign(_)
             | Self::PasteHtml { .. }
+            | Self::PasteText(_)
             | Self::SetTableColumns { .. }
             | Self::InsertTableRow { .. }
             | Self::DeleteTableRow
@@ -168,6 +177,11 @@ impl RichCommand {
             | Self::DeleteTableColumn
             | Self::MergeTableCells
             | Self::SplitTableCell => true,
+            Self::Navigation(command) => command.is_document_mutation(),
+            Self::Grid(command) => command.is_document_mutation(),
+            Self::Component(command) => command.is_document_mutation(),
+            Self::Structure(command) => command.is_document_mutation(),
+            Self::Anchor(command) => command.is_document_mutation(),
             Self::Custom {
                 mutates_document, ..
             } => *mutates_document,
@@ -216,6 +230,7 @@ impl RichCommand {
             Self::ToggleList(_) => "rich.format.toggle_list",
             Self::SetTextAlign(_) => "rich.format.set_text_align",
             Self::PasteHtml { .. } => "rich.clipboard.paste_html",
+            Self::PasteText(_) => "rich.clipboard.paste_text",
             Self::SetTableColumns { .. } => "rich.table.set_columns",
             Self::InsertTableRow { .. } => "rich.table.insert_row",
             Self::DeleteTableRow => "rich.table.delete_row",
@@ -224,6 +239,11 @@ impl RichCommand {
             Self::MergeTableCells => "rich.table.merge_cells",
             Self::SplitTableCell => "rich.table.split_cell",
             Self::NavigateTableCell { .. } => "rich.table.navigate_cell",
+            Self::Navigation(command) => command.command_id(),
+            Self::Grid(command) => command.command_id(),
+            Self::Component(command) => command.command_id(),
+            Self::Structure(command) => command.command_id(),
+            Self::Anchor(command) => command.command_id(),
             Self::Custom { id, .. } => id.as_str(),
         }
     }
@@ -324,6 +344,11 @@ impl InteractionPolicy {
             {
                 Some(CommandOutcome::RejectedByPolicy)
             }
+            RichCommand::Navigation(_) | RichCommand::Anchor(_)
+                if !self.selectable && !command.is_document_mutation() =>
+            {
+                Some(CommandOutcome::RejectedByPolicy)
+            }
             RichCommand::OpenLink(_) if !self.clickable_links => {
                 Some(CommandOutcome::RejectedByPolicy)
             }
@@ -378,4 +403,5 @@ pub enum CommandOutcome {
     RejectedByPolicy,
     Cancelled,
     Unsupported,
+    TargetHidden,
 }

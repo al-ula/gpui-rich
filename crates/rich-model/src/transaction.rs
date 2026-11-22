@@ -22,6 +22,11 @@ pub enum Step {
         offset: usize,
         content: InlineContent,
     },
+    RestoreInlineContent {
+        block_id: BlockId,
+        offset: usize,
+        content: InlineContent,
+    },
     DeleteRange {
         block_id: BlockId,
         range: Range<usize>,
@@ -59,6 +64,11 @@ pub enum Step {
         target: ContainerTarget,
         index: usize,
     },
+    MoveBlockIn {
+        target: ContainerTarget,
+        from: usize,
+        to: usize,
+    },
     ToggleHeadingCollapsed {
         block_id: BlockId,
     },
@@ -73,6 +83,27 @@ pub enum Step {
     UpdateNamedStyle {
         style_id: StyleId,
         style: Option<NamedStyle>,
+    },
+    SetAnchors {
+        anchors: crate::anchors::AnchorStore,
+    },
+    MapSplitAnchors {
+        block_id: BlockId,
+        offset: usize,
+        new_block_id: BlockId,
+    },
+    MapMergeAnchors {
+        block_id: BlockId,
+        offset: usize,
+        source_block_id: BlockId,
+        source_offset: usize,
+    },
+    SetComponents {
+        components: crate::components::ComponentStore,
+    },
+    SetListNumbering {
+        block_id: BlockId,
+        numbering: Option<crate::structure_edit::ListNumbering>,
     },
 }
 
@@ -137,7 +168,19 @@ impl Document {
         let mut change_set = ChangeSet::default();
         let mut inverse_steps = Vec::with_capacity(tx.steps.len());
 
+        let has_bookmarks = self.anchors.bookmarks().next().is_some();
+        let original_block_order = (has_bookmarks
+            && tx.steps.iter().any(|step| matches!(
+                step,
+                Step::RemoveBlock { .. } | Step::RemoveBlockIn { .. } | Step::SetBlockKind { .. }
+            )))
+            .then(|| self.collect_leaf_blocks().into_iter().map(|block| block.id).collect::<Vec<_>>());
+        let anchors_before = (has_bookmarks
+            || tx.steps.iter().any(|step| matches!(step, Step::SetAnchors { .. })))
+            .then(|| self.anchors.clone());
+
         for step in tx.steps {
+            let restore_inline_identity = matches!(&step, Step::RestoreInlineContent { .. });
             match step {
                 Step::InsertText {
                     block_id,
@@ -157,6 +200,7 @@ impl Document {
                         None
                     };
                     if let Some(clamped) = applied {
+                        self.anchors.map_insert(block_id, clamped, inserted_len);
                         change_set.mark_dirty(block_id);
                         self.bump_ancestors_of_block(block_id, &mut change_set);
                         inverse_steps.push(Step::DeleteRange {
@@ -169,19 +213,29 @@ impl Document {
                     block_id,
                     offset,
                     content,
+                }
+                | Step::RestoreInlineContent {
+                    block_id,
+                    offset,
+                    content,
                 } => {
                     let inserted_len = content.len();
                     let applied = if let Some(block) = self.find_block_mut(block_id)
                         && let Some(inline) = block.kind.inline_content_mut()
                     {
                         let clamped = offset.min(inline.len());
-                        inline.insert_content(clamped, &content);
+                        if restore_inline_identity {
+                            inline.insert_content_preserving_object_ids(clamped, &content);
+                        } else {
+                            inline.insert_content(clamped, &content);
+                        }
                         block.bump_version();
                         Some(clamped)
                     } else {
                         None
                     };
                     if let Some(clamped) = applied {
+                        self.anchors.map_insert(block_id, clamped, inserted_len);
                         change_set.mark_dirty(block_id);
                         self.bump_ancestors_of_block(block_id, &mut change_set);
                         inverse_steps.push(Step::DeleteRange {
@@ -203,9 +257,10 @@ impl Document {
                         None
                     };
                     if let Some((start, slice)) = removed {
+                        self.anchors.map_delete(block_id, start, start + slice.len());
                         change_set.mark_dirty(block_id);
                         self.bump_ancestors_of_block(block_id, &mut change_set);
-                        inverse_steps.push(Step::InsertContent {
+                        inverse_steps.push(Step::RestoreInlineContent {
                             block_id,
                             offset: start,
                             content: slice,
@@ -297,7 +352,12 @@ impl Document {
                     }
                 }
                 Step::InsertBlock { index, block } => {
-                    let clamped = index.min(self.blocks.len());
+                    let end = if crate::anchors::is_footnote_body(&block) {
+                        self.blocks.len()
+                    } else {
+                        self.content_end_index()
+                    };
+                    let clamped = index.min(end);
                     let id = block.id;
                     self.blocks.insert(clamped, block);
                     change_set.mark_dirty(id);
@@ -320,6 +380,11 @@ impl Document {
                     index,
                     block,
                 } => {
+                    let index = if target == ContainerTarget::Root && !crate::anchors::is_footnote_body(&block) {
+                        index.min(self.content_end_index())
+                    } else {
+                        index
+                    };
                     let id = block.id;
                     let inserted_index = self.container_blocks_mut(target).map(|blocks| {
                         let clamped = index.min(blocks.len());
@@ -352,6 +417,31 @@ impl Document {
                             target,
                             index,
                             block: removed,
+                        });
+                    }
+                }
+                Step::MoveBlockIn { target, from, to } => {
+                    if target == ContainerTarget::Root {
+                        let end = self.content_end_index();
+                        if (from < end) != (to < end) {
+                            continue;
+                        }
+                    }
+                    if let Some(blocks) = self.container_blocks_mut(target)
+                        && from != to
+                        && from < blocks.len()
+                        && to < blocks.len()
+                    {
+                        let block = blocks.remove(from);
+                        let id = block.id;
+                        blocks.insert(to, block);
+                        change_set.mark_dirty(id);
+                        change_set.structure_changed = true;
+                        self.bump_ancestors_of_target(target, &mut change_set);
+                        inverse_steps.push(Step::MoveBlockIn {
+                            target,
+                            from: to,
+                            to: from,
                         });
                     }
                 }
@@ -408,10 +498,71 @@ impl Document {
                         style: previous,
                     });
                 }
+                Step::SetAnchors { anchors } => {
+                    if self.anchors != anchors {
+                        self.anchors = anchors;
+                        change_set.structure_changed = true;
+                    }
+                }
+                Step::MapSplitAnchors { block_id, offset, new_block_id } => {
+                    self.anchors.map_split(block_id, offset, new_block_id);
+                }
+                Step::MapMergeAnchors { block_id, offset, source_block_id, source_offset } => {
+                    self.anchors.map_merge_suffix(block_id, offset, source_block_id, source_offset);
+                }
+                Step::SetComponents { components } => {
+                    if self.components != components {
+                        let previous = std::mem::replace(&mut self.components, components);
+                        let affected: Vec<_> = self.collect_leaf_blocks()
+                            .into_iter()
+                            .filter(|block| block.kind.inline_content().is_some_and(|inline| {
+                                inline.objects.iter().any(|entry| {
+                                    let InlineObject::Custom { kind, data } = &entry.object else {
+                                        return false;
+                                    };
+                                    let payload = data.as_json();
+                                    match kind.as_ref() {
+                                        crate::components::DROPDOWN_KIND => payload.get("definition_id")
+                                            .and_then(serde_json::Value::as_str)
+                                            .is_some_and(|id| previous.dropdowns.get(id) != self.components.dropdowns.get(id)),
+                                        crate::components::VARIABLE_KIND => payload.get("variable_id")
+                                            .and_then(serde_json::Value::as_str)
+                                            .is_some_and(|id| previous.variables.get(id) != self.components.variables.get(id)),
+                                        _ => false,
+                                    }
+                                })
+                            }))
+                            .map(|block| block.id)
+                            .collect();
+                        for block_id in affected {
+                            if let Some(block) = self.find_block_mut(block_id) {
+                                block.bump_version();
+                            }
+                            change_set.mark_dirty(block_id);
+                            self.bump_ancestors_of_block(block_id, &mut change_set);
+                        }
+                        change_set.structure_changed = true;
+                        inverse_steps.push(Step::SetComponents { components: previous });
+                    }
+                }
+                Step::SetListNumbering { block_id, numbering } => {
+                    let previous = self.ordered_lists.set(block_id, numbering);
+                    if previous != numbering {
+                        change_set.mark_dirty(block_id);
+                        change_set.structure_changed = true;
+                        inverse_steps.push(Step::SetListNumbering { block_id, numbering: previous });
+                    }
+                }
             }
         }
 
+        if let Some(order) = original_block_order {
+            self.repair_bookmarks_after_removal(&order);
+        }
         inverse_steps.reverse();
+        if let Some(anchors) = anchors_before && anchors != self.anchors {
+            inverse_steps.push(Step::SetAnchors { anchors });
+        }
         AppliedTransaction {
             change_set,
             inverse: Transaction {
@@ -419,6 +570,40 @@ impl Document {
                 selection_before: tx.selection_after,
                 selection_after: tx.selection_before,
             },
+        }
+    }
+
+    fn repair_bookmarks_after_removal(&mut self, order: &[BlockId]) {
+        use crate::anchors::AnchorPosition;
+
+        let repairs: Vec<_> = self.anchors.bookmarks().filter_map(|bookmark| {
+            let position = bookmark.position;
+            let text = |id| self.find_block(id)?.kind.inline_content();
+            if let Some(inline) = text(position.block_id) {
+                let offset = inline.text.floor_char_boundary(position.offset.min(inline.len()));
+                return (offset != position.offset).then_some((
+                    bookmark.id,
+                    Some(AnchorPosition { block_id: position.block_id, offset }),
+                ));
+            }
+            let fallback = order.iter().position(|id| *id == position.block_id).and_then(|index| {
+                order[index + 1..].iter().find_map(|&id| {
+                    text(id).map(|_| AnchorPosition { block_id: id, offset: 0 })
+                }).or_else(|| order[..index].iter().rev().find_map(|&id| {
+                    text(id).map(|inline| AnchorPosition { block_id: id, offset: inline.len() })
+                }))
+            }).or_else(|| self.collect_leaf_blocks().first().map(|leaf| AnchorPosition {
+                block_id: leaf.id,
+                offset: 0,
+            }));
+            Some((bookmark.id, fallback))
+        }).collect();
+        for (id, fallback) in repairs {
+            if let Some(position) = fallback {
+                self.anchors.set_bookmark_position(id, position);
+            } else {
+                self.anchors.remove_bookmark(id);
+            }
         }
     }
 
@@ -489,6 +674,14 @@ impl Document {
                     block_id: start_id,
                     offset: start_offset,
                     content: trailing,
+                });
+            }
+            if self.anchors.bookmarks().next().is_some() {
+                steps.push(Step::MapMergeAnchors {
+                    block_id: start_id,
+                    offset: start_offset,
+                    source_block_id: end_id,
+                    source_offset: end_offset,
                 });
             }
             for remove_index in ((start_container_index + 1)..=end_container_index).rev() {
@@ -642,6 +835,13 @@ impl Document {
         };
 
         let mut steps = Vec::new();
+        if self.anchors.bookmarks().next().is_some() {
+            steps.push(Step::MapSplitAnchors {
+                block_id: leaf_id,
+                offset,
+                new_block_id,
+            });
+        }
         if offset < inline.len() {
             steps.push(Step::DeleteRange {
                 block_id: leaf_id,
@@ -743,6 +943,14 @@ impl Document {
                 content: current_inline.clone(),
             });
         }
+        if self.anchors.bookmarks().next().is_some() {
+            steps.push(Step::MapMergeAnchors {
+                block_id: prev_block.id,
+                offset: join_offset,
+                source_block_id: leaf_id,
+                source_offset: 0,
+            });
+        }
         steps.push(Step::RemoveBlockIn {
             target,
             index: block_index,
@@ -778,6 +986,14 @@ impl Document {
                 block_id: leaf_id,
                 offset: join_offset,
                 content: next_inline.clone(),
+            });
+        }
+        if self.anchors.bookmarks().next().is_some() {
+            steps.push(Step::MapMergeAnchors {
+                block_id: leaf_id,
+                offset: join_offset,
+                source_block_id: next_block.id,
+                source_offset: 0,
             });
         }
         steps.push(Step::RemoveBlockIn {
@@ -1063,6 +1279,10 @@ impl Document {
         next_table
             .columns
             .insert(insert_at.min(next_table.columns.len()), ColumnSpec::Auto);
+        next_table.column_kinds = std::mem::take(&mut next_table.column_kinds)
+            .into_iter()
+            .map(|(column, kind)| (column + usize::from(column >= insert_at), kind))
+            .collect();
 
         let row_count = next_table.rows.len();
         let mut row_spanning_insert = vec![false; row_count];
@@ -1173,6 +1393,14 @@ impl Document {
             next_table.columns.push(ColumnSpec::Auto);
         }
         next_table.columns.drain(start_col..end_col);
+        next_table.column_kinds = std::mem::take(&mut next_table.column_kinds)
+            .into_iter()
+            .filter_map(|(column, kind)| {
+                if column < start_col { Some((column, kind)) }
+                else if column >= end_col { Some((column - (end_col - start_col), kind)) }
+                else { None }
+            })
+            .collect();
 
         for row_idx in 0..next_table.rows.len() {
             let row_placements: Vec<_> = placements
@@ -1500,7 +1728,7 @@ impl Document {
             .map(TableCellStep::MoveTo)
     }
 
-    fn table_cell_doc_pos(
+    pub(crate) fn table_cell_doc_pos(
         &self,
         table_id: BlockId,
         row_index: usize,

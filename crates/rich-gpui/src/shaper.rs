@@ -9,9 +9,10 @@ use rich_layout::{
     GlyphBackend, InlineBoxMetrics, Insets, ShapedGlyph, ShapedGlyphRun, ShapedSegment,
     ShaperRunSpec, Size, TextShaper, pt_to_px,
 };
-use rich_model::{CustomPayload, InlineObject, InlineVAlign, RgbaColor};
+use rich_model::{AnchorId, ChipKind, ComponentStore, CustomPayload, DROPDOWN_KIND, InlineObject,
+    InlineVAlign, PLACEHOLDER_KIND, RgbaColor, VARIABLE_KIND, footnote_reference_id};
 use std::collections::HashMap;
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Arc, OnceLock, RwLock};
 
 const PREFERRED_SANS_FONTS: &[&str] = &[
     "IBM Plex Sans",
@@ -296,6 +297,8 @@ pub struct GpuiShaper<'window, 'registry> {
     window: &'window Window,
     extensions: Option<&'registry ExtensionRegistry>,
     font_resolver: Option<&'registry FontResolver>,
+    components: Option<&'registry ComponentStore>,
+    footnote_numbers: Option<Arc<HashMap<AnchorId, u32>>>,
 }
 
 impl<'window> GpuiShaper<'window, 'window> {
@@ -305,6 +308,8 @@ impl<'window> GpuiShaper<'window, 'window> {
             window,
             extensions: None,
             font_resolver: None,
+            components: None,
+            footnote_numbers: None,
         }
     }
 }
@@ -319,6 +324,8 @@ impl<'window, 'registry> GpuiShaper<'window, 'registry> {
             window,
             extensions: Some(extensions),
             font_resolver: None,
+            components: None,
+            footnote_numbers: None,
         }
     }
 
@@ -330,6 +337,12 @@ impl<'window, 'registry> GpuiShaper<'window, 'registry> {
         self.font_resolver = font_resolver;
         self
     }
+    /// Resolves component labels against the owning document's canonical definitions.
+    pub fn with_components(mut self, components: &'registry ComponentStore) -> Self {
+        self.components = Some(components);
+        self
+    }
+
 }
 
 impl TextShaper for GpuiShaper<'_, '_> {
@@ -532,6 +545,13 @@ impl TextShaper for GpuiShaper<'_, '_> {
                     valign: InlineVAlign::Baseline,
                 }
             }
+            InlineObject::Custom { .. } if footnote_reference_id(object).is_some() => {
+                InlineBoxMetrics {
+                    width: pt_to_px(15.0, zoom),
+                    height: pt_to_px(12.0, zoom),
+                    valign: InlineVAlign::Baseline,
+                }
+            }
             InlineObject::Custom { kind, data } => {
                 if let Some(extension) = self
                     .extensions
@@ -539,9 +559,10 @@ impl TextShaper for GpuiShaper<'_, '_> {
                 {
                     return extension.measure_inline(data, zoom, self.window);
                 }
+                let label = kind.to_string();
                 let font_size = px(pt_to_px(10.0, zoom));
                 let run = TextRun {
-                    len: kind.len(),
+                    len: label.len(),
                     font: gpui_kit::font(".SystemUIFont"),
                     color: rgba_to_hsla(RgbaColor::BLACK),
                     background_color: None,
@@ -549,7 +570,7 @@ impl TextShaper for GpuiShaper<'_, '_> {
                     strikethrough: None,
                 };
                 let shaped = self.window.text_system().shape_line(
-                    SharedString::from(kind.to_string()),
+                    SharedString::from(label),
                     font_size,
                     &[run],
                     None,
@@ -561,6 +582,29 @@ impl TextShaper for GpuiShaper<'_, '_> {
                     valign: InlineVAlign::Middle,
                 }
             }
+        }
+    }
+
+    fn resolve_inline_object(&self, object: &InlineObject) -> Option<InlineObject> {
+        if let Some(id) = footnote_reference_id(object) {
+            return self.footnote_numbers.as_ref()?.get(&id)
+                .map(|&index| InlineObject::FootnoteRef { index });
+        }
+        let InlineObject::Custom { kind, data } = object else { return None; };
+        if !matches!(kind.as_ref(), DROPDOWN_KIND | VARIABLE_KIND | PLACEHOLDER_KIND) {
+            return None;
+        }
+        let components = self.components?;
+        let mut label = components.inline_fallback(kind, &data.as_json());
+        if kind.as_ref() == DROPDOWN_KIND {
+            label.push_str(" ▾");
+        }
+        Some(InlineObject::SmartChip { kind: ChipKind::Tag, label, accent: None })
+    }
+
+    fn set_footnote_numbers(&mut self, numbers: &Arc<HashMap<AnchorId, u32>>) {
+        if !self.footnote_numbers.as_ref().is_some_and(|current| Arc::ptr_eq(current, numbers)) {
+            self.footnote_numbers = Some(Arc::clone(numbers));
         }
     }
 

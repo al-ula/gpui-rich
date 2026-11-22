@@ -1,24 +1,34 @@
+pub mod anchors;
 pub mod block;
 pub mod clipboard;
+pub mod components;
 pub mod codec;
 pub mod command;
 pub mod decoration;
+pub mod grid_edit;
 pub mod inline;
+pub mod navigation;
 pub mod payload;
 pub mod selection;
 pub mod style;
+pub mod structure_edit;
 pub mod sync;
 pub mod transaction;
 
+pub use anchors::*;
 pub use block::*;
 pub use clipboard::*;
+pub use components::*;
 pub use codec::*;
 pub use command::*;
 pub use decoration::*;
+pub use grid_edit::*;
 pub use inline::*;
+pub use navigation::*;
 pub use payload::*;
 pub use selection::*;
 pub use style::*;
+pub use structure_edit::*;
 pub use sync::*;
 pub use transaction::*;
 
@@ -547,6 +557,7 @@ mod tests {
             BlockKind::table(TableBlock {
                 columns: vec![ColumnSpec::Auto; 2],
                 rows,
+                column_kinds: Default::default(),
                 border_style: TableBorderStyle::default(),
             }),
             BlockStyle::default(),

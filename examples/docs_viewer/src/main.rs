@@ -2029,6 +2029,7 @@ fn build_sample_document() -> Document {
             ColumnSpec::Ratio(1.2),
         ],
         rows,
+        column_kinds: Default::default(),
         border_style: TableBorderStyle::default(),
     };
     document.push_block(

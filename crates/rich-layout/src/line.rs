@@ -1143,11 +1143,12 @@ fn itemize_and_shape<S: TextShaper>(
                         doc_range: abs_idx..(abs_idx + ch_len),
                     });
                 } else if let Some(entry) = content.object_at(abs_idx) {
-                    let metrics = shaper.measure_inline_object(&entry.object, zoom);
+                    let object = shaper.resolve_inline_object(&entry.object).unwrap_or_else(|| entry.object.clone());
+                    let metrics = shaper.measure_inline_object(&object, zoom);
                     items.push(ShapedItem::InlineBox {
                         doc_range: abs_idx..(abs_idx + ch_len),
                         object_id: entry.id,
-                        object: entry.object.clone(),
+                        object,
                         metrics,
                     });
                 }
