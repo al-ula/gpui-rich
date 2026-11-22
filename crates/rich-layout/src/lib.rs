@@ -198,4 +198,51 @@ mod tests {
             _ => panic!("expected table layout"),
         }
     }
+
+    #[test]
+    fn vertical_navigation_preserves_goal_x_across_short_middle_block() {
+        let mut doc = Document::new();
+        let first_id = doc.add_paragraph(
+            InlineContent::plain("First paragraph with plenty of horizontal text"),
+            BlockStyle::default(),
+        );
+        let middle_id = doc.add_paragraph(InlineContent::plain("Hi"), BlockStyle::default());
+        let third_id = doc.add_paragraph(
+            InlineContent::plain("Third paragraph with plenty of horizontal text"),
+            BlockStyle::default(),
+        );
+
+        let mut flow = FlowLayout::<MockBackend>::default();
+        let mut shaper = MockShaper;
+        flow.layout_visible_blocks(&doc, 0.0, 900.0, 600.0, 200.0, 1.0, &mut shaper);
+
+        let start_pos = doc.doc_pos_for_block(first_id, 20).unwrap();
+        let (mid_pos, mid_aff, goal_x) = flow
+            .cached_vertical_move(&start_pos, Affinity::Downstream, None, 1, &doc, 900.0, 1.0)
+            .unwrap();
+        assert_eq!(mid_pos.leaf_block_id(), Some(middle_id));
+        assert_eq!(mid_pos.offset, 2);
+
+        // Moving down again using the preserved goal_x restores column alignment in the third block.
+        let (third_pos, _, third_goal_x) = flow
+            .cached_vertical_move(
+                &mid_pos,
+                mid_aff,
+                Some(goal_x),
+                1,
+                &doc,
+                900.0,
+                1.0,
+            )
+            .unwrap();
+        assert_eq!(third_pos.leaf_block_id(), Some(third_id));
+        assert!((third_goal_x - goal_x).abs() < 0.01);
+        assert!(third_pos.offset >= 15);
+
+        let range_bounds = flow
+            .range_bounds_in_block(first_id, 0..5, &doc, 900.0, 1.0, &mut shaper)
+            .unwrap();
+        assert!(range_bounds.width > 0.0);
+        assert!(range_bounds.height > 0.0);
+    }
 }

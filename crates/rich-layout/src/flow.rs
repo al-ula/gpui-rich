@@ -734,6 +734,273 @@ impl<B: GlyphBackend> FlowLayout<B> {
         )
     }
 
+    /// Returns the canvas-space caret rectangle for `pos` using the latest cached block layout
+    /// (without requiring a [`TextShaper`]).
+    pub fn cached_caret_rect(
+        &self,
+        pos: &DocPos,
+        affinity: Affinity,
+        doc: &Document,
+        viewport_width: f32,
+        zoom: f32,
+    ) -> Option<Rect> {
+        let top_id = pos.top_level_block_id()?;
+        let leaf_id = pos.leaf_block_id()?;
+        let top_index = doc.top_level_index(top_id)?;
+        let top_block = doc.blocks.get(top_index)?;
+        let layout = self.cache.get_latest(top_id)?;
+        let (block_x, _) =
+            resolve_block_horizontal_span(viewport_width, &doc.config, top_block.width_mode, zoom);
+        let block_y = self.block_y(top_index);
+
+        let mut leaf_paragraphs = Vec::new();
+        collect_leaf_paragraphs(&layout, block_x, block_y, &mut leaf_paragraphs);
+        let target = leaf_paragraphs
+            .into_iter()
+            .find(|leaf| leaf.block_id == leaf_id)?;
+        Some(
+            target
+                .paragraph
+                .caret_rect(pos.offset, affinity)
+                .translate(target.origin_x, target.origin_y),
+        )
+    }
+
+    /// Returns the visual line start or end byte offset and affinity for `pos` using cached layout.
+    pub fn cached_line_boundary(
+        &self,
+        pos: &DocPos,
+        affinity: Affinity,
+        to_end: bool,
+    ) -> Option<(usize, Affinity)> {
+        let top_id = pos.top_level_block_id()?;
+        let leaf_id = pos.leaf_block_id()?;
+        let layout = self.cache.get_latest(top_id)?;
+        let mut leaf_paragraphs = Vec::new();
+        collect_leaf_paragraphs(&layout, 0.0, 0.0, &mut leaf_paragraphs);
+        let target = leaf_paragraphs
+            .into_iter()
+            .find(|leaf| leaf.block_id == leaf_id)?;
+        if target.paragraph.lines.is_empty() {
+            return Some((0, Affinity::Downstream));
+        }
+        let line_index = target.paragraph.line_index_for_pos(pos.offset, affinity);
+        let line = target.paragraph.lines.get(line_index)?;
+        if to_end {
+            let end_affinity = if line.soft_wrapped {
+                Affinity::Upstream
+            } else {
+                Affinity::Downstream
+            };
+            Some((line.doc_range.end, end_affinity))
+        } else {
+            Some((line.doc_range.start, Affinity::Downstream))
+        }
+    }
+
+    /// Moves the caret vertically by `delta_lines` (`-1` up, `+1` down), preserving `goal_x`
+    /// across soft-wrapped lines and visible leaf block boundaries.
+    #[allow(clippy::too_many_arguments)]
+    pub fn cached_vertical_move(
+        &self,
+        pos: &DocPos,
+        affinity: Affinity,
+        goal_x: Option<f32>,
+        delta_lines: isize,
+        doc: &Document,
+        viewport_width: f32,
+        zoom: f32,
+    ) -> Option<(DocPos, Affinity, f32)> {
+        if delta_lines == 0 {
+            return None;
+        }
+        let top_id = pos.top_level_block_id()?;
+        let leaf_id = pos.leaf_block_id()?;
+        let top_index = doc.top_level_index(top_id)?;
+        let top_block = doc.blocks.get(top_index)?;
+        let (block_x, _) =
+            resolve_block_horizontal_span(viewport_width, &doc.config, top_block.width_mode, zoom);
+        let block_y = self.block_y(top_index);
+
+        let effective_goal_x = goal_x.unwrap_or_else(|| {
+            self.cached_caret_rect(pos, affinity, doc, viewport_width, zoom)
+                .map(|rect| rect.x)
+                .unwrap_or(block_x)
+        });
+
+        // 1. Try moving inside the current leaf paragraph first.
+        if let Some(layout) = self.cache.get_latest(top_id) {
+            let mut leaf_paragraphs = Vec::new();
+            collect_leaf_paragraphs(&layout, block_x, block_y, &mut leaf_paragraphs);
+            if let Some(current_leaf) = leaf_paragraphs.into_iter().find(|leaf| leaf.block_id == leaf_id)
+                && let Some((next_offset, next_affinity)) = current_leaf.paragraph.vertical_step(
+                    pos.offset,
+                    affinity,
+                    effective_goal_x - current_leaf.origin_x,
+                    delta_lines,
+                )
+            {
+                let mut next_pos = pos.clone();
+                next_pos.offset = next_offset;
+                return Some((next_pos, next_affinity, effective_goal_x));
+            }
+        }
+
+        // 2. Cross into the previous or next visible leaf block.
+        let visible_leaves = doc.collect_visible_leaf_blocks();
+        let current_leaf_index = visible_leaves.iter().position(|block| block.id == leaf_id)?;
+        let target_leaf_index = if delta_lines < 0 {
+            current_leaf_index.checked_sub(1)?
+        } else {
+            let next = current_leaf_index + 1;
+            if next < visible_leaves.len() {
+                next
+            } else {
+                return None;
+            }
+        };
+        let target_leaf = visible_leaves.get(target_leaf_index)?;
+        let target_path = doc.path_for_block(target_leaf.id)?;
+        let target_top_id = target_path.first().map(|segment| match *segment {
+            PathSegment::Block(id) => id,
+            PathSegment::TableCell { table_id, .. } => table_id,
+        })?;
+        let target_top_index = doc.top_level_index(target_top_id)?;
+        let target_top_block = doc.blocks.get(target_top_index)?;
+        let (target_block_x, _) = resolve_block_horizontal_span(
+            viewport_width,
+            &doc.config,
+            target_top_block.width_mode,
+            zoom,
+        );
+        let target_block_y = self.block_y(target_top_index);
+
+        if let Some(target_layout) = self.cache.get_latest(target_top_id) {
+            let mut leaf_paragraphs = Vec::new();
+            collect_leaf_paragraphs(
+                &target_layout,
+                target_block_x,
+                target_block_y,
+                &mut leaf_paragraphs,
+            );
+            if let Some(leaf_ref) = leaf_paragraphs
+                .into_iter()
+                .find(|leaf| leaf.block_id == target_leaf.id)
+                && let Some(line) = if delta_lines < 0 {
+                    leaf_ref.paragraph.lines.last()
+                } else {
+                    leaf_ref.paragraph.lines.first()
+                }
+            {
+                let hit = leaf_ref.paragraph.hit_test(Point::new(
+                    effective_goal_x - leaf_ref.origin_x,
+                    line.rect.center().y,
+                ));
+                return Some((
+                    DocPos {
+                        path: target_path,
+                        offset: hit.offset,
+                    },
+                    hit.affinity,
+                    effective_goal_x,
+                ));
+            }
+        }
+
+        // Fallback when the adjacent block is off-screen and not yet laid out.
+        let fallback_offset = if delta_lines < 0 {
+            target_leaf
+                .kind
+                .inline_content()
+                .map(|inline| inline.len())
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        Some((
+            DocPos {
+                path: target_path,
+                offset: fallback_offset,
+            },
+            Affinity::Downstream,
+            effective_goal_x,
+        ))
+    }
+
+    /// Computes canvas-space bounding rectangle for UTF-8 byte `range` inside `block_id`
+    /// (used to position platform IME candidate popups).
+    #[allow(clippy::too_many_arguments)]
+    pub fn range_bounds_in_block<S: TextShaper<Backend = B>>(
+        &mut self,
+        block_id: BlockId,
+        range: std::ops::Range<usize>,
+        doc: &Document,
+        viewport_width: f32,
+        zoom: f32,
+        shaper: &mut S,
+    ) -> Option<Rect> {
+        let path = doc.path_for_block(block_id)?;
+        let top_id = path.first().map(|segment| match *segment {
+            PathSegment::Block(id) => id,
+            PathSegment::TableCell { table_id, .. } => table_id,
+        })?;
+        let top_index = doc.top_level_index(top_id)?;
+        let top_block = doc.blocks.get(top_index)?;
+        let (block_x, max_width) =
+            resolve_block_horizontal_span(viewport_width, &doc.config, top_block.width_mode, zoom);
+        let block_y = self.block_y(top_index);
+        let marker = self.list_markers.get(top_index).and_then(|m| m.as_deref());
+        let layout = self.cache.get_or_layout(
+            top_block,
+            marker,
+            &doc.stylesheet,
+            &doc.config,
+            max_width,
+            zoom,
+            shaper,
+        );
+
+        let mut leaf_paragraphs = Vec::new();
+        collect_leaf_paragraphs(&layout, block_x, block_y, &mut leaf_paragraphs);
+        let leaf = leaf_paragraphs
+            .into_iter()
+            .find(|entry| entry.block_id == block_id)?;
+
+        if range.is_empty() {
+            return Some(
+                leaf.paragraph
+                    .caret_rect(range.start, Affinity::Downstream)
+                    .translate(leaf.origin_x, leaf.origin_y),
+            );
+        }
+
+        let rects = leaf.paragraph.selection_rects(range.clone(), false);
+        if let Some(first) = rects.first() {
+            let mut union = *first;
+            for rect in rects.iter().skip(1) {
+                let min_x = union.x.min(rect.x);
+                let min_y = union.y.min(rect.y);
+                let max_x = union.right().max(rect.right());
+                let max_y = union.bottom().max(rect.bottom());
+                union = Rect::new(min_x, min_y, max_x - min_x, max_y - min_y);
+            }
+            Some(union.translate(leaf.origin_x, leaf.origin_y))
+        } else {
+            Some(
+                leaf.paragraph
+                    .caret_rect(range.start, Affinity::Downstream)
+                    .translate(leaf.origin_x, leaf.origin_y),
+            )
+        }
+    }
+
+    /// Returns the top canvas Y offset of the top-level block containing `pos`.
+    pub fn block_canvas_y(&self, pos: &DocPos, doc: &Document) -> Option<f32> {
+        let top_id = pos.top_level_block_id()?;
+        let top_index = doc.top_level_index(top_id)?;
+        Some(self.block_y(top_index))
+    }
+
     fn rebuild_height_index(&mut self) {
         self.height_index = HeightIndex::new(self.metrics.len());
         for i in 0..self.metrics.len() {

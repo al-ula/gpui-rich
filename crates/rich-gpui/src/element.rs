@@ -1,20 +1,21 @@
 //! Custom GPUI [`Element`] implementing virtualized non-paginated 6-layer rich text painting.
 
 use crate::shaper::{GpuiGlyphBackend, GpuiShaper, rgba_to_hsla};
-use crate::view::RichDocumentView;
+use crate::theme::RichTheme;
+use crate::view::{ImePreedit, RichDocumentView};
 #[cfg(not(feature = "gpui-fast"))]
 use gpui_kit::IntoElement;
 use gpui_kit::{
     App, BorderStyle, Bounds, BoxShadow, ContentMask, Corners, CursorStyle, Edges, Element,
-    ElementId, Entity, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId,
-    LayoutId, Length, Pixels, Point, SharedString, StrikethroughStyle, Style, TextRun,
-    UnderlineStyle, Window, fill, outline, point, px, quad, size,
+    ElementId, ElementInputHandler, Entity, FocusHandle, GlobalElementId, Hitbox, HitboxBehavior,
+    Hsla, InspectorElementId, LayoutId, Length, Pixels, Point, SharedString, StrikethroughStyle,
+    Style, TextRun, UnderlineStyle, Window, fill, outline, point, px, quad, size,
 };
 use rich_layout::{
     BlockLayout, BlockLayoutKind, HorizontalMetrics, InlineBoxFragment, LineFragment,
     ParagraphLayout, Rect, TextFragment, VisibleBlock, pt_to_px, resolve_horizontal_metrics,
 };
-use rich_model::{ChipKind, DocumentSelection, InlineObject, RgbaColor, UnderlineKind};
+use rich_model::{Affinity, DocumentSelection, InlineObject, UnderlineKind};
 
 const OVERSCAN_PX: f32 = 300.0;
 
@@ -40,17 +41,30 @@ impl IntoElement for RichDocumentElement {
     }
 }
 
+/// Prepaint payload for painting an ephemeral IME preedit composition overlay on Layer 5.
+struct PrepaintPreedit {
+    preedit: ImePreedit,
+    anchor_rect: Rect,
+    font_size_px: f32,
+}
+
 /// Prepaint payload passed from `Element::prepaint` into `Element::paint`.
 pub struct RichPrepaintState {
     visible_blocks: Vec<VisibleBlock<GpuiGlyphBackend>>,
     selection_rects: Vec<Rect>,
     caret_rect: Option<Rect>,
+    preedit_overlay: Option<PrepaintPreedit>,
     scroll_x: f32,
     scroll_y: f32,
     total_height: f32,
     horizontal: HorizontalMetrics,
     zoom: f32,
     debug_overlay: bool,
+    show_heading_chevrons: bool,
+    editable: bool,
+    focused: bool,
+    focus_handle: FocusHandle,
+    theme: RichTheme,
     cursor_style: CursorStyle,
     hitbox: Hitbox,
 }
@@ -96,15 +110,23 @@ impl Element for RichDocumentElement {
             visible_blocks,
             selection_rects,
             caret_rect,
+            preedit_overlay,
             scroll_x,
             scroll_y,
             total_height,
             horizontal,
             zoom,
             debug_overlay,
+            show_heading_chevrons,
+            editable,
+            focused,
+            focus_handle,
+            theme,
             cursor_style,
-        ) = self.view.update(cx, |view, _cx| {
+        ) = self.view.update(cx, |view, cx| {
             view.last_viewport_bounds = bounds;
+            let focused = view.focus_handle.is_focused(window);
+            view.sync_focus_state(focused, cx);
 
             let horizontal =
                 resolve_horizontal_metrics(viewport_width, &view.document.config, view.zoom);
@@ -136,34 +158,80 @@ impl Element for RichDocumentElement {
                 .map(|selection| view.flow.selection_rects_for_visible(selection, &visible))
                 .unwrap_or_default();
 
-            let caret_rect = match &view.selection {
-                Some(DocumentSelection::Text {
-                    anchor,
-                    focus,
-                    affinity,
-                    ..
-                }) if anchor == focus => {
-                    view.flow.caret_rect_in_visible(focus, *affinity, &visible)
+            let preedit_overlay = view.ime_preedit.as_ref().and_then(|preedit| {
+                let anchor_pos = view
+                    .document
+                    .doc_pos_for_block(preedit.block_id, preedit.replace_range.start)?;
+                let anchor_rect =
+                    view.flow
+                        .caret_rect_in_visible(&anchor_pos, Affinity::Downstream, &visible)?;
+                let block_font_pt = view
+                    .document
+                    .find_block(preedit.block_id)
+                    .map(|block| {
+                        block
+                            .style
+                            .resolved_base_text(
+                                &view.document.stylesheet,
+                                &view.document.config.default_style,
+                            )
+                            .font_size_pt
+                    })
+                    .unwrap_or(view.document.config.default_style.font_size_pt);
+                Some(PrepaintPreedit {
+                    preedit: preedit.clone(),
+                    anchor_rect,
+                    font_size_px: pt_to_px(block_font_pt, view.zoom).max(10.0),
+                })
+            });
+
+            let caret_rect = if focused
+                && view.policy.should_show_caret()
+                && view.caret_visible
+                && preedit_overlay.is_none()
+            {
+                match &view.selection {
+                    Some(DocumentSelection::Text {
+                        anchor,
+                        focus,
+                        affinity,
+                        ..
+                    }) if anchor == focus => {
+                        view.flow.caret_rect_in_visible(focus, *affinity, &visible)
+                    }
+                    _ => None,
                 }
-                _ => None,
+            } else {
+                None
             };
 
             let cursor_style = if view.hovered_pointer {
                 CursorStyle::PointingHand
-            } else {
+            } else if view.policy.selectable || view.policy.editable {
                 CursorStyle::IBeam
+            } else {
+                CursorStyle::Arrow
             };
+
+            let theme = view.active_theme(cx);
+            let focus_handle = view.focus_handle.clone();
 
             (
                 visible,
                 selection_rects,
                 caret_rect,
+                preedit_overlay,
                 view.scroll_x,
                 view.scroll_y,
                 view.flow.total_height(),
                 horizontal,
                 view.zoom,
                 view.debug_overlay,
+                view.policy.collapsible_headings,
+                view.policy.editable,
+                focused,
+                focus_handle,
+                theme,
                 cursor_style,
             )
         });
@@ -174,12 +242,18 @@ impl Element for RichDocumentElement {
             visible_blocks,
             selection_rects,
             caret_rect,
+            preedit_overlay,
             scroll_x,
             scroll_y,
             total_height,
             horizontal,
             zoom,
             debug_overlay,
+            show_heading_chevrons,
+            editable,
+            focused,
+            focus_handle,
+            theme,
             cursor_style,
             hitbox,
         }
@@ -196,6 +270,29 @@ impl Element for RichDocumentElement {
         cx: &mut App,
     ) {
         window.set_cursor_style(prepaint.cursor_style, &prepaint.hitbox);
+        if prepaint.editable {
+            window.handle_input(
+                &prepaint.focus_handle,
+                ElementInputHandler::new(bounds, self.view.clone()),
+                cx,
+            );
+            if prepaint.focused {
+                let anchor_key = prepaint.caret_rect.map(|rect| {
+                    (
+                        rect.x.round() as i32,
+                        rect.y.round() as i32,
+                        prepaint.scroll_x.round() as i32,
+                        prepaint.scroll_y.round() as i32,
+                    )
+                });
+                let moved = self.view.update(cx, |view, _| {
+                    view.last_ime_anchor.replace(anchor_key) != Some(anchor_key)
+                });
+                if moved {
+                    window.invalidate_character_coordinates();
+                }
+            }
+        }
 
         let origin_x: f32 = bounds.origin.x.into();
         let origin_y: f32 = bounds.origin.y.into();
@@ -208,13 +305,12 @@ impl Element for RichDocumentElement {
             )
         };
 
+        let theme = &prepaint.theme;
+
         window.with_content_mask(Some(ContentMask { bounds }), |window| {
             // Layer 0: Fluid canvas backdrop or neutral desk + infinite-length continuous paper sheet.
             if let Some(sheet) = prepaint.horizontal.paper_sheet {
-                window.paint_quad(fill(
-                    bounds,
-                    rgba_to_hsla(RgbaColor::rgb(0xee, 0xf2, 0xf6)),
-                ));
+                window.paint_quad(fill(bounds, theme.desk_background));
 
                 let sheet_height = (prepaint.total_height - sheet.top_y - sheet.desk_margin * 0.5)
                     .max(viewport_height - sheet.top_y + prepaint.scroll_y);
@@ -226,7 +322,7 @@ impl Element for RichDocumentElement {
                     sheet_bounds,
                     sheet_radius,
                     &[BoxShadow {
-                        color: rgba_to_hsla(RgbaColor::rgba(0x1f, 0x23, 0x28, 0x1c)),
+                        color: theme.paper_shadow,
                         offset: point(px(0.0), px(2.0)),
                         blur_radius: px(10.0),
                         spread_radius: px(0.0),
@@ -236,13 +332,13 @@ impl Element for RichDocumentElement {
                 window.paint_quad(quad(
                     sheet_bounds,
                     sheet_radius,
-                    rgba_to_hsla(RgbaColor::WHITE),
+                    theme.surface_background,
                     Edges::all(px(1.0)),
-                    rgba_to_hsla(RgbaColor::rgb(0xd8, 0xde, 0xe4)),
+                    theme.paper_border,
                     BorderStyle::Solid,
                 ));
             } else {
-                window.paint_quad(fill(bounds, rgba_to_hsla(RgbaColor::WHITE)));
+                window.paint_quad(fill(bounds, theme.surface_background));
             }
 
             // Layer 1: Block chrome (tables, blockquotes, code frames, rules, list markers, chevrons).
@@ -252,6 +348,8 @@ impl Element for RichDocumentElement {
                     visible.x,
                     visible.y,
                     prepaint.zoom,
+                    prepaint.show_heading_chevrons,
+                    theme,
                     &canvas_to_window,
                     window,
                     cx,
@@ -259,12 +357,11 @@ impl Element for RichDocumentElement {
             }
 
             // Layer 2: Selection highlights.
-            let selection_color = rgba_to_hsla(RgbaColor::rgba(0x0b, 0x57, 0xd0, 0x38));
             for rect in &prepaint.selection_rects {
                 let top_left = canvas_to_window(rect.x, rect.y);
                 window.paint_quad(fill(
                     Bounds::new(top_left, size(px(rect.width), px(rect.height))),
-                    selection_color,
+                    theme.selection_background,
                 ));
             }
 
@@ -275,6 +372,7 @@ impl Element for RichDocumentElement {
                     visible.x,
                     visible.y,
                     prepaint.zoom,
+                    theme,
                     &canvas_to_window,
                     window,
                 );
@@ -288,18 +386,27 @@ impl Element for RichDocumentElement {
                     visible.y,
                     prepaint.zoom,
                     prepaint.debug_overlay,
+                    theme,
                     &canvas_to_window,
                     window,
                     cx,
                 );
             }
 
-            // Layer 5: Caret and scrollbar thumb.
-            if let Some(caret) = prepaint.caret_rect {
+            // Layer 5: Caret, ephemeral IME preedit overlay, and scrollbar thumbs.
+            if let Some(preedit_overlay) = &prepaint.preedit_overlay {
+                paint_ime_preedit(
+                    preedit_overlay,
+                    theme,
+                    &canvas_to_window,
+                    window,
+                    cx,
+                );
+            } else if let Some(caret) = prepaint.caret_rect {
                 let top_left = canvas_to_window(caret.x.round(), caret.y.round());
                 window.paint_quad(fill(
                     Bounds::new(top_left, size(px(2.0), px(caret.height.max(12.0)))),
-                    rgba_to_hsla(RgbaColor::rgb(0x0b, 0x57, 0xd0)),
+                    theme.caret,
                 ));
             }
 
@@ -319,7 +426,7 @@ impl Element for RichDocumentElement {
                 window.paint_quad(quad(
                     thumb_bounds,
                     Corners::all(px(3.5)),
-                    rgba_to_hsla(RgbaColor::rgba(0x59, 0x63, 0x6e, 0x66)),
+                    theme.scrollbar_thumb,
                     Edges::all(px(0.0)),
                     gpui_kit::transparent_black(),
                     BorderStyle::Solid,
@@ -343,7 +450,7 @@ impl Element for RichDocumentElement {
                 window.paint_quad(quad(
                     thumb_bounds,
                     Corners::all(px(3.5)),
-                    rgba_to_hsla(RgbaColor::rgba(0x59, 0x63, 0x6e, 0x66)),
+                    theme.scrollbar_thumb,
                     Edges::all(px(0.0)),
                     gpui_kit::transparent_black(),
                     BorderStyle::Solid,
@@ -353,11 +460,14 @@ impl Element for RichDocumentElement {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_block_chrome(
     layout: &BlockLayout<GpuiGlyphBackend>,
     block_x: f32,
     block_y: f32,
     zoom: f32,
+    show_heading_chevrons: bool,
+    theme: &RichTheme,
     to_window: &impl Fn(f32, f32) -> Point<Pixels>,
     window: &mut Window,
     cx: &mut App,
@@ -369,6 +479,9 @@ fn paint_block_chrome(
             chevron_rect,
             ..
         } => {
+            if !show_heading_chevrons {
+                return;
+            }
             let symbol = if *collapsed { "▸" } else { "▾" };
             let glyph_origin = to_window(
                 block_x + chevron_rect.x + pt_to_px(2.0, zoom),
@@ -378,7 +491,7 @@ fn paint_block_chrome(
                 symbol,
                 glyph_origin,
                 pt_to_px(11.5, zoom),
-                RgbaColor::MUTED,
+                theme.muted_text,
                 window,
                 cx,
             );
@@ -402,16 +515,16 @@ fn paint_block_chrome(
                 );
                 let box_bounds = Bounds::new(box_origin, size(px(box_size), px(box_size)));
                 let (background, border) = if *is_checked {
-                    (RgbaColor::LINK, RgbaColor::LINK)
+                    (theme.accent, theme.accent)
                 } else {
-                    (RgbaColor::WHITE, RgbaColor::MUTED)
+                    (theme.surface_background, theme.muted_text)
                 };
                 window.paint_quad(quad(
                     box_bounds,
                     Corners::all(px(pt_to_px(2.0, zoom))),
-                    rgba_to_hsla(background),
+                    background,
                     Edges::all(px(1.25)),
-                    rgba_to_hsla(border),
+                    border,
                     BorderStyle::Solid,
                 ));
                 if *is_checked {
@@ -424,7 +537,7 @@ fn paint_block_chrome(
                     window.paint_quad(quad(
                         Bounds::new(inner_origin, size(px(inner_size), px(inner_size))),
                         Corners::all(px(1.0)),
-                        rgba_to_hsla(RgbaColor::WHITE),
+                        theme.accent_foreground,
                         Edges::all(px(0.0)),
                         gpui_kit::transparent_black(),
                         BorderStyle::Solid,
@@ -437,7 +550,7 @@ fn paint_block_chrome(
                     marker,
                     origin,
                     pt_to_px(11.0, zoom),
-                    RgbaColor::MUTED,
+                    theme.muted_text,
                     window,
                     cx,
                 );
@@ -448,7 +561,7 @@ fn paint_block_chrome(
             window.paint_quad(quad(
                 Bounds::new(bar_origin, size(px(bar_rect.width), px(bar_rect.height))),
                 Corners::all(px(1.5)),
-                rgba_to_hsla(RgbaColor::rgb(0xd0, 0xd7, 0xde)),
+                theme.blockquote_rail,
                 Edges::all(px(0.0)),
                 gpui_kit::transparent_black(),
                 BorderStyle::Solid,
@@ -459,6 +572,8 @@ fn paint_block_chrome(
                     block_x + child.x,
                     block_y + child.y,
                     zoom,
+                    show_heading_chevrons,
+                    theme,
                     to_window,
                     window,
                     cx,
@@ -474,9 +589,9 @@ fn paint_block_chrome(
             window.paint_quad(quad(
                 Bounds::new(frame_origin, size(px(frame_rect.width), px(frame_rect.height))),
                 Corners::all(px(pt_to_px(5.0, zoom))),
-                rgba_to_hsla(RgbaColor::rgb(0xf6, 0xf8, 0xfa)),
+                theme.code_background,
                 Edges::all(px(1.0)),
-                rgba_to_hsla(RgbaColor::rgb(0xd0, 0xd7, 0xde)),
+                theme.code_border,
                 BorderStyle::Solid,
             ));
             if let Some(label) = language {
@@ -488,30 +603,33 @@ fn paint_block_chrome(
                     label,
                     label_origin,
                     pt_to_px(8.5, zoom),
-                    RgbaColor::MUTED,
+                    theme.muted_text,
                     window,
                     cx,
                 );
             }
         }
         BlockLayoutKind::Table(table) => {
-            let border_color = rgba_to_hsla(table.border_style.color);
+            let border_color = theme.resolve_table_border(table.border_style.color);
             let border_width = pt_to_px(table.border_style.width_pt, zoom).max(1.0);
             for cell in &table.cells {
                 let cell_origin = to_window(block_x + cell.rect.x, block_y + cell.rect.y);
                 let cell_bounds =
                     Bounds::new(cell_origin, size(px(cell.rect.width), px(cell.rect.height)));
-                let fill_color = cell.background.unwrap_or_else(|| {
-                    if cell.is_header {
-                        RgbaColor::rgb(0xf6, 0xf8, 0xfa)
-                    } else {
-                        RgbaColor::WHITE
-                    }
-                });
+                let fill_color = cell
+                    .background
+                    .map(rgba_to_hsla)
+                    .unwrap_or_else(|| {
+                        if cell.is_header {
+                            theme.table_header_background
+                        } else {
+                            theme.table_cell_background
+                        }
+                    });
                 window.paint_quad(quad(
                     cell_bounds,
                     Corners::all(px(0.0)),
-                    rgba_to_hsla(fill_color),
+                    fill_color,
                     Edges::all(px(border_width)),
                     border_color,
                     BorderStyle::Solid,
@@ -522,6 +640,8 @@ fn paint_block_chrome(
                         block_x + cell.rect.x + child.x,
                         block_y + cell.rect.y + child.y,
                         zoom,
+                        show_heading_chevrons,
+                        theme,
                         to_window,
                         window,
                         cx,
@@ -533,17 +653,19 @@ fn paint_block_chrome(
             let line_origin = to_window(block_x, block_y + *rule_y);
             window.paint_quad(fill(
                 Bounds::new(line_origin, size(px(layout.width), px(1.0))),
-                rgba_to_hsla(RgbaColor::rgb(0xd8, 0xde, 0xe4)),
+                theme.rule_color,
             ));
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_block_inline_backgrounds(
     layout: &BlockLayout<GpuiGlyphBackend>,
     block_x: f32,
     block_y: f32,
     zoom: f32,
+    theme: &RichTheme,
     to_window: &impl Fn(f32, f32) -> Point<Pixels>,
     window: &mut Window,
 ) {
@@ -551,7 +673,7 @@ fn paint_block_inline_backgrounds(
         BlockLayoutKind::Paragraph(paragraph)
         | BlockLayoutKind::Heading { paragraph, .. }
         | BlockLayoutKind::ListItem { paragraph, .. } => {
-            paint_paragraph_backgrounds(paragraph, block_x, block_y, zoom, to_window, window);
+            paint_paragraph_backgrounds(paragraph, block_x, block_y, zoom, theme, to_window, window);
         }
         BlockLayoutKind::CodeBlock {
             content_origin,
@@ -563,6 +685,7 @@ fn paint_block_inline_backgrounds(
                 block_x + content_origin.x,
                 block_y + content_origin.y,
                 zoom,
+                theme,
                 to_window,
                 window,
             );
@@ -574,6 +697,7 @@ fn paint_block_inline_backgrounds(
                     block_x + child.x,
                     block_y + child.y,
                     zoom,
+                    theme,
                     to_window,
                     window,
                 );
@@ -587,6 +711,7 @@ fn paint_block_inline_backgrounds(
                         block_x + cell.rect.x + child.x,
                         block_y + cell.rect.y + child.y,
                         zoom,
+                        theme,
                         to_window,
                         window,
                     );
@@ -602,6 +727,7 @@ fn paint_paragraph_backgrounds(
     origin_x: f32,
     origin_y: f32,
     zoom: f32,
+    theme: &RichTheme,
     to_window: &impl Fn(f32, f32) -> Point<Pixels>,
     window: &mut Window,
 ) {
@@ -631,7 +757,7 @@ fn paint_paragraph_backgrounds(
                             window.paint_quad(quad(
                                 Bounds::new(top_left, size(px(width + 2.0 * pad_x), px(height))),
                                 Corners::all(px(radius)),
-                                rgba_to_hsla(background),
+                                theme.resolve_inline_background(background, decoration.inline_code),
                                 Edges::all(px(0.0)),
                                 gpui_kit::transparent_black(),
                                 BorderStyle::Solid,
@@ -651,6 +777,7 @@ fn paint_block_foreground(
     block_y: f32,
     zoom: f32,
     debug_overlay: bool,
+    theme: &RichTheme,
     to_window: &impl Fn(f32, f32) -> Point<Pixels>,
     window: &mut Window,
     cx: &mut App,
@@ -665,6 +792,7 @@ fn paint_block_foreground(
                 block_y,
                 zoom,
                 debug_overlay,
+                theme,
                 to_window,
                 window,
                 cx,
@@ -681,6 +809,7 @@ fn paint_block_foreground(
                 block_y + content_origin.y,
                 zoom,
                 debug_overlay,
+                theme,
                 to_window,
                 window,
                 cx,
@@ -694,6 +823,7 @@ fn paint_block_foreground(
                     block_y + child.y,
                     zoom,
                     debug_overlay,
+                    theme,
                     to_window,
                     window,
                     cx,
@@ -709,6 +839,7 @@ fn paint_block_foreground(
                         block_y + cell.rect.y + child.y,
                         zoom,
                         debug_overlay,
+                        theme,
                         to_window,
                         window,
                         cx,
@@ -727,6 +858,7 @@ fn paint_paragraph_foreground(
     origin_y: f32,
     zoom: f32,
     debug_overlay: bool,
+    theme: &RichTheme,
     to_window: &impl Fn(f32, f32) -> Point<Pixels>,
     window: &mut Window,
     cx: &mut App,
@@ -736,13 +868,13 @@ fn paint_paragraph_foreground(
             let line_origin = to_window(origin_x + line.rect.x, origin_y + line.rect.y);
             window.paint_quad(outline(
                 Bounds::new(line_origin, size(px(line.rect.width), px(line.rect.height))),
-                rgba_to_hsla(RgbaColor::rgba(0x09, 0x69, 0xda, 0x55)),
+                theme.debug_line_outline,
                 BorderStyle::Solid,
             ));
             let base_origin = to_window(origin_x + line.rect.x, origin_y + line.baseline_y);
             window.paint_quad(fill(
                 Bounds::new(base_origin, size(px(line.rect.width), px(1.0))),
-                rgba_to_hsla(RgbaColor::rgba(0xcf, 0x22, 0x2e, 0x77)),
+                theme.debug_baseline,
             ));
         }
 
@@ -753,6 +885,7 @@ fn paint_paragraph_foreground(
                         text_fragment,
                         origin_x,
                         origin_y + line.baseline_y,
+                        theme,
                         to_window,
                         window,
                     );
@@ -763,6 +896,7 @@ fn paint_paragraph_foreground(
                         inline_box,
                         box_rect.translate(origin_x, origin_y),
                         zoom,
+                        theme,
                         to_window,
                         window,
                         cx,
@@ -778,6 +912,7 @@ fn paint_text_fragment(
     fragment: &TextFragment<GpuiGlyphBackend>,
     origin_x: f32,
     line_baseline_y: f32,
+    theme: &RichTheme,
     to_window: &impl Fn(f32, f32) -> Point<Pixels>,
     window: &mut Window,
 ) {
@@ -785,7 +920,7 @@ fn paint_text_fragment(
     let font_size = px(fragment.font_size_px);
 
     for run in &fragment.runs {
-        let color = rgba_to_hsla(run.color);
+        let color = theme.resolve_text_color(run.color);
         for glyph in &run.glyphs {
             let glyph_origin = to_window(
                 origin_x + fragment.x + glyph.x,
@@ -805,8 +940,8 @@ fn paint_text_fragment(
     let default_run_color = fragment
         .runs
         .first()
-        .map(|run| rgba_to_hsla(run.color))
-        .unwrap_or_else(|| rgba_to_hsla(RgbaColor::BLACK));
+        .map(|run| theme.resolve_text_color(run.color))
+        .unwrap_or(theme.text);
 
     for decoration in &fragment.decorations {
         let start_x = fragment.x + fragment.local_x_for_byte(decoration.doc_range.start);
@@ -820,7 +955,7 @@ fn paint_text_fragment(
         if let Some(underline) = decoration.underline {
             let (color, wavy) = match underline {
                 UnderlineKind::Solid => (default_run_color, false),
-                UnderlineKind::Wavy(wavy_color) => (rgba_to_hsla(wavy_color), true),
+                UnderlineKind::Wavy(wavy_color) => (theme.resolve_text_color(wavy_color), true),
             };
             let underline_y = baseline_y + (fragment.descent * 0.35).max(1.5);
             window.paint_underline(
@@ -852,6 +987,7 @@ fn paint_inline_box(
     inline_box: &InlineBoxFragment,
     canvas_rect: Rect,
     zoom: f32,
+    theme: &RichTheme,
     to_window: &impl Fn(f32, f32) -> Point<Pixels>,
     window: &mut Window,
     cx: &mut App,
@@ -865,50 +1001,36 @@ fn paint_inline_box(
             label,
             accent,
         } => {
-            let (bg, border, text_color) = match kind {
-                ChipKind::Person => (
-                    RgbaColor::rgb(0xe8, 0xf0, 0xfe),
-                    RgbaColor::rgb(0xae, 0xcb, 0xfa),
-                    RgbaColor::rgb(0x17, 0x4e, 0xa6),
-                ),
-                ChipKind::Date => (
-                    RgbaColor::rgb(0xfe, 0xf3, 0xc7),
-                    RgbaColor::rgb(0xfc, 0xd3, 0x4d),
-                    RgbaColor::rgb(0x92, 0x40, 0x0e),
-                ),
-                ChipKind::Document => (
-                    RgbaColor::rgb(0xdc, 0xfc, 0xe7),
-                    RgbaColor::rgb(0x86, 0xef, 0xac),
-                    RgbaColor::rgb(0x16, 0x65, 0x34),
-                ),
-                ChipKind::Tag => (
-                    RgbaColor::rgb(0xf3, 0xe8, 0xff),
-                    RgbaColor::rgb(0xd8, 0xb4, 0xfe),
-                    RgbaColor::rgb(0x6b, 0x21, 0xa8),
-                ),
-            };
-            let resolved_border = accent.unwrap_or(border);
+            let chip_colors = theme.smart_chips.for_kind(*kind);
+            let resolved_border = accent.map(rgba_to_hsla).unwrap_or(chip_colors.border);
             window.paint_quad(quad(
                 bounds,
                 Corners::all(px(canvas_rect.height * 0.5)),
-                rgba_to_hsla(bg),
+                chip_colors.background,
                 Edges::all(px(1.0)),
-                rgba_to_hsla(resolved_border),
+                resolved_border,
                 BorderStyle::Solid,
             ));
             let text_origin = to_window(
                 canvas_rect.x + pt_to_px(8.0, zoom),
                 canvas_rect.y + pt_to_px(2.5, zoom),
             );
-            paint_small_label(label, text_origin, pt_to_px(10.0, zoom), text_color, window, cx);
+            paint_small_label(
+                label,
+                text_origin,
+                pt_to_px(10.0, zoom),
+                chip_colors.text,
+                window,
+                cx,
+            );
         }
         InlineObject::Image { alt, .. } => {
             window.paint_quad(quad(
                 bounds,
                 Corners::all(px(pt_to_px(4.0, zoom))),
-                rgba_to_hsla(RgbaColor::rgb(0xee, 0xf2, 0xf6)),
+                theme.image_placeholder_background,
                 Edges::all(px(1.0)),
-                rgba_to_hsla(RgbaColor::rgb(0xbd, 0xc8, 0xd4)),
+                theme.image_placeholder_border,
                 BorderStyle::Solid,
             ));
             let caption = if alt.is_empty() { "Image" } else { alt.as_str() };
@@ -920,7 +1042,7 @@ fn paint_inline_box(
                 caption,
                 text_origin,
                 pt_to_px(9.5, zoom),
-                RgbaColor::MUTED,
+                theme.muted_text,
                 window,
                 cx,
             );
@@ -931,7 +1053,7 @@ fn paint_inline_box(
                 &label,
                 top_left,
                 pt_to_px(8.5, zoom),
-                RgbaColor::LINK,
+                theme.link,
                 window,
                 cx,
             );
@@ -939,22 +1061,100 @@ fn paint_inline_box(
     }
 }
 
+fn paint_ime_preedit(
+    overlay: &PrepaintPreedit,
+    theme: &RichTheme,
+    to_window: &impl Fn(f32, f32) -> Point<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let text = overlay.preedit.text.as_str();
+    if text.is_empty() {
+        return;
+    }
+    let font_size_px = overlay.font_size_px;
+    let run = TextRun {
+        len: text.len(),
+        font: gpui_kit::font(".SystemUIFont"),
+        color: theme.text,
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let shaped = window.text_system().shape_line(
+        SharedString::from(text.to_owned()),
+        px(font_size_px),
+        &[run],
+        None,
+    );
+    let shaped_width: f32 = shaped.width.into();
+    let height = overlay.anchor_rect.height.max(font_size_px * 1.25);
+    let pad_x = 2.0;
+    let origin = to_window(overlay.anchor_rect.x, overlay.anchor_rect.y);
+    let pill_bounds = Bounds::new(
+        point(origin.x - px(pad_x), origin.y),
+        size(px(shaped_width + 2.0 * pad_x), px(height)),
+    );
+    window.paint_quad(quad(
+        pill_bounds,
+        Corners::all(px(2.0)),
+        theme.surface_background,
+        Edges::all(px(0.0)),
+        gpui_kit::transparent_black(),
+        BorderStyle::Solid,
+    ));
+
+    if let Err(error) = shaped.paint(
+        origin,
+        px(height),
+        gpui_kit::TextAlign::Left,
+        None,
+        window,
+        cx,
+    ) {
+        eprintln!("rich-gpui: failed to paint IME preedit: {error}");
+    }
+
+    let underline_y = overlay.anchor_rect.y + height - 2.0;
+    window.paint_underline(
+        to_window(overlay.anchor_rect.x, underline_y),
+        px(shaped_width.max(4.0)),
+        &UnderlineStyle {
+            thickness: px(1.5),
+            color: Some(theme.caret),
+            wavy: false,
+        },
+    );
+
+    let caret_byte = overlay.preedit.selected_range.end.min(text.len());
+    let caret_offset_x: f32 = shaped.x_for_index(caret_byte).into();
+    window.paint_quad(fill(
+        Bounds::new(
+            to_window(
+                (overlay.anchor_rect.x + caret_offset_x).round(),
+                overlay.anchor_rect.y.round(),
+            ),
+            size(px(2.0), px(height)),
+        ),
+        theme.caret,
+    ));
+}
+
 fn paint_small_label(
     text: &str,
     origin: Point<Pixels>,
     font_size_px: f32,
-    color: RgbaColor,
+    color: Hsla,
     window: &mut Window,
     cx: &mut App,
 ) {
     if text.is_empty() {
         return;
     }
-    let hsla: Hsla = rgba_to_hsla(color);
     let run = TextRun {
         len: text.len(),
         font: gpui_kit::font(".SystemUIFont"),
-        color: hsla,
+        color,
         background_color: None,
         underline: None,
         strikethrough: None,

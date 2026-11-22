@@ -161,6 +161,12 @@ impl<B: GlyphBackend> LayoutCache<B> {
         self.entries.get(&key).cloned()
     }
 
+    /// Returns the most recently cached layout for `id`, regardless of current viewport/zoom key.
+    pub fn get_latest(&self, id: BlockId) -> Option<Arc<BlockLayout<B>>> {
+        let key = self.latest_by_id.get(&id)?;
+        self.entries.get(key).cloned()
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn get_or_layout<S: TextShaper<Backend = B>>(
         &mut self,

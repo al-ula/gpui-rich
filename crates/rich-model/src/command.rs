@@ -1,9 +1,10 @@
 //! Command model unifying viewer interactions, GPUI actions, and future editing operations.
 
-use crate::block::BlockId;
+use crate::block::{BlockId, Document};
 use crate::inline::InlineObject;
 use crate::selection::{DocPos, DocumentSelection};
 use crate::style::{BlockStyle, HorizontalLayout, InlineStyle, TextAlign};
+use crate::transaction::ChangeSet;
 use serde::{Deserialize, Serialize};
 
 /// Cardinal direction for caret navigation and deletion commands.
@@ -74,6 +75,8 @@ pub enum RichCommand {
     },
     SplitBlock,
     InsertSoftBreak,
+    Indent,
+    Outdent,
     ToggleMark(MarkKind),
     SetInlineStyle(InlineStyle),
     SetBlockStyle(BlockStyle),
@@ -92,6 +95,8 @@ impl RichCommand {
                 | Self::Delete { .. }
                 | Self::SplitBlock
                 | Self::InsertSoftBreak
+                | Self::Indent
+                | Self::Outdent
                 | Self::ToggleMark(_)
                 | Self::SetInlineStyle(_)
                 | Self::SetBlockStyle(_)
@@ -123,11 +128,151 @@ impl RichCommand {
             Self::Delete { .. } => "rich.edit.delete",
             Self::SplitBlock => "rich.edit.split_block",
             Self::InsertSoftBreak => "rich.edit.insert_soft_break",
+            Self::Indent => "rich.edit.indent",
+            Self::Outdent => "rich.edit.outdent",
             Self::ToggleMark(_) => "rich.format.toggle_mark",
             Self::SetInlineStyle(_) => "rich.format.set_inline_style",
             Self::SetBlockStyle(_) => "rich.format.set_block_style",
             Self::SetTextAlign(_) => "rich.format.set_text_align",
         }
+    }
+}
+
+/// Origin of a dispatched [`RichCommand`], used for policy gating and middleware decisions.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+pub enum CommandSource {
+    /// Initiated by direct user input (keyboard, mouse, IME, toolbar action).
+    #[default]
+    User,
+    /// Initiated programmatically by the host application, plugins, or sync layers.
+    Programmatic,
+}
+
+/// Controls which user-initiated interactions and mutations are permitted on a document view.
+///
+/// Commands dispatched with [`CommandSource::Programmatic`] bypass user-interaction gates while
+/// still executing through middleware, transactions, layout synchronization, and host events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct InteractionPolicy {
+    pub editable: bool,
+    pub selectable: bool,
+    pub clickable_links: bool,
+    pub collapsible_headings: bool,
+    pub show_caret_read_only: bool,
+}
+
+impl Default for InteractionPolicy {
+    fn default() -> Self {
+        Self::viewer()
+    }
+}
+
+impl InteractionPolicy {
+    /// Full editing preset: document mutations, selection, links, and collapsible headings enabled.
+    pub const fn editable() -> Self {
+        Self {
+            editable: true,
+            selectable: true,
+            clickable_links: true,
+            collapsible_headings: true,
+            show_caret_read_only: false,
+        }
+    }
+
+    /// Interactive read-only viewer preset: selection, copy, links, and collapsible headings enabled.
+    pub const fn viewer() -> Self {
+        Self {
+            editable: false,
+            selectable: true,
+            clickable_links: true,
+            collapsible_headings: true,
+            show_caret_read_only: false,
+        }
+    }
+
+    /// Non-interactive preview preset: scrolling and zoom remain active while editing, selection,
+    /// link activation, and heading collapse are disabled for user input.
+    pub const fn static_preview() -> Self {
+        Self {
+            editable: false,
+            selectable: false,
+            clickable_links: false,
+            collapsible_headings: false,
+            show_caret_read_only: false,
+        }
+    }
+
+    /// Returns true when a collapsed caret should be visible.
+    pub const fn should_show_caret(&self) -> bool {
+        self.editable || self.show_caret_read_only
+    }
+
+    /// Evaluates whether `command` from `source` is permitted under this policy.
+    ///
+    /// Returns `Some(rejection)` when blocked, or `None` when permitted.
+    pub fn check_command(
+        &self,
+        command: &RichCommand,
+        source: CommandSource,
+    ) -> Option<CommandOutcome> {
+        if source == CommandSource::Programmatic {
+            return None;
+        }
+        if command.is_document_mutation() && !self.editable {
+            return Some(CommandOutcome::RejectedReadOnly);
+        }
+        match command {
+            RichCommand::SetSelection(Some(_))
+            | RichCommand::SelectAll
+            | RichCommand::SelectWordAt(_)
+            | RichCommand::MoveCaret { .. }
+            | RichCommand::CopySelection
+                if !self.selectable =>
+            {
+                Some(CommandOutcome::RejectedByPolicy)
+            }
+            RichCommand::OpenLink(_) if !self.clickable_links => {
+                Some(CommandOutcome::RejectedByPolicy)
+            }
+            RichCommand::ToggleHeadingCollapsed(_) if !self.collapsible_headings => {
+                Some(CommandOutcome::RejectedByPolicy)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Decision returned by [`CommandMiddleware::before_command`].
+#[derive(Clone, Debug, PartialEq)]
+pub enum CommandDecision {
+    /// Proceed with the current command.
+    Continue,
+    /// Abort command execution and report [`CommandOutcome::Cancelled`].
+    Cancel,
+    /// Substitute a different command for remaining middleware and execution.
+    Replace(RichCommand),
+}
+
+/// Extension hook intercepting commands before execution and observing applied transactions.
+pub trait CommandMiddleware {
+    /// Inspects, cancels, or replaces a command prior to policy enforcement and execution.
+    fn before_command(
+        &mut self,
+        _command: &RichCommand,
+        _source: CommandSource,
+        _document: &Document,
+        _selection: Option<&DocumentSelection>,
+    ) -> CommandDecision {
+        CommandDecision::Continue
+    }
+
+    /// Invoked after a [`crate::Transaction`] mutates the [`Document`].
+    fn after_transaction(
+        &mut self,
+        _change_set: &ChangeSet,
+        _document: &Document,
+        _selection: Option<&DocumentSelection>,
+    ) {
     }
 }
 
@@ -137,5 +282,7 @@ pub enum CommandOutcome {
     Executed,
     NoOp,
     RejectedReadOnly,
+    RejectedByPolicy,
+    Cancelled,
     Unsupported,
 }

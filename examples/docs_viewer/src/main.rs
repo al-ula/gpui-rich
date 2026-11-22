@@ -2,29 +2,51 @@
 
 use gpui_kit::{
     App, AppContext, Bounds, Context, Entity, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Render, SharedString, Styled, Window, WindowBounds, WindowOptions, div, px, rgb,
-    size,
+    ParentElement, Render, SharedString, Styled, Subscription, Window, WindowBounds, WindowOptions,
+    div, px, rgb, size,
 };
-use rich_gpui::{RichDocumentView, register_default_keybindings};
+use rich_gpui::{RichDocumentEvent, RichDocumentView, RichTheme, register_default_keybindings};
 use rich_model::{
     BaselineShift, BlockKind, BlockNode, BlockStyle, BlockWidth, ChipKind, ColumnSpec, Document,
-    FontWeight, HorizontalLayout, InlineContent, InlineObject, InlineStyle, InlineVAlign, ListId,
-    ListKind, NumberStyle, PaperSpec, RgbaColor, RichCommand, StyleId, TableBlock,
-    TableBorderStyle, TableCell, TableRow, TextAlign, UnderlineKind,
+    FontWeight, HorizontalLayout, InlineContent, InlineObject, InlineStyle, InlineVAlign,
+    InteractionPolicy, ListId, ListKind, NumberStyle, PaperSpec, RgbaColor, RichCommand, StyleId,
+    TableBlock, TableBorderStyle, TableCell, TableRow, TextAlign, UnderlineKind,
 };
 
 struct DocsViewerApp {
     document_view: Entity<RichDocumentView>,
+    _event_subscription: Subscription,
     last_paper_spec: PaperSpec,
+    dark_mode: bool,
+    status_message: SharedString,
 }
 
 impl DocsViewerApp {
     fn new(cx: &mut Context<Self>) -> Self {
         let document = build_sample_document();
         let document_view = cx.new(|cx| RichDocumentView::new(document, cx));
+        let event_subscription = cx.subscribe(
+            &document_view,
+            |this, _view, event: &RichDocumentEvent, cx| match event {
+                RichDocumentEvent::LinkActivated { href } => {
+                    this.status_message = format!("Link: {href}").into();
+                    cx.notify();
+                }
+                RichDocumentEvent::DocumentMutated { change_set } => {
+                    this.status_message =
+                        format!("Mutated {} block(s)", change_set.dirty_blocks.len()).into();
+                    cx.notify();
+                }
+                RichDocumentEvent::SelectionChanged { .. }
+                | RichDocumentEvent::CommandExecuted { .. } => {}
+            },
+        );
         Self {
             document_view,
+            _event_subscription: event_subscription,
             last_paper_spec: PaperSpec::LETTER,
+            dark_mode: false,
+            status_message: SharedString::from("Viewer"),
         }
     }
 
@@ -32,9 +54,14 @@ impl DocsViewerApp {
         id: &'static str,
         label: impl Into<SharedString>,
         active: bool,
+        dark_mode: bool,
     ) -> gpui_kit::Stateful<gpui_kit::Div> {
-        let background = if active { rgb(0xd3e3fd) } else { rgb(0xf1f3f4) };
-        let text_color = if active { rgb(0x0b57d0) } else { rgb(0x1f2328) };
+        let (background, text_color) = match (dark_mode, active) {
+            (false, true) => (rgb(0xd3e3fd), rgb(0x0b57d0)),
+            (false, false) => (rgb(0xf1f3f4), rgb(0x1f2328)),
+            (true, true) => (rgb(0x1f3a5f), rgb(0x79c0ff)),
+            (true, false) => (rgb(0x21262d), rgb(0xe6edf3)),
+        };
         div()
             .id(id)
             .px(px(10.0))
@@ -50,41 +77,48 @@ impl DocsViewerApp {
 
 impl Render for DocsViewerApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let (zoom, horizontal_layout, debug_active) = {
+        let (zoom, horizontal_layout, debug_active, policy) = {
             let view = self.document_view.read(cx);
             (
                 view.zoom,
                 view.document.config.horizontal_layout,
                 view.debug_overlay,
+                view.policy,
             )
         };
+        let dark = self.dark_mode;
         let is_fill = matches!(horizontal_layout, HorizontalLayout::Fill);
         let active_paper = match horizontal_layout {
             HorizontalLayout::Paper(spec) => Some(spec),
             HorizontalLayout::Fill => None,
         };
         let zoom_label = format!("{}%", (zoom * 100.0).round() as i32);
+        let toolbar_bg = if dark { rgb(0x161b22) } else { rgb(0xf8f9fa) };
+        let toolbar_border = if dark { rgb(0x30363d) } else { rgb(0xd0d7de) };
+        let title_color = if dark { rgb(0xe6edf3) } else { rgb(0x1f2328) };
+        let muted_color = if dark { rgb(0x8b949e) } else { rgb(0x59636e) };
+        let root_bg = if dark { rgb(0x0d1117) } else { rgb(0xffffff) };
 
         let mut toolbar = div()
             .flex()
             .flex_row()
             .items_center()
-            .gap(px(8.0))
-            .px(px(16.0))
+            .gap(px(6.0))
+            .px(px(14.0))
             .py(px(8.0))
-            .bg(rgb(0xf8f9fa))
+            .bg(toolbar_bg)
             .border_b_1()
-            .border_color(rgb(0xd0d7de))
+            .border_color(toolbar_border)
             .child(
                 div()
                     .text_size(px(13.0))
                     .font_weight(gpui_kit::FontWeight::SEMIBOLD)
-                    .text_color(rgb(0x1f2328))
-                    .mr(px(8.0))
+                    .text_color(title_color)
+                    .mr(px(6.0))
                     .child("gpui-rich"),
             )
             .child(
-                Self::toolbar_button("mode-paper", "Paper", !is_fill).on_mouse_down(
+                Self::toolbar_button("mode-paper", "Paper", !is_fill, dark).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _event, _window, cx| {
                         let spec = this.last_paper_spec;
@@ -98,7 +132,7 @@ impl Render for DocsViewerApp {
                 ),
             )
             .child(
-                Self::toolbar_button("mode-fill", "Fill", is_fill).on_mouse_down(
+                Self::toolbar_button("mode-fill", "Fill", is_fill, dark).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _event, _window, cx| {
                         this.document_view.update(cx, |view, cx| {
@@ -113,12 +147,13 @@ impl Render for DocsViewerApp {
 
         if let Some(paper_spec) = active_paper {
             toolbar = toolbar
-                .child(div().w(px(1.0)).h(px(16.0)).bg(rgb(0xd0d7de)).mx(px(4.0)))
+                .child(div().w(px(1.0)).h(px(16.0)).bg(toolbar_border).mx(px(2.0)))
                 .child(
                     Self::toolbar_button(
                         "paper-narrow",
                         "Narrow",
                         paper_spec == PaperSpec::NARROW,
+                        dark,
                     )
                     .on_mouse_down(
                         MouseButton::Left,
@@ -140,6 +175,7 @@ impl Render for DocsViewerApp {
                         "paper-letter",
                         "Letter",
                         paper_spec == PaperSpec::LETTER,
+                        dark,
                     )
                     .on_mouse_down(
                         MouseButton::Left,
@@ -157,28 +193,33 @@ impl Render for DocsViewerApp {
                     ),
                 )
                 .child(
-                    Self::toolbar_button("paper-wide", "Wide", paper_spec == PaperSpec::WIDE)
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(|this, _event, _window, cx| {
-                                this.last_paper_spec = PaperSpec::WIDE;
-                                this.document_view.update(cx, |view, cx| {
-                                    view.dispatch_command(
-                                        RichCommand::SetHorizontalLayout(HorizontalLayout::Paper(
-                                            PaperSpec::WIDE,
-                                        )),
-                                        cx,
-                                    );
-                                });
-                            }),
-                        ),
+                    Self::toolbar_button(
+                        "paper-wide",
+                        "Wide",
+                        paper_spec == PaperSpec::WIDE,
+                        dark,
+                    )
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.last_paper_spec = PaperSpec::WIDE;
+                            this.document_view.update(cx, |view, cx| {
+                                view.dispatch_command(
+                                    RichCommand::SetHorizontalLayout(HorizontalLayout::Paper(
+                                        PaperSpec::WIDE,
+                                    )),
+                                    cx,
+                                );
+                            });
+                        }),
+                    ),
                 );
         }
 
         toolbar = toolbar
-            .child(div().w(px(1.0)).h(px(16.0)).bg(rgb(0xd0d7de)).mx(px(4.0)))
+            .child(div().w(px(1.0)).h(px(16.0)).bg(toolbar_border).mx(px(2.0)))
             .child(
-                Self::toolbar_button("zoom-out", "-", false).on_mouse_down(
+                Self::toolbar_button("zoom-out", "-", false, dark).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _event, _window, cx| {
                         this.document_view.update(cx, |view, cx| {
@@ -188,7 +229,7 @@ impl Render for DocsViewerApp {
                 ),
             )
             .child(
-                Self::toolbar_button("zoom-reset", zoom_label, false).on_mouse_down(
+                Self::toolbar_button("zoom-reset", zoom_label, false, dark).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _event, _window, cx| {
                         this.document_view.update(cx, |view, cx| {
@@ -198,7 +239,7 @@ impl Render for DocsViewerApp {
                 ),
             )
             .child(
-                Self::toolbar_button("zoom-in", "+", false).on_mouse_down(
+                Self::toolbar_button("zoom-in", "+", false, dark).on_mouse_down(
                     MouseButton::Left,
                     cx.listener(|this, _event, _window, cx| {
                         this.document_view.update(cx, |view, cx| {
@@ -207,9 +248,86 @@ impl Render for DocsViewerApp {
                     }),
                 ),
             )
+            .child(div().w(px(1.0)).h(px(16.0)).bg(toolbar_border).mx(px(2.0)))
+            .child(
+                Self::toolbar_button(
+                    "policy-viewer",
+                    "Viewer",
+                    policy == InteractionPolicy::viewer(),
+                    dark,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        this.status_message = SharedString::from("Viewer");
+                        this.document_view.update(cx, |view, cx| {
+                            view.set_policy(InteractionPolicy::viewer(), cx);
+                        });
+                    }),
+                ),
+            )
+            .child(
+                Self::toolbar_button(
+                    "policy-editable",
+                    "Editable",
+                    policy == InteractionPolicy::editable(),
+                    dark,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        this.status_message = SharedString::from("Editable");
+                        this.document_view.update(cx, |view, cx| {
+                            view.set_policy(InteractionPolicy::editable(), cx);
+                        });
+                    }),
+                ),
+            )
+            .child(
+                Self::toolbar_button(
+                    "policy-preview",
+                    "Preview",
+                    policy == InteractionPolicy::static_preview(),
+                    dark,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        this.status_message = SharedString::from("Static Preview");
+                        this.document_view.update(cx, |view, cx| {
+                            view.set_policy(InteractionPolicy::static_preview(), cx);
+                        });
+                    }),
+                ),
+            )
             .child(div().flex_1())
             .child(
-                Self::toolbar_button("toggle-debug", "Debug Baselines", debug_active)
+                div()
+                    .text_size(px(11.0))
+                    .text_color(muted_color)
+                    .mr(px(6.0))
+                    .child(self.status_message.clone()),
+            )
+            .child(
+                Self::toolbar_button("toggle-theme", if dark { "Light" } else { "Dark" }, dark, dark)
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.dark_mode = !this.dark_mode;
+                            let next_theme = if this.dark_mode {
+                                RichTheme::dark()
+                            } else {
+                                RichTheme::light()
+                            };
+                            this.document_view.update(cx, |view, cx| {
+                                view.set_theme(next_theme, cx);
+                            });
+                            cx.notify();
+                        }),
+                    ),
+            )
+            .child(
+                Self::toolbar_button("toggle-debug", "Debug Baselines", debug_active, dark)
                     .on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _event, _window, cx| {
@@ -224,7 +342,7 @@ impl Render for DocsViewerApp {
             .flex()
             .flex_col()
             .size_full()
-            .bg(rgb(0xffffff))
+            .bg(root_bg)
             .child(toolbar)
             .child(div().flex_1().size_full().child(self.document_view.clone()))
     }
@@ -304,7 +422,7 @@ fn build_sample_document() -> Document {
     chips.push_text(", ", InlineStyle::default());
     chips.push_text(
         "highlighted passages",
-        InlineStyle::default().with_background(RgbaColor::rgb(0xff, 0xf3, 0xb0)),
+        InlineStyle::default().with_background(RgbaColor::rgba(0xff, 0xd4, 0x3b, 0x6b)),
     );
     chips.push_text(", ", InlineStyle::default());
     chips.push_text(
@@ -313,8 +431,13 @@ fn build_sample_document() -> Document {
     );
     chips.push_text(", ", InlineStyle::default());
     chips.push_text("strikethrough", InlineStyle::default().with_strikethrough(true));
-    chips.push_text(", and ", InlineStyle::default());
+    chips.push_text(", ", InlineStyle::default());
     chips.push_text("clickable links", InlineStyle::default().with_link("https://gpui.rs"));
+    chips.push_text(", and ", InlineStyle::default());
+    chips.push_text(
+        "internal doc URIs",
+        InlineStyle::default().with_link("doc://architecture/phase-2"),
+    );
     chips.push_object(InlineObject::FootnoteRef { index: 1 }, InlineStyle::default());
     chips.push_text(".", InlineStyle::default());
     document.add_paragraph(chips, BlockStyle::default());

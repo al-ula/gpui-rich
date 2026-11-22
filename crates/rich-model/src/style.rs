@@ -25,6 +25,7 @@ impl RgbaColor {
     pub const WHITE: Self = Self::rgb(0xff, 0xff, 0xff);
     pub const MUTED: Self = Self::rgb(0x59, 0x63, 0x6e);
     pub const LINK: Self = Self::rgb(0x0b, 0x57, 0xd0);
+    pub const INLINE_CODE_BG: Self = Self::rgba(0x9a, 0xa5, 0xb1, 0x35);
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
@@ -225,7 +226,7 @@ impl InlineStyle {
 
         let background = self.background.or_else(|| {
             if inline_code {
-                Some(RgbaColor::rgba(0x9a, 0xa5, 0xb1, 0x35))
+                Some(RgbaColor::INLINE_CODE_BG)
             } else {
                 base.background
             }

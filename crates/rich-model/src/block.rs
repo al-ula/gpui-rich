@@ -1,11 +1,28 @@
 use crate::inline::InlineContent;
+use crate::selection::{DocPos, PathSegment};
 use crate::style::{
     BlockStyle, BlockWidth, DocumentLayoutConfig, Edges, RgbaColor, StyleId, StyleSheet,
 };
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BlockId(pub u64);
+
+/// Identifies a block list within the document tree (top-level or nested inside a container).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum ContainerTarget {
+    /// Top-level `Document::blocks`.
+    Root,
+    /// Children of a `BlockKind::Blockquote` with the given [`BlockId`].
+    Blockquote(BlockId),
+    /// Children of a specific cell inside a `BlockKind::Table`.
+    TableCell {
+        table_id: BlockId,
+        row: usize,
+        col: usize,
+    },
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ListId(pub u64);
@@ -295,6 +312,114 @@ impl Document {
         leaves
     }
 
+    /// Collects text-bearing leaf blocks currently visible under collapsible heading rules.
+    pub fn collect_visible_leaf_blocks(&self) -> Vec<&BlockNode> {
+        let mut leaves = Vec::new();
+        let mut collapsed_level: Option<u8> = None;
+
+        for block in &self.blocks {
+            let visible = match &block.kind {
+                BlockKind::Heading {
+                    level, collapsed, ..
+                } => {
+                    if let Some(current_level) = collapsed_level {
+                        if *level <= current_level {
+                            collapsed_level = if *collapsed { Some(*level) } else { None };
+                            true
+                        } else {
+                            false
+                        }
+                    } else {
+                        if *collapsed {
+                            collapsed_level = Some(*level);
+                        }
+                        true
+                    }
+                }
+                _ => collapsed_level.is_none(),
+            };
+            if visible {
+                collect_leaves_in_slice(std::slice::from_ref(block), &mut leaves);
+            }
+        }
+        leaves
+    }
+
+    /// Finds the enclosing [`ContainerTarget`] and child index of `block_id`.
+    pub fn locate_block(&self, block_id: BlockId) -> Option<(ContainerTarget, usize)> {
+        locate_in_slice(&self.blocks, ContainerTarget::Root, block_id)
+    }
+
+    /// Resolves the full [`PathSegment`] chain leading to `block_id`.
+    pub fn path_for_block(&self, block_id: BlockId) -> Option<SmallVec<[PathSegment; 4]>> {
+        let mut path = SmallVec::new();
+        if build_path_in_slice(&self.blocks, block_id, &mut path) {
+            Some(path)
+        } else {
+            None
+        }
+    }
+
+    /// Constructs a [`DocPos`] targeting `block_id` at UTF-8 byte `offset`, preserving nested container paths.
+    pub fn doc_pos_for_block(&self, block_id: BlockId, offset: usize) -> Option<DocPos> {
+        let path = self.path_for_block(block_id)?;
+        Some(DocPos { path, offset })
+    }
+
+    /// Returns an immutable slice of the blocks inside `target`.
+    pub fn container_blocks(&self, target: ContainerTarget) -> Option<&[BlockNode]> {
+        match target {
+            ContainerTarget::Root => Some(&self.blocks),
+            ContainerTarget::Blockquote(quote_id) => {
+                let block = self.find_block(quote_id)?;
+                if let BlockKind::Blockquote(children) = &block.kind {
+                    Some(children)
+                } else {
+                    None
+                }
+            }
+            ContainerTarget::TableCell { table_id, row, col } => {
+                let block = self.find_block(table_id)?;
+                if let BlockKind::Table(table) = &block.kind {
+                    table
+                        .rows
+                        .get(row)
+                        .and_then(|table_row| table_row.cells.get(col))
+                        .map(|cell| cell.blocks.as_slice())
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Returns a mutable reference to the block list inside `target`.
+    pub fn container_blocks_mut(&mut self, target: ContainerTarget) -> Option<&mut Vec<BlockNode>> {
+        match target {
+            ContainerTarget::Root => Some(&mut self.blocks),
+            ContainerTarget::Blockquote(quote_id) => {
+                let block = self.find_block_mut(quote_id)?;
+                if let BlockKind::Blockquote(children) = &mut block.kind {
+                    Some(children)
+                } else {
+                    None
+                }
+            }
+            ContainerTarget::TableCell { table_id, row, col } => {
+                let block = self.find_block_mut(table_id)?;
+                if let BlockKind::Table(table) = &mut block.kind {
+                    table
+                        .rows
+                        .get_mut(row)
+                        .and_then(|table_row| table_row.cells.get_mut(col))
+                        .map(|cell| &mut cell.blocks)
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
     pub fn toggle_heading_collapsed(&mut self, id: BlockId) -> Option<bool> {
         let block = self.find_block_mut(id)?;
         if let BlockKind::Heading { collapsed, .. } = &mut block.kind {
@@ -334,6 +459,82 @@ fn collect_leaves_in_slice<'doc>(blocks: &'doc [BlockNode], out: &mut Vec<&'doc 
             BlockKind::HorizontalRule => {}
         }
     }
+}
+
+fn locate_in_slice(
+    blocks: &[BlockNode],
+    current_target: ContainerTarget,
+    block_id: BlockId,
+) -> Option<(ContainerTarget, usize)> {
+    for (index, block) in blocks.iter().enumerate() {
+        if block.id == block_id {
+            return Some((current_target, index));
+        }
+        match &block.kind {
+            BlockKind::Blockquote(children) => {
+                if let Some(found) =
+                    locate_in_slice(children, ContainerTarget::Blockquote(block.id), block_id)
+                {
+                    return Some(found);
+                }
+            }
+            BlockKind::Table(table) => {
+                for (row_index, row) in table.rows.iter().enumerate() {
+                    for (col_index, cell) in row.cells.iter().enumerate() {
+                        let cell_target = ContainerTarget::TableCell {
+                            table_id: block.id,
+                            row: row_index,
+                            col: col_index,
+                        };
+                        if let Some(found) = locate_in_slice(&cell.blocks, cell_target, block_id) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn build_path_in_slice(
+    blocks: &[BlockNode],
+    block_id: BlockId,
+    path: &mut SmallVec<[PathSegment; 4]>,
+) -> bool {
+    for block in blocks {
+        if block.id == block_id {
+            path.push(PathSegment::Block(block.id));
+            return true;
+        }
+        match &block.kind {
+            BlockKind::Blockquote(children) => {
+                path.push(PathSegment::Block(block.id));
+                if build_path_in_slice(children, block_id, path) {
+                    return true;
+                }
+                path.pop();
+            }
+            BlockKind::Table(table) => {
+                for (row_index, row) in table.rows.iter().enumerate() {
+                    for (col_index, cell) in row.cells.iter().enumerate() {
+                        path.push(PathSegment::TableCell {
+                            table_id: block.id,
+                            row: row_index,
+                            col: col_index,
+                        });
+                        if build_path_in_slice(&cell.blocks, block_id, path) {
+                            return true;
+                        }
+                        path.pop();
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    false
 }
 
 fn find_in_slice(blocks: &[BlockNode], id: BlockId) -> Option<&BlockNode> {
