@@ -1,4 +1,5 @@
-use crate::style::{InlineStyle, RgbaColor};
+use crate::payload::CustomPayload;
+use crate::style::{InlineStyle, RgbaColor, SharedStr};
 use serde::{Deserialize, Serialize};
 use std::ops::Range;
 
@@ -45,9 +46,19 @@ pub enum InlineObject {
     },
     /// Host-defined custom inline atomic node rendered and measured via `ExtensionRegistry`.
     Custom {
-        kind: String,
-        data: serde_json::Value,
+        kind: SharedStr,
+        #[serde(default)]
+        data: CustomPayload,
     },
+}
+
+impl InlineObject {
+    pub fn custom(kind: impl Into<SharedStr>, data: CustomPayload) -> Self {
+        Self::Custom {
+            kind: kind.into(),
+            data,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]

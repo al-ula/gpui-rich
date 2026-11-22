@@ -2,6 +2,7 @@
 
 use crate::block::{BlockId, ColumnSpec, Document, ListKind};
 use crate::inline::{InlineObject, InlineObjectId};
+use crate::payload::CustomPayload;
 use crate::selection::{DocPos, DocumentSelection};
 use crate::style::{
     BlockStyle, Edges, HorizontalLayout, InlineStyle, LinkTarget, NamedStyle, StyleId, TextAlign,
@@ -128,7 +129,8 @@ pub enum RichCommand {
     /// Host-defined custom command routed through policy gating, middleware, and `ExtensionRegistry`.
     Custom {
         id: String,
-        payload: serde_json::Value,
+        #[serde(default)]
+        payload: CustomPayload,
         mutates_document: bool,
     },
 }

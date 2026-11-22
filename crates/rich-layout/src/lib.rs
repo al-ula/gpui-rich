@@ -152,7 +152,7 @@ mod tests {
                         c1,
                         vec![BlockNode::new(
                             p1,
-                            BlockKind::Paragraph(InlineContent::plain("Metric")),
+                            BlockKind::paragraph(InlineContent::plain("Metric")),
                             BlockStyle::default(),
                         )],
                     ),
@@ -160,7 +160,7 @@ mod tests {
                         c2,
                         vec![BlockNode::new(
                             p2,
-                            BlockKind::Paragraph(InlineContent::plain(
+                            BlockKind::paragraph(InlineContent::plain(
                                 "Description spanning a wider column with wrapping text.",
                             )),
                             BlockStyle::default(),
@@ -172,7 +172,7 @@ mod tests {
         };
 
         doc.push_block(
-            BlockNode::new(t_id, BlockKind::Table(table), BlockStyle::default())
+            BlockNode::new(t_id, BlockKind::table(table), BlockStyle::default())
                 .with_width_mode(BlockWidth::Wide),
         );
 
@@ -264,7 +264,7 @@ mod tests {
 
             fn measure_inline_object(&mut self, object: &InlineObject, zoom: f32) -> InlineBoxMetrics {
                 if let InlineObject::Custom { kind, .. } = object
-                    && kind == "badge"
+                    && kind.as_ref() == "badge"
                 {
                     return InlineBoxMetrics {
                         width: 64.0 * zoom,
@@ -278,14 +278,28 @@ mod tests {
             fn measure_custom_block(
                 &mut self,
                 kind: &str,
-                _data: &serde_json::Value,
+                _data: &CustomPayload,
                 max_width: f32,
                 zoom: f32,
             ) -> Size {
-                if kind == "callout" {
+                if kind == "callout_leaf" {
                     Size::new(max_width, 84.0 * zoom)
                 } else {
                     Size::new(max_width, 40.0 * zoom)
+                }
+            }
+
+            fn measure_custom_chrome(
+                &mut self,
+                kind: &str,
+                _data: &CustomPayload,
+                _max_width: f32,
+                zoom: f32,
+            ) -> Insets {
+                if kind == "callout" {
+                    Insets::new(28.0 * zoom, 12.0 * zoom, 10.0 * zoom, 16.0 * zoom)
+                } else {
+                    Insets::xy(12.0 * zoom, 8.0 * zoom)
                 }
             }
         }
@@ -294,26 +308,52 @@ mod tests {
         let mut inline = InlineContent::empty();
         inline.push_text("Before ", InlineStyle::default());
         inline.push_object(
-            InlineObject::Custom {
-                kind: "badge".into(),
-                data: serde_json::json!({ "label": "PRO" }),
-            },
+            InlineObject::custom(
+                "badge",
+                CustomPayload::from_json(serde_json::json!({ "label": "PRO" })),
+            ),
             InlineStyle::default(),
         );
         document.add_paragraph(inline, BlockStyle::default());
-        let callout_id = document.add_custom_block("callout", serde_json::json!({ "title": "Note" }));
+        let leaf_id = document.add_custom_block(
+            "callout_leaf",
+            CustomPayload::from_json(serde_json::json!({ "title": "Note" })),
+        );
+        let child_id = document.alloc_block_id();
+        let container_id = document.add_custom_container(
+            "callout",
+            CustomPayload::from_json(serde_json::json!({ "title": "Editable Callout" })),
+            vec![BlockNode::new(
+                child_id,
+                BlockKind::paragraph(InlineContent::plain("Inside container")),
+                BlockStyle::default(),
+            )],
+        );
 
         let mut flow = FlowLayout::<MockBackend>::default();
         let mut shaper = CustomMetricShaper;
         let visible = flow.layout_visible_blocks(&document, 0.0, 600.0, 600.0, 100.0, 1.0, &mut shaper);
-        assert_eq!(visible.len(), 2);
+        assert_eq!(visible.len(), 3);
 
-        let callout = visible.iter().find(|entry| entry.id == callout_id).unwrap();
-        assert!((callout.layout.height - 84.0).abs() < 0.01);
+        let leaf = visible.iter().find(|entry| entry.id == leaf_id).unwrap();
+        assert!((leaf.layout.height - 84.0).abs() < 0.01);
         assert!(matches!(
-            &callout.layout.kind,
-            BlockLayoutKind::Custom { kind, .. } if kind == "callout"
+            &leaf.layout.kind,
+            BlockLayoutKind::CustomLeaf { kind, .. } if kind.as_ref() == "callout_leaf"
         ));
+
+        let container = visible.iter().find(|entry| entry.id == container_id).unwrap();
+        assert!(matches!(
+            &container.layout.kind,
+            BlockLayoutKind::CustomContainer { kind, children, chrome, .. }
+                if kind.as_ref() == "callout" && children.len() == 1 && (chrome.top - 28.0).abs() < 0.01
+        ));
+        let hit_pt = Point::new(container.x + 24.0, container.y + 34.0);
+        let hit = flow
+            .hit_test_canvas(hit_pt, &document, 600.0, 1.0, &mut shaper)
+            .expect("expected hit inside custom container child");
+        assert_eq!(hit.pos.leaf_block_id(), Some(child_id));
+        assert_eq!(hit.pos.top_level_block_id(), Some(container_id));
     }
 
     #[test]
@@ -445,7 +485,7 @@ mod tests {
         let p2 = doc.alloc_block_id();
         doc.push_block(BlockNode::new(
             table_id,
-            BlockKind::Table(TableBlock {
+            BlockKind::table(TableBlock {
                 columns: vec![ColumnSpec::Ratio(1.0), ColumnSpec::Ratio(1.0)],
                 rows: vec![TableRow {
                     is_header: false,
@@ -454,7 +494,7 @@ mod tests {
                             c1,
                             vec![BlockNode::new(
                                 p1,
-                                BlockKind::Paragraph(InlineContent::plain("A")),
+                                BlockKind::paragraph(InlineContent::plain("A")),
                                 BlockStyle::default(),
                             )],
                         ),
@@ -462,7 +502,7 @@ mod tests {
                             c2,
                             vec![BlockNode::new(
                                 p2,
-                                BlockKind::Paragraph(InlineContent::plain("B")),
+                                BlockKind::paragraph(InlineContent::plain("B")),
                                 BlockStyle::default(),
                             )],
                         ),

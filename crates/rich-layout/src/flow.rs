@@ -251,29 +251,26 @@ pub fn compute_visibility_mask(doc: &Document) -> Vec<bool> {
     let mut collapsed_level: Option<u8> = None;
 
     for (idx, block) in doc.blocks.iter().enumerate() {
-        match &block.kind {
-            BlockKind::Heading {
-                level, collapsed, ..
-            } => {
-                if let Some(cur_level) = collapsed_level {
-                    if *level <= cur_level {
-                        collapsed_level = if *collapsed { Some(*level) } else { None };
-                        visible[idx] = true;
+        if let Some(heading) = block.kind.heading_data() {
+            if let Some(cur_level) = collapsed_level {
+                if heading.level <= cur_level {
+                    collapsed_level = if heading.collapsed {
+                        Some(heading.level)
                     } else {
-                        visible[idx] = false;
-                    }
-                } else {
+                        None
+                    };
                     visible[idx] = true;
-                    if *collapsed {
-                        collapsed_level = Some(*level);
-                    }
-                }
-            }
-            _ => {
-                if collapsed_level.is_some() {
+                } else {
                     visible[idx] = false;
                 }
+            } else {
+                visible[idx] = true;
+                if heading.collapsed {
+                    collapsed_level = Some(heading.level);
+                }
             }
+        } else if collapsed_level.is_some() {
+            visible[idx] = false;
         }
     }
     visible
@@ -285,19 +282,17 @@ pub fn compute_list_markers(doc: &Document) -> Vec<Option<String>> {
     let mut counters: HashMap<(ListId, u8), usize> = HashMap::new();
 
     for (idx, block) in doc.blocks.iter().enumerate() {
-        if let BlockKind::ListItem {
-            list_id,
-            kind,
-            indent_level,
-            checked,
-            ..
-        } = &block.kind
-        {
+        if let Some(item) = block.kind.list_item_data() {
             // Reset deeper sub-list counters whenever a parent level increments.
-            counters.retain(|&(lid, lvl), _| lid != *list_id || lvl <= *indent_level);
-            let entry = counters.entry((*list_id, *indent_level)).or_insert(0);
+            counters.retain(|&(lid, lvl), _| lid != item.list_id || lvl <= item.indent_level);
+            let entry = counters.entry((item.list_id, item.indent_level)).or_insert(0);
             *entry += 1;
-            markers[idx] = Some(default_list_marker(*kind, *indent_level, *entry, *checked));
+            markers[idx] = Some(default_list_marker(
+                item.kind,
+                item.indent_level,
+                *entry,
+                item.checked,
+            ));
         }
     }
     markers
@@ -601,78 +596,8 @@ impl<B: GlyphBackend> FlowLayout<B> {
             });
         }
 
-        match &layout.kind {
-            crate::block::BlockLayoutKind::Blockquote { children, .. } => {
-                if let Some(child) = nearest_child_for_y(children, local.y) {
-                    let child_local = Point::new(local.x - child.x, local.y - child.y);
-                    if let Some(chrome_hit) =
-                        hit_test_block_chrome(&child.layout, child_local, child.layout.id)
-                    {
-                        return Some(chrome_hit);
-                    }
-                    if let Some(hit) = child.layout.hit_test_local(child_local) {
-                        let mut pos = DocPos::top_level(block.id, hit.offset);
-                        pos.path.push(PathSegment::Block(child.layout.id));
-                        return Some(CanvasHitResult {
-                            pos,
-                            affinity: hit.affinity,
-                            hit,
-                            toggled_heading: None,
-                            toggled_checklist: None,
-                            code_block_copy: None,
-                        });
-                    }
-                }
-            }
-            crate::block::BlockLayoutKind::Table(table) => {
-                let target_cell = table
-                    .cells
-                    .iter()
-                    .find(|cell| cell.rect.contains(local))
-                    .or_else(|| {
-                        table.cells.iter().min_by(|left, right| {
-                            let left_dist = rect_distance_sq(left.rect, local);
-                            let right_dist = rect_distance_sq(right.rect, local);
-                            left_dist.total_cmp(&right_dist)
-                        })
-                    });
-                if let Some(cell) = target_cell {
-                    let cell_local = Point::new(local.x - cell.rect.x, local.y - cell.rect.y);
-                    if let Some(child) = nearest_child_for_y(&cell.children, cell_local.y) {
-                        let child_local =
-                            Point::new(cell_local.x - child.x, cell_local.y - child.y);
-                        if let Some(chrome_hit) =
-                            hit_test_block_chrome(&child.layout, child_local, child.layout.id)
-                        {
-                            return Some(chrome_hit);
-                        }
-                        if let Some(hit) = child.layout.hit_test_local(child_local) {
-                            let mut path = smallvec::SmallVec::new();
-                            path.push(PathSegment::TableCell {
-                                table_id: block.id,
-                                row: cell.row,
-                                col: cell.cell_index,
-                            });
-                            path.push(PathSegment::Block(child.layout.id));
-                            return Some(CanvasHitResult {
-                                pos: DocPos {
-                                    path,
-                                    offset: hit.offset,
-                                },
-                                affinity: hit.affinity,
-                                hit,
-                                toggled_heading: None,
-                                toggled_checklist: None,
-                                code_block_copy: None,
-                            });
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-
-        None
+        let mut path_prefix = smallvec::SmallVec::new();
+        hit_test_layout_recursive(&layout, local, &mut path_prefix)
     }
 
     /// Hit-tests internal vertical column dividers of cached top-level tables within `tolerance_px`.
@@ -690,24 +615,23 @@ impl<B: GlyphBackend> FlowLayout<B> {
         let content_y = (canvas_point.y - self.top_padding_px).max(0.0);
         let idx = self.height_index.index_at_y(content_y);
         let block = doc.blocks.get(idx)?;
-        if !self.is_visible(idx) || !matches!(block.kind, BlockKind::Table(_)) {
+        if !self.is_visible(idx) || block.kind.table_block().is_none() {
             return None;
         }
         let layout = self.cache.get_latest(block.id)?;
-        let crate::block::BlockLayoutKind::Table(table) = &layout.kind else {
-            return None;
-        };
+        let table = layout.table_layout()?;
         if table.column_widths.len() < 2 {
             return None;
         }
+        let content_origin = layout.content_origin();
         let (block_x, _) =
             resolve_block_horizontal_span(viewport_width, &doc.config, block.width_mode, zoom);
-        let block_y = self.block_y(idx);
+        let block_y = self.block_y(idx) + content_origin.y;
         if canvas_point.y < block_y || canvas_point.y > block_y + table.total_height {
             return None;
         }
 
-        let mut acc_x = block_x;
+        let mut acc_x = block_x + content_origin.x;
         for (column_index, &width) in table
             .column_widths
             .iter()
@@ -876,7 +800,8 @@ impl<B: GlyphBackend> FlowLayout<B> {
                     if visible.id != *table_id {
                         continue;
                     }
-                    if let crate::block::BlockLayoutKind::Table(table) = &visible.layout.kind {
+                    if let Some(table) = visible.layout.table_layout() {
+                        let content_origin = visible.layout.content_origin();
                         for cell in &table.cells {
                             let cell_row_end =
                                 cell.row + (cell.rowspan.max(1) as usize).saturating_sub(1);
@@ -887,7 +812,10 @@ impl<B: GlyphBackend> FlowLayout<B> {
                                 && cell_col_end >= col_min
                                 && cell.col <= col_max
                             {
-                                rects.push(cell.rect.translate(visible.x, visible.y));
+                                rects.push(cell.rect.translate(
+                                    visible.x + content_origin.x,
+                                    visible.y + content_origin.y,
+                                ));
                             }
                         }
                     }
@@ -1261,31 +1189,93 @@ fn collect_leaf_paragraphs<'layout, B: GlyphBackend>(
         });
         return;
     }
-    match &layout.kind {
-        crate::block::BlockLayoutKind::Blockquote { children, .. } => {
-            for child in children {
+    if let Some(children) = layout.children() {
+        for child in children {
+            collect_leaf_paragraphs(
+                &child.layout,
+                origin_x + child.x,
+                origin_y + child.y,
+                out,
+            );
+        }
+    } else if let Some(table) = layout.table_layout() {
+        let content_origin = layout.content_origin();
+        for cell in &table.cells {
+            for child in &cell.children {
                 collect_leaf_paragraphs(
                     &child.layout,
-                    origin_x + child.x,
-                    origin_y + child.y,
+                    origin_x + content_origin.x + cell.rect.x + child.x,
+                    origin_y + content_origin.y + cell.rect.y + child.y,
                     out,
                 );
             }
         }
-        crate::block::BlockLayoutKind::Table(table) => {
-            for cell in &table.cells {
-                for child in &cell.children {
-                    collect_leaf_paragraphs(
-                        &child.layout,
-                        origin_x + cell.rect.x + child.x,
-                        origin_y + cell.rect.y + child.y,
-                        out,
-                    );
-                }
+    }
+}
+
+fn hit_test_layout_recursive<B: GlyphBackend>(
+    layout: &BlockLayout<B>,
+    local: Point,
+    path_prefix: &mut smallvec::SmallVec<[PathSegment; 4]>,
+) -> Option<CanvasHitResult> {
+    if let Some(chrome_hit) = hit_test_block_chrome(layout, local, layout.id) {
+        return Some(chrome_hit);
+    }
+    if let Some(hit) = layout.hit_test_local(local) {
+        let mut path = path_prefix.clone();
+        path.push(PathSegment::Block(layout.id));
+        return Some(CanvasHitResult {
+            pos: DocPos {
+                path,
+                offset: hit.offset,
+            },
+            affinity: hit.affinity,
+            hit,
+            toggled_heading: None,
+            toggled_checklist: None,
+            code_block_copy: None,
+        });
+    }
+    if let Some(children) = layout.children() {
+        if let Some(child) = nearest_child_for_y(children, local.y) {
+            let child_local = Point::new(local.x - child.x, local.y - child.y);
+            path_prefix.push(PathSegment::Block(layout.id));
+            let result = hit_test_layout_recursive(&child.layout, child_local, path_prefix);
+            path_prefix.pop();
+            return result;
+        }
+        return None;
+    }
+    if let Some(table) = layout.table_layout() {
+        let origin = layout.content_origin();
+        let table_local = Point::new(local.x - origin.x, local.y - origin.y);
+        let target_cell = table
+            .cells
+            .iter()
+            .find(|cell| cell.rect.contains(table_local))
+            .or_else(|| {
+                table.cells.iter().min_by(|left, right| {
+                    let left_dist = rect_distance_sq(left.rect, table_local);
+                    let right_dist = rect_distance_sq(right.rect, table_local);
+                    left_dist.total_cmp(&right_dist)
+                })
+            });
+        if let Some(cell) = target_cell {
+            let cell_local = Point::new(table_local.x - cell.rect.x, table_local.y - cell.rect.y);
+            if let Some(child) = nearest_child_for_y(&cell.children, cell_local.y) {
+                let child_local = Point::new(cell_local.x - child.x, cell_local.y - child.y);
+                path_prefix.push(PathSegment::TableCell {
+                    table_id: layout.id,
+                    row: cell.row,
+                    col: cell.cell_index,
+                });
+                let result = hit_test_layout_recursive(&child.layout, child_local, path_prefix);
+                path_prefix.pop();
+                return result;
             }
         }
-        _ => {}
     }
+    None
 }
 
 fn nearest_child_for_y<B: GlyphBackend>(
@@ -1388,34 +1378,41 @@ fn estimate_block_metrics(
     let base_line = pt_to_px(16.0, zoom);
 
     let est_height = match &block.kind {
-        BlockKind::Paragraph(c) | BlockKind::ListItem { content: c, .. } => {
-            let chars_per_line = (max_width / pt_to_px(6.5, zoom)).max(12.0);
-            let lines = ((c.len().max(1) as f32) / chars_per_line).ceil().max(1.0);
-            lines * base_line
+        BlockKind::Text { content, .. } => {
+            if let Some(heading) = block.kind.heading_data() {
+                let scale = match heading.level {
+                    1 => 2.0,
+                    2 => 1.6,
+                    3 => 1.35,
+                    _ => 1.15,
+                };
+                let chars_per_line = (max_width / pt_to_px(6.5 * scale, zoom)).max(8.0);
+                let lines = ((content.len().max(1) as f32) / chars_per_line)
+                    .ceil()
+                    .max(1.0);
+                lines * base_line * scale
+            } else if block.kind.code_block_data().is_some() {
+                let lines = content.text.lines().count().max(1) as f32;
+                lines * pt_to_px(15.0, zoom) + pt_to_px(24.0, zoom)
+            } else {
+                let chars_per_line = (max_width / pt_to_px(6.5, zoom)).max(12.0);
+                let lines = ((content.len().max(1) as f32) / chars_per_line)
+                    .ceil()
+                    .max(1.0);
+                lines * base_line
+            }
         }
-        BlockKind::Heading { level, content, .. } => {
-            let scale = match level {
-                1 => 2.0,
-                2 => 1.6,
-                3 => 1.35,
-                _ => 1.15,
-            };
-            let chars_per_line = (max_width / pt_to_px(6.5 * scale, zoom)).max(8.0);
-            let lines = ((content.len().max(1) as f32) / chars_per_line)
-                .ceil()
-                .max(1.0);
-            lines * base_line * scale
-        }
-        BlockKind::CodeBlock { content, .. } => {
-            let lines = content.text.lines().count().max(1) as f32;
-            lines * pt_to_px(15.0, zoom) + pt_to_px(24.0, zoom)
-        }
-        BlockKind::Blockquote(children) => {
+        BlockKind::Container { children, .. } => {
             (children.len().max(1) as f32) * base_line * 1.4
         }
-        BlockKind::Table(t) => (t.rows.len().max(1) as f32) * pt_to_px(30.0, zoom),
-        BlockKind::HorizontalRule => pt_to_px(12.0, zoom),
-        BlockKind::Custom { .. } => pt_to_px(44.0, zoom),
+        BlockKind::Grid { table, .. } => (table.rows.len().max(1) as f32) * pt_to_px(30.0, zoom),
+        BlockKind::Leaf { .. } => {
+            if block.kind.is_horizontal_rule() {
+                pt_to_px(12.0, zoom)
+            } else {
+                pt_to_px(44.0, zoom)
+            }
+        }
     };
 
     BlockMetrics {

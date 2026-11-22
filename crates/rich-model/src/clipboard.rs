@@ -3,36 +3,37 @@
 
 use crate::block::{
     BlockKind, BlockNode, ColumnSpec, Document, ListId, ListKind, NumberStyle, TableBlock,
-    TableBorderStyle, TableCell, TableRow,
+    TableBorderStyle, TableCell, TableRow, block_kinds,
 };
 use crate::inline::{
     ChipKind, InlineContent, InlineObject, InlineVAlign, OBJECT_REPLACEMENT_CHAR,
 };
+use crate::payload::CustomPayload;
 use crate::selection::DocumentSelection;
 use crate::style::{
-    BaselineShift, BlockStyle, FontWeight, InlineStyle, LinkTarget, RgbaColor, StyleId, TextAlign,
-    UnderlineKind,
+    BaselineShift, BlockStyle, FontWeight, InlineStyle, LinkTarget, RgbaColor, SharedStr, StyleId,
+    TextAlign, UnderlineKind,
 };
 use std::collections::HashMap;
 
 /// Custom node clipboard fallback formatter implemented by host registries (such as `ExtensionRegistry`).
 pub trait ClipboardCustomFormatter {
-    fn plain_text_block(&self, kind: &str, data: &serde_json::Value) -> Option<String> {
+    fn plain_text_block(&self, kind: &str, data: &CustomPayload) -> Option<String> {
         let _ = (kind, data);
         None
     }
 
-    fn html_block(&self, kind: &str, data: &serde_json::Value) -> Option<String> {
+    fn html_block(&self, kind: &str, data: &CustomPayload) -> Option<String> {
         let _ = (kind, data);
         None
     }
 
-    fn plain_text_inline(&self, kind: &str, data: &serde_json::Value) -> Option<String> {
+    fn plain_text_inline(&self, kind: &str, data: &CustomPayload) -> Option<String> {
         let _ = (kind, data);
         None
     }
 
-    fn html_inline(&self, kind: &str, data: &serde_json::Value) -> Option<String> {
+    fn html_inline(&self, kind: &str, data: &CustomPayload) -> Option<String> {
         let _ = (kind, data);
         None
     }
@@ -72,8 +73,19 @@ pub enum ClipboardBlock {
     Table(ClipboardTable),
     HorizontalRule,
     Custom {
-        kind: String,
-        data: serde_json::Value,
+        kind: SharedStr,
+        data: CustomPayload,
+    },
+    CustomText {
+        kind: SharedStr,
+        data: CustomPayload,
+        content: InlineContent,
+        align: TextAlign,
+    },
+    CustomContainer {
+        kind: SharedStr,
+        data: CustomPayload,
+        children: Vec<ClipboardBlock>,
     },
 }
 
@@ -192,9 +204,7 @@ impl Document {
                 anchor_cell,
                 focus_cell,
             } => {
-                let BlockKind::Table(table) = &self.find_block(*table_id)?.kind else {
-                    return None;
-                };
+                let table = self.find_block(*table_id)?.kind.table_block()?;
                 let row_min = anchor_cell.0.min(focus_cell.0);
                 let row_max = anchor_cell.0.max(focus_cell.0);
                 let col_min = anchor_cell.1.min(focus_cell.1);
@@ -268,38 +278,43 @@ impl Document {
                     };
                     let sliced = inline.slice(slice_start..slice_end);
                     let align = block.style.align;
-                    let clipboard_block = match &block.kind {
-                        BlockKind::Paragraph(_) => ClipboardBlock::Paragraph {
+                    let clipboard_block = if block.kind.is_paragraph() {
+                        ClipboardBlock::Paragraph {
                             content: sliced,
                             align,
-                        },
-                        BlockKind::Heading { level, .. } => ClipboardBlock::Heading {
-                            level: *level,
+                        }
+                    } else if let Some(heading) = block.kind.heading_data() {
+                        ClipboardBlock::Heading {
+                            level: heading.level,
                             content: sliced,
                             align,
-                        },
-                        BlockKind::ListItem {
-                            list_id,
-                            kind,
-                            indent_level,
-                            checked,
-                            ..
-                        } => ClipboardBlock::ListItem {
-                            list_group: list_id.0,
-                            kind: *kind,
-                            indent_level: *indent_level,
-                            checked: *checked,
+                        }
+                    } else if let Some(item) = block.kind.list_item_data() {
+                        ClipboardBlock::ListItem {
+                            list_group: item.list_id.0,
+                            kind: item.kind,
+                            indent_level: item.indent_level,
+                            checked: item.checked,
                             content: sliced,
                             align,
-                        },
-                        BlockKind::CodeBlock { language, .. } => ClipboardBlock::CodeBlock {
-                            language: language.clone(),
+                        }
+                    } else if let Some(code) = block.kind.code_block_data() {
+                        ClipboardBlock::CodeBlock {
+                            language: code.language.clone(),
                             content: sliced,
-                        },
-                        _ => ClipboardBlock::Paragraph {
+                        }
+                    } else if let BlockKind::Text { kind, data, .. } = &block.kind {
+                        ClipboardBlock::CustomText {
+                            kind: kind.clone(),
+                            data: data.clone(),
                             content: sliced,
                             align,
-                        },
+                        }
+                    } else {
+                        ClipboardBlock::Paragraph {
+                            content: sliced,
+                            align,
+                        }
                     };
                     blocks.push(clipboard_block);
                 }
@@ -316,37 +331,71 @@ impl Document {
 fn block_node_to_clipboard_block(block: &BlockNode) -> ClipboardBlock {
     let align = block.style.align;
     match &block.kind {
-        BlockKind::Paragraph(content) => ClipboardBlock::Paragraph {
-            content: content.clone(),
-            align,
-        },
-        BlockKind::Heading { level, content, .. } => ClipboardBlock::Heading {
-            level: *level,
-            content: content.clone(),
-            align,
-        },
-        BlockKind::ListItem {
-            list_id,
+        BlockKind::Text {
             kind,
-            indent_level,
-            checked,
+            data,
             content,
-        } => ClipboardBlock::ListItem {
-            list_group: list_id.0,
-            kind: *kind,
-            indent_level: *indent_level,
-            checked: *checked,
-            content: content.clone(),
-            align,
+        } => match kind.as_ref() {
+            block_kinds::PARAGRAPH => ClipboardBlock::Paragraph {
+                content: content.clone(),
+                align,
+            },
+            block_kinds::HEADING => ClipboardBlock::Heading {
+                level: block.kind.heading_data().map(|h| h.level).unwrap_or(1),
+                content: content.clone(),
+                align,
+            },
+            block_kinds::LIST_ITEM => {
+                if let Some(item) = block.kind.list_item_data() {
+                    ClipboardBlock::ListItem {
+                        list_group: item.list_id.0,
+                        kind: item.kind,
+                        indent_level: item.indent_level,
+                        checked: item.checked,
+                        content: content.clone(),
+                        align,
+                    }
+                } else {
+                    ClipboardBlock::Paragraph {
+                        content: content.clone(),
+                        align,
+                    }
+                }
+            }
+            block_kinds::CODE_BLOCK => ClipboardBlock::CodeBlock {
+                language: block
+                    .kind
+                    .code_block_data()
+                    .and_then(|code| code.language.clone()),
+                content: content.clone(),
+            },
+            _ => ClipboardBlock::CustomText {
+                kind: kind.clone(),
+                data: data.clone(),
+                content: content.clone(),
+                align,
+            },
         },
-        BlockKind::Blockquote(children) => {
-            ClipboardBlock::Blockquote(children.iter().map(block_node_to_clipboard_block).collect())
+        BlockKind::Container {
+            kind,
+            data,
+            children,
+        } => {
+            let mapped: Vec<ClipboardBlock> = children
+                .iter()
+                .map(block_node_to_clipboard_block)
+                .collect();
+            if kind.as_ref() == block_kinds::BLOCKQUOTE {
+                ClipboardBlock::Blockquote(mapped)
+            } else {
+                ClipboardBlock::CustomContainer {
+                    kind: kind.clone(),
+                    data: data.clone(),
+                    children: mapped,
+                }
+            }
         }
-        BlockKind::CodeBlock { language, content } => ClipboardBlock::CodeBlock {
-            language: language.clone(),
-            content: content.clone(),
-        },
-        BlockKind::Table(table) => ClipboardBlock::Table(ClipboardTable {
+        BlockKind::Grid { table, .. } => ClipboardBlock::Table(ClipboardTable {
             rows: table
                 .rows
                 .iter()
@@ -368,11 +417,16 @@ fn block_node_to_clipboard_block(block: &BlockNode) -> ClipboardBlock {
                 })
                 .collect(),
         }),
-        BlockKind::HorizontalRule => ClipboardBlock::HorizontalRule,
-        BlockKind::Custom { kind, data } => ClipboardBlock::Custom {
-            kind: kind.clone(),
-            data: data.clone(),
-        },
+        BlockKind::Leaf { kind, data } => {
+            if kind.as_ref() == block_kinds::HORIZONTAL_RULE {
+                ClipboardBlock::HorizontalRule
+            } else {
+                ClipboardBlock::Custom {
+                    kind: kind.clone(),
+                    data: data.clone(),
+                }
+            }
+        }
     }
 }
 
@@ -385,7 +439,7 @@ fn clipboard_block_to_node(
     match block {
         ClipboardBlock::Paragraph { content, align } => BlockNode::new(
             id,
-            BlockKind::Paragraph(content.clone()),
+            BlockKind::paragraph(content.clone()),
             BlockStyle::default().with_align(*align),
         ),
         ClipboardBlock::Heading {
@@ -396,11 +450,7 @@ fn clipboard_block_to_node(
             let clamped = (*level).clamp(1, 6);
             BlockNode::new(
                 id,
-                BlockKind::Heading {
-                    level: clamped,
-                    collapsed: false,
-                    content: content.clone(),
-                },
+                BlockKind::heading(clamped, false, content.clone()),
                 BlockStyle::named(StyleId::heading(clamped)).with_align(*align),
             )
         }
@@ -427,13 +477,13 @@ fn clipboard_block_to_node(
             style.space_after_pt = Some(4.0);
             BlockNode::new(
                 id,
-                BlockKind::ListItem {
+                BlockKind::list_item(
                     list_id,
-                    kind: *kind,
-                    indent_level: *indent_level,
-                    checked: *checked,
-                    content: content.clone(),
-                },
+                    *kind,
+                    *indent_level,
+                    *checked,
+                    content.clone(),
+                ),
                 style,
             )
         }
@@ -446,7 +496,7 @@ fn clipboard_block_to_node(
                 let child_id = document.alloc_block_id();
                 child_nodes.push(BlockNode::new(
                     child_id,
-                    BlockKind::Paragraph(InlineContent::empty()),
+                    BlockKind::paragraph(InlineContent::empty()),
                     BlockStyle::default(),
                 ));
             }
@@ -456,14 +506,11 @@ fn clipboard_block_to_node(
                 space_after_pt: Some(10.0),
                 ..BlockStyle::default()
             };
-            BlockNode::new(id, BlockKind::Blockquote(child_nodes), style)
+            BlockNode::new(id, BlockKind::blockquote(child_nodes), style)
         }
         ClipboardBlock::CodeBlock { language, content } => BlockNode::new(
             id,
-            BlockKind::CodeBlock {
-                language: language.clone(),
-                content: content.clone(),
-            },
+            BlockKind::code_block(language.clone(), content.clone()),
             BlockStyle::named(StyleId::CODE_BLOCK),
         ),
         ClipboardBlock::Table(table) => {
@@ -498,7 +545,7 @@ fn clipboard_block_to_node(
                                 let para_id = document.alloc_block_id();
                                 cell_blocks.push(BlockNode::new(
                                     para_id,
-                                    BlockKind::Paragraph(InlineContent::empty()),
+                                    BlockKind::paragraph(InlineContent::empty()),
                                     BlockStyle::default(),
                                 ));
                             }
@@ -512,7 +559,7 @@ fn clipboard_block_to_node(
                 .collect();
             BlockNode::new(
                 id,
-                BlockKind::Table(TableBlock {
+                BlockKind::table(TableBlock {
                     columns: vec![ColumnSpec::Auto; column_count],
                     rows,
                     border_style: TableBorderStyle::default(),
@@ -526,7 +573,7 @@ fn clipboard_block_to_node(
                 space_after_pt: Some(10.0),
                 ..BlockStyle::default()
             };
-            BlockNode::new(id, BlockKind::HorizontalRule, style)
+            BlockNode::new(id, BlockKind::horizontal_rule(), style)
         }
         ClipboardBlock::Custom { kind, data } => {
             let style = BlockStyle {
@@ -534,12 +581,43 @@ fn clipboard_block_to_node(
                 space_after_pt: Some(8.0),
                 ..BlockStyle::default()
             };
+            BlockNode::new(id, BlockKind::leaf(kind.clone(), data.clone()), style)
+        }
+        ClipboardBlock::CustomText {
+            kind,
+            data,
+            content,
+            align,
+        } => BlockNode::new(
+            id,
+            BlockKind::text(kind.clone(), data.clone(), content.clone()),
+            BlockStyle::default().with_align(*align),
+        ),
+        ClipboardBlock::CustomContainer {
+            kind,
+            data,
+            children,
+        } => {
+            let mut child_nodes: Vec<BlockNode> = children
+                .iter()
+                .map(|child| clipboard_block_to_node(child, document, list_id_map))
+                .collect();
+            if child_nodes.is_empty() {
+                let child_id = document.alloc_block_id();
+                child_nodes.push(BlockNode::new(
+                    child_id,
+                    BlockKind::paragraph(InlineContent::empty()),
+                    BlockStyle::default(),
+                ));
+            }
+            let style = BlockStyle {
+                space_before_pt: Some(6.0),
+                space_after_pt: Some(8.0),
+                ..BlockStyle::default()
+            };
             BlockNode::new(
                 id,
-                BlockKind::Custom {
-                    kind: kind.clone(),
-                    data: data.clone(),
-                },
+                BlockKind::container(kind.clone(), data.clone(), child_nodes),
                 style,
             )
         }
@@ -558,12 +636,33 @@ fn block_to_plain_text(
         ClipboardBlock::Paragraph { content, .. }
         | ClipboardBlock::Heading { content, .. }
         | ClipboardBlock::ListItem { content, .. }
-        | ClipboardBlock::CodeBlock { content, .. } => inline_to_plain_text(content, formatter),
+        | ClipboardBlock::CodeBlock { content, .. }
+        | ClipboardBlock::CustomText { content, .. } => inline_to_plain_text(content, formatter),
         ClipboardBlock::Blockquote(children) => children
             .iter()
             .map(|child| block_to_plain_text(child, formatter))
             .collect::<Vec<_>>()
             .join("\n"),
+        ClipboardBlock::CustomContainer {
+            kind,
+            data,
+            children,
+        } => {
+            let body = children
+                .iter()
+                .map(|child| block_to_plain_text(child, formatter))
+                .collect::<Vec<_>>()
+                .join("\n");
+            if let Some(prefix) = formatter.plain_text_block(kind, data) {
+                if body.is_empty() {
+                    prefix
+                } else {
+                    format!("{prefix}\n{body}")
+                }
+            } else {
+                body
+            }
+        }
         ClipboardBlock::Table(table) => table
             .rows
             .iter()
@@ -768,6 +867,37 @@ fn write_single_block_html(
                 );
                 output.push_str("</div>");
             }
+        }
+        ClipboardBlock::CustomText {
+            kind,
+            data,
+            content,
+            align,
+        } => {
+            let payload = serde_json::to_string(data).unwrap_or_else(|_| "null".into());
+            output.push_str("<div data-gpui-rich-custom-text=\"");
+            push_escaped_html(kind, output);
+            output.push_str("\" data-gpui-rich-payload=\"");
+            push_escaped_html(&payload, output);
+            output.push('"');
+            write_align_style_attr(*align, output);
+            output.push('>');
+            write_inline_html(content, formatter, output);
+            output.push_str("</div>");
+        }
+        ClipboardBlock::CustomContainer {
+            kind,
+            data,
+            children,
+        } => {
+            let payload = serde_json::to_string(data).unwrap_or_else(|_| "null".into());
+            output.push_str("<div data-gpui-rich-custom-container=\"");
+            push_escaped_html(kind, output);
+            output.push_str("\" data-gpui-rich-payload=\"");
+            push_escaped_html(&payload, output);
+            output.push_str("\">");
+            write_blocks_html(children, formatter, output);
+            output.push_str("</div>");
         }
     }
 }
@@ -1435,11 +1565,13 @@ impl HtmlFragmentParser {
         // Custom block round-trip (`<div data-gpui-rich-custom-block="...">`).
         if let Some(custom_block_kind) = attr_value(attrs, "data-gpui-rich-custom-block") {
             self.flush_current_block();
-            let data = attr_value(attrs, "data-gpui-rich-payload")
-                .and_then(|raw| serde_json::from_str(raw).ok())
-                .unwrap_or(serde_json::Value::Null);
+            let data = CustomPayload::from_json(
+                attr_value(attrs, "data-gpui-rich-payload")
+                    .and_then(|raw| serde_json::from_str(raw).ok())
+                    .unwrap_or(serde_json::Value::Null),
+            );
             self.push_block(ClipboardBlock::Custom {
-                kind: custom_block_kind.to_owned(),
+                kind: SharedStr::from(custom_block_kind),
                 data,
             });
             if !self_closing {
@@ -1450,19 +1582,17 @@ impl HtmlFragmentParser {
 
         // Custom inline round-trip (`<span data-gpui-rich-custom-inline="...">`).
         if let Some(custom_inline_kind) = attr_value(attrs, "data-gpui-rich-custom-inline") {
-            let data = attr_value(attrs, "data-gpui-rich-payload")
-                .and_then(|raw| serde_json::from_str(raw).ok())
-                .unwrap_or(serde_json::Value::Null);
+            let data = CustomPayload::from_json(
+                attr_value(attrs, "data-gpui-rich-payload")
+                    .and_then(|raw| serde_json::from_str(raw).ok())
+                    .unwrap_or(serde_json::Value::Null),
+            );
             self.ensure_paragraph();
             let style = self.current_inline_style();
             if let Some(block) = self.current_block.as_mut() {
-                block.content.push_object(
-                    InlineObject::Custom {
-                        kind: custom_inline_kind.to_owned(),
-                        data,
-                    },
-                    style,
-                );
+                block
+                    .content
+                    .push_object(InlineObject::custom(custom_inline_kind, data), style);
             }
             if !self_closing {
                 self.skip_custom_inner_depth = 1;

@@ -1,10 +1,46 @@
 use crate::inline::InlineContent;
+use crate::payload::CustomPayload;
 use crate::selection::{DocPos, PathSegment};
 use crate::style::{
-    BlockStyle, BlockWidth, DocumentLayoutConfig, Edges, RgbaColor, StyleId, StyleSheet,
+    BlockStyle, BlockWidth, DocumentLayoutConfig, Edges, RgbaColor, SharedStr, StyleId, StyleSheet,
 };
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
+use std::borrow::Cow;
+use std::sync::Arc;
+
+/// Built-in semantic kind identifiers for [`BlockKind`].
+pub mod block_kinds {
+    pub const PARAGRAPH: &str = "paragraph";
+    pub const HEADING: &str = "heading";
+    pub const LIST_ITEM: &str = "list_item";
+    pub const CODE_BLOCK: &str = "code_block";
+    pub const BLOCKQUOTE: &str = "blockquote";
+    pub const TABLE: &str = "table";
+    pub const HORIZONTAL_RULE: &str = "horizontal_rule";
+}
+
+/// Built-in typed metadata for [`block_kinds::HEADING`] text blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HeadingData {
+    pub level: u8,
+    pub collapsed: bool,
+}
+
+/// Built-in typed metadata for [`block_kinds::LIST_ITEM`] text blocks.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ListItemData {
+    pub list_id: ListId,
+    pub kind: ListKind,
+    pub indent_level: u8,
+    pub checked: Option<bool>,
+}
+
+/// Built-in typed metadata for [`block_kinds::CODE_BLOCK`] text blocks.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CodeBlockData {
+    pub language: Option<String>,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct BlockId(pub u64);
@@ -14,9 +50,9 @@ pub struct BlockId(pub u64);
 pub enum ContainerTarget {
     /// Top-level `Document::blocks`.
     Root,
-    /// Children of a `BlockKind::Blockquote` with the given [`BlockId`].
-    Blockquote(BlockId),
-    /// Children of a specific cell inside a `BlockKind::Table`.
+    /// Children of any [`BlockKind::Container`] (blockquote or custom container) with the given [`BlockId`].
+    Container(BlockId),
+    /// Children of a specific cell inside a [`BlockKind::Grid`].
     TableCell {
         table_id: BlockId,
         row: usize,
@@ -213,59 +249,256 @@ impl TableBlock {
     }
 }
 
+/// Structural block shape with an open semantic `kind` identifier and typed [`CustomPayload`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum BlockKind {
-    Paragraph(InlineContent),
-    Heading {
-        level: u8,
-        collapsed: bool,
+    /// Text-bearing leaf block (paragraphs, headings, list items, code blocks, and custom text blocks).
+    Text {
+        kind: SharedStr,
+        #[serde(default)]
+        data: CustomPayload,
         content: InlineContent,
     },
-    ListItem {
+    /// Vertical container of editable child blocks (blockquotes, callouts, toggles, admonitions).
+    Container {
+        kind: SharedStr,
+        #[serde(default)]
+        data: CustomPayload,
+        children: Vec<BlockNode>,
+    },
+    /// Two-dimensional table/grid container.
+    Grid {
+        kind: SharedStr,
+        #[serde(default)]
+        data: CustomPayload,
+        table: TableBlock,
+    },
+    /// Atomic non-text leaf block (horizontal rules, embeds, charts, custom widgets).
+    Leaf {
+        kind: SharedStr,
+        #[serde(default)]
+        data: CustomPayload,
+    },
+}
+
+impl BlockKind {
+    pub fn paragraph(content: InlineContent) -> Self {
+        Self::Text {
+            kind: Arc::from(block_kinds::PARAGRAPH),
+            data: CustomPayload::empty(),
+            content,
+        }
+    }
+
+    pub fn heading(level: u8, collapsed: bool, content: InlineContent) -> Self {
+        Self::Text {
+            kind: Arc::from(block_kinds::HEADING),
+            data: CustomPayload::typed(HeadingData {
+                level: level.clamp(1, 6),
+                collapsed,
+            }),
+            content,
+        }
+    }
+
+    pub fn list_item(
         list_id: ListId,
         kind: ListKind,
         indent_level: u8,
         checked: Option<bool>,
         content: InlineContent,
-    },
-    Blockquote(Vec<BlockNode>),
-    CodeBlock {
-        language: Option<String>,
-        content: InlineContent,
-    },
-    Table(TableBlock),
-    HorizontalRule,
-    /// Host-defined custom block node measured and rendered via `ExtensionRegistry`.
-    Custom {
-        kind: String,
-        data: serde_json::Value,
-    },
-}
+    ) -> Self {
+        Self::Text {
+            kind: Arc::from(block_kinds::LIST_ITEM),
+            data: CustomPayload::typed(ListItemData {
+                list_id,
+                kind,
+                indent_level,
+                checked,
+            }),
+            content,
+        }
+    }
 
-impl BlockKind {
+    pub fn code_block(language: Option<String>, content: InlineContent) -> Self {
+        Self::Text {
+            kind: Arc::from(block_kinds::CODE_BLOCK),
+            data: CustomPayload::typed(CodeBlockData { language }),
+            content,
+        }
+    }
+
+    pub fn blockquote(children: Vec<BlockNode>) -> Self {
+        Self::Container {
+            kind: Arc::from(block_kinds::BLOCKQUOTE),
+            data: CustomPayload::empty(),
+            children,
+        }
+    }
+
+    pub fn table(table: TableBlock) -> Self {
+        Self::Grid {
+            kind: Arc::from(block_kinds::TABLE),
+            data: CustomPayload::empty(),
+            table,
+        }
+    }
+
+    pub fn horizontal_rule() -> Self {
+        Self::Leaf {
+            kind: Arc::from(block_kinds::HORIZONTAL_RULE),
+            data: CustomPayload::empty(),
+        }
+    }
+
+    pub fn text(
+        kind: impl Into<SharedStr>,
+        data: CustomPayload,
+        content: InlineContent,
+    ) -> Self {
+        Self::Text {
+            kind: kind.into(),
+            data,
+            content,
+        }
+    }
+
+    pub fn container(
+        kind: impl Into<SharedStr>,
+        data: CustomPayload,
+        children: Vec<BlockNode>,
+    ) -> Self {
+        Self::Container {
+            kind: kind.into(),
+            data,
+            children,
+        }
+    }
+
+    pub fn grid(kind: impl Into<SharedStr>, data: CustomPayload, table: TableBlock) -> Self {
+        Self::Grid {
+            kind: kind.into(),
+            data,
+            table,
+        }
+    }
+
+    pub fn leaf(kind: impl Into<SharedStr>, data: CustomPayload) -> Self {
+        Self::Leaf {
+            kind: kind.into(),
+            data,
+        }
+    }
+
+    pub fn semantic_kind(&self) -> &str {
+        match self {
+            Self::Text { kind, .. }
+            | Self::Container { kind, .. }
+            | Self::Grid { kind, .. }
+            | Self::Leaf { kind, .. } => kind.as_ref(),
+        }
+    }
+
+    pub fn data(&self) -> &CustomPayload {
+        match self {
+            Self::Text { data, .. }
+            | Self::Container { data, .. }
+            | Self::Grid { data, .. }
+            | Self::Leaf { data, .. } => data,
+        }
+    }
+
+    pub fn data_mut(&mut self) -> &mut CustomPayload {
+        match self {
+            Self::Text { data, .. }
+            | Self::Container { data, .. }
+            | Self::Grid { data, .. }
+            | Self::Leaf { data, .. } => data,
+        }
+    }
+
     pub fn inline_content(&self) -> Option<&InlineContent> {
         match self {
-            BlockKind::Paragraph(c)
-            | BlockKind::Heading { content: c, .. }
-            | BlockKind::ListItem { content: c, .. }
-            | BlockKind::CodeBlock { content: c, .. } => Some(c),
-            BlockKind::Blockquote(_)
-            | BlockKind::Table(_)
-            | BlockKind::HorizontalRule
-            | BlockKind::Custom { .. } => None,
+            Self::Text { content, .. } => Some(content),
+            Self::Container { .. } | Self::Grid { .. } | Self::Leaf { .. } => None,
         }
     }
 
     pub fn inline_content_mut(&mut self) -> Option<&mut InlineContent> {
         match self {
-            BlockKind::Paragraph(c)
-            | BlockKind::Heading { content: c, .. }
-            | BlockKind::ListItem { content: c, .. }
-            | BlockKind::CodeBlock { content: c, .. } => Some(c),
-            BlockKind::Blockquote(_)
-            | BlockKind::Table(_)
-            | BlockKind::HorizontalRule
-            | BlockKind::Custom { .. } => None,
+            Self::Text { content, .. } => Some(content),
+            Self::Container { .. } | Self::Grid { .. } | Self::Leaf { .. } => None,
+        }
+    }
+
+    pub fn children(&self) -> Option<&[BlockNode]> {
+        match self {
+            Self::Container { children, .. } => Some(children),
+            Self::Text { .. } | Self::Grid { .. } | Self::Leaf { .. } => None,
+        }
+    }
+
+    pub fn children_mut(&mut self) -> Option<&mut Vec<BlockNode>> {
+        match self {
+            Self::Container { children, .. } => Some(children),
+            Self::Text { .. } | Self::Grid { .. } | Self::Leaf { .. } => None,
+        }
+    }
+
+    pub fn table_block(&self) -> Option<&TableBlock> {
+        match self {
+            Self::Grid { table, .. } => Some(table),
+            Self::Text { .. } | Self::Container { .. } | Self::Leaf { .. } => None,
+        }
+    }
+
+    pub fn table_block_mut(&mut self) -> Option<&mut TableBlock> {
+        match self {
+            Self::Grid { table, .. } => Some(table),
+            Self::Text { .. } | Self::Container { .. } | Self::Leaf { .. } => None,
+        }
+    }
+
+    pub fn is_paragraph(&self) -> bool {
+        matches!(self, Self::Text { kind, .. } if kind.as_ref() == block_kinds::PARAGRAPH)
+    }
+
+    pub fn is_blockquote(&self) -> bool {
+        matches!(self, Self::Container { kind, .. } if kind.as_ref() == block_kinds::BLOCKQUOTE)
+    }
+
+    pub fn is_horizontal_rule(&self) -> bool {
+        matches!(self, Self::Leaf { kind, .. } if kind.as_ref() == block_kinds::HORIZONTAL_RULE)
+    }
+
+    pub fn is_builtin_table(&self) -> bool {
+        matches!(self, Self::Grid { kind, .. } if kind.as_ref() == block_kinds::TABLE)
+    }
+
+    pub fn heading_data(&self) -> Option<HeadingData> {
+        match self {
+            Self::Text { kind, data, .. } if kind.as_ref() == block_kinds::HEADING => {
+                data.as_typed::<HeadingData>().map(|value| *value)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn list_item_data(&self) -> Option<ListItemData> {
+        match self {
+            Self::Text { kind, data, .. } if kind.as_ref() == block_kinds::LIST_ITEM => {
+                data.as_typed::<ListItemData>().map(|value| *value)
+            }
+            _ => None,
+        }
+    }
+
+    pub fn code_block_data(&self) -> Option<Cow<'_, CodeBlockData>> {
+        match self {
+            Self::Text { kind, data, .. } if kind.as_ref() == block_kinds::CODE_BLOCK => {
+                data.as_typed::<CodeBlockData>()
+            }
+            _ => None,
         }
     }
 }
@@ -339,7 +572,7 @@ impl Document {
 
     pub fn add_paragraph(&mut self, content: InlineContent, style: BlockStyle) -> BlockId {
         let id = self.alloc_block_id();
-        self.push_block(BlockNode::new(id, BlockKind::Paragraph(content), style))
+        self.push_block(BlockNode::new(id, BlockKind::paragraph(content), style))
     }
 
     pub fn add_heading(&mut self, level: u8, content: InlineContent) -> BlockId {
@@ -347,11 +580,7 @@ impl Document {
         let style = BlockStyle::named(StyleId::heading(level));
         self.push_block(BlockNode::new(
             id,
-            BlockKind::Heading {
-                level: level.clamp(1, 6),
-                collapsed: false,
-                content,
-            },
+            BlockKind::heading(level.clamp(1, 6), false, content),
             style,
         ))
     }
@@ -370,13 +599,7 @@ impl Document {
         style.space_after_pt = Some(4.0);
         self.push_block(BlockNode::new(
             id,
-            BlockKind::ListItem {
-                list_id,
-                kind,
-                indent_level,
-                checked,
-                content,
-            },
+            BlockKind::list_item(list_id, kind, indent_level, checked, content),
             style,
         ))
     }
@@ -386,7 +609,7 @@ impl Document {
         let style = BlockStyle::named(StyleId::CODE_BLOCK);
         self.push_block(BlockNode::new(
             id,
-            BlockKind::CodeBlock { language, content },
+            BlockKind::code_block(language, content),
             style,
         ))
     }
@@ -397,7 +620,7 @@ impl Document {
         style.indent_start_pt = 16.0;
         style.space_before_pt = Some(6.0);
         style.space_after_pt = Some(10.0);
-        self.push_block(BlockNode::new(id, BlockKind::Blockquote(children), style))
+        self.push_block(BlockNode::new(id, BlockKind::blockquote(children), style))
     }
 
     pub fn add_horizontal_rule(&mut self) -> BlockId {
@@ -405,14 +628,46 @@ impl Document {
         let mut style = BlockStyle::default();
         style.space_before_pt = Some(10.0);
         style.space_after_pt = Some(10.0);
-        self.push_block(BlockNode::new(id, BlockKind::HorizontalRule, style))
+        self.push_block(BlockNode::new(id, BlockKind::horizontal_rule(), style))
     }
 
-    /// Appends a host-defined custom block node.
+    /// Appends a host-defined custom leaf block node.
     pub fn add_custom_block(
         &mut self,
-        kind: impl Into<String>,
-        data: serde_json::Value,
+        kind: impl Into<SharedStr>,
+        data: CustomPayload,
+    ) -> BlockId {
+        let id = self.alloc_block_id();
+        let style = BlockStyle {
+            space_before_pt: Some(6.0),
+            space_after_pt: Some(8.0),
+            ..BlockStyle::default()
+        };
+        self.push_block(BlockNode::new(id, BlockKind::leaf(kind, data), style))
+    }
+
+    /// Appends a host-defined custom text block node with editable [`InlineContent`].
+    pub fn add_custom_text(
+        &mut self,
+        kind: impl Into<SharedStr>,
+        data: CustomPayload,
+        content: InlineContent,
+        style: BlockStyle,
+    ) -> BlockId {
+        let id = self.alloc_block_id();
+        self.push_block(BlockNode::new(
+            id,
+            BlockKind::text(kind, data, content),
+            style,
+        ))
+    }
+
+    /// Appends a host-defined custom container block node hosting editable child blocks.
+    pub fn add_custom_container(
+        &mut self,
+        kind: impl Into<SharedStr>,
+        data: CustomPayload,
+        children: Vec<BlockNode>,
     ) -> BlockId {
         let id = self.alloc_block_id();
         let style = BlockStyle {
@@ -422,10 +677,7 @@ impl Document {
         };
         self.push_block(BlockNode::new(
             id,
-            BlockKind::Custom {
-                kind: kind.into(),
-                data,
-            },
+            BlockKind::container(kind, data, children),
             style,
         ))
     }
@@ -448,7 +700,7 @@ impl Document {
         find_in_slice_mut(&mut self.blocks, id)
     }
 
-    /// Collects all text-bearing leaf blocks (including blockquote and table cell children) in reading order.
+    /// Collects all text-bearing leaf blocks (including container and table cell children) in reading order.
     pub fn collect_leaf_blocks(&self) -> Vec<&BlockNode> {
         let mut leaves = Vec::new();
         collect_leaves_in_slice(&self.blocks, &mut leaves);
@@ -461,25 +713,26 @@ impl Document {
         let mut collapsed_level: Option<u8> = None;
 
         for block in &self.blocks {
-            let visible = match &block.kind {
-                BlockKind::Heading {
-                    level, collapsed, ..
-                } => {
-                    if let Some(current_level) = collapsed_level {
-                        if *level <= current_level {
-                            collapsed_level = if *collapsed { Some(*level) } else { None };
-                            true
+            let visible = if let Some(heading) = block.kind.heading_data() {
+                if let Some(current_level) = collapsed_level {
+                    if heading.level <= current_level {
+                        collapsed_level = if heading.collapsed {
+                            Some(heading.level)
                         } else {
-                            false
-                        }
-                    } else {
-                        if *collapsed {
-                            collapsed_level = Some(*level);
-                        }
+                            None
+                        };
                         true
+                    } else {
+                        false
                     }
+                } else {
+                    if heading.collapsed {
+                        collapsed_level = Some(heading.level);
+                    }
+                    true
                 }
-                _ => collapsed_level.is_none(),
+            } else {
+                collapsed_level.is_none()
             };
             if visible {
                 collect_leaves_in_slice(std::slice::from_ref(block), &mut leaves);
@@ -513,25 +766,18 @@ impl Document {
     pub fn container_blocks(&self, target: ContainerTarget) -> Option<&[BlockNode]> {
         match target {
             ContainerTarget::Root => Some(&self.blocks),
-            ContainerTarget::Blockquote(quote_id) => {
-                let block = self.find_block(quote_id)?;
-                if let BlockKind::Blockquote(children) = &block.kind {
-                    Some(children)
-                } else {
-                    None
-                }
+            ContainerTarget::Container(container_id) => {
+                let block = self.find_block(container_id)?;
+                block.kind.children()
             }
             ContainerTarget::TableCell { table_id, row, col } => {
                 let block = self.find_block(table_id)?;
-                if let BlockKind::Table(table) = &block.kind {
-                    table
-                        .rows
-                        .get(row)
-                        .and_then(|table_row| table_row.cells.get(col))
-                        .map(|cell| cell.blocks.as_slice())
-                } else {
-                    None
-                }
+                let table = block.kind.table_block()?;
+                table
+                    .rows
+                    .get(row)
+                    .and_then(|table_row| table_row.cells.get(col))
+                    .map(|cell| cell.blocks.as_slice())
             }
         }
     }
@@ -540,56 +786,42 @@ impl Document {
     pub fn container_blocks_mut(&mut self, target: ContainerTarget) -> Option<&mut Vec<BlockNode>> {
         match target {
             ContainerTarget::Root => Some(&mut self.blocks),
-            ContainerTarget::Blockquote(quote_id) => {
-                let block = self.find_block_mut(quote_id)?;
-                if let BlockKind::Blockquote(children) = &mut block.kind {
-                    Some(children)
-                } else {
-                    None
-                }
+            ContainerTarget::Container(container_id) => {
+                let block = self.find_block_mut(container_id)?;
+                block.kind.children_mut()
             }
             ContainerTarget::TableCell { table_id, row, col } => {
                 let block = self.find_block_mut(table_id)?;
-                if let BlockKind::Table(table) = &mut block.kind {
-                    table
-                        .rows
-                        .get_mut(row)
-                        .and_then(|table_row| table_row.cells.get_mut(col))
-                        .map(|cell| &mut cell.blocks)
-                } else {
-                    None
-                }
+                let table = block.kind.table_block_mut()?;
+                table
+                    .rows
+                    .get_mut(row)
+                    .and_then(|table_row| table_row.cells.get_mut(col))
+                    .map(|cell| &mut cell.blocks)
             }
         }
     }
 
     pub fn toggle_heading_collapsed(&mut self, id: BlockId) -> Option<bool> {
         let block = self.find_block_mut(id)?;
-        if let BlockKind::Heading { collapsed, .. } = &mut block.kind {
-            *collapsed = !*collapsed;
-            let state = *collapsed;
-            block.bump_version();
-            Some(state)
-        } else {
-            None
-        }
+        let mut heading = block.kind.heading_data()?;
+        heading.collapsed = !heading.collapsed;
+        let state = heading.collapsed;
+        *block.kind.data_mut() = CustomPayload::typed(heading);
+        block.bump_version();
+        Some(state)
     }
 
-    /// Toggles the checked state of a checklist `BlockKind::ListItem`, returning the new state.
+    /// Toggles the checked state of a checklist list item, returning the new state.
     pub fn toggle_checklist_item(&mut self, id: BlockId) -> Option<bool> {
         let block = self.find_block_mut(id)?;
-        if let BlockKind::ListItem {
-            checked: Some(is_checked),
-            ..
-        } = &mut block.kind
-        {
-            *is_checked = !*is_checked;
-            let state = *is_checked;
-            block.bump_version();
-            Some(state)
-        } else {
-            None
-        }
+        let mut item = block.kind.list_item_data()?;
+        let is_checked = item.checked.as_mut()?;
+        *is_checked = !*is_checked;
+        let state = *is_checked;
+        *block.kind.data_mut() = CustomPayload::typed(item);
+        block.bump_version();
+        Some(state)
     }
 
     pub fn to_json_pretty(&self) -> Result<String, serde_json::Error> {
@@ -604,19 +836,16 @@ impl Document {
 fn collect_leaves_in_slice<'doc>(blocks: &'doc [BlockNode], out: &mut Vec<&'doc BlockNode>) {
     for block in blocks {
         match &block.kind {
-            BlockKind::Blockquote(children) => collect_leaves_in_slice(children, out),
-            BlockKind::Table(table) => {
+            BlockKind::Container { children, .. } => collect_leaves_in_slice(children, out),
+            BlockKind::Grid { table, .. } => {
                 for row in &table.rows {
                     for cell in &row.cells {
                         collect_leaves_in_slice(&cell.blocks, out);
                     }
                 }
             }
-            BlockKind::Paragraph(_)
-            | BlockKind::Heading { .. }
-            | BlockKind::ListItem { .. }
-            | BlockKind::CodeBlock { .. } => out.push(block),
-            BlockKind::HorizontalRule | BlockKind::Custom { .. } => {}
+            BlockKind::Text { .. } => out.push(block),
+            BlockKind::Leaf { .. } => {}
         }
     }
 }
@@ -624,21 +853,21 @@ fn collect_leaves_in_slice<'doc>(blocks: &'doc [BlockNode], out: &mut Vec<&'doc 
 fn max_list_id_in_slice(blocks: &[BlockNode]) -> u64 {
     let mut max_id = 0u64;
     for block in blocks {
+        if let Some(item) = block.kind.list_item_data() {
+            max_id = max_id.max(item.list_id.0);
+        }
         match &block.kind {
-            BlockKind::ListItem { list_id, .. } => {
-                max_id = max_id.max(list_id.0);
-            }
-            BlockKind::Blockquote(children) => {
+            BlockKind::Container { children, .. } => {
                 max_id = max_id.max(max_list_id_in_slice(children));
             }
-            BlockKind::Table(table) => {
+            BlockKind::Grid { table, .. } => {
                 for row in &table.rows {
                     for cell in &row.cells {
                         max_id = max_id.max(max_list_id_in_slice(&cell.blocks));
                     }
                 }
             }
-            _ => {}
+            BlockKind::Text { .. } | BlockKind::Leaf { .. } => {}
         }
     }
     max_id
@@ -654,14 +883,14 @@ fn locate_in_slice(
             return Some((current_target, index));
         }
         match &block.kind {
-            BlockKind::Blockquote(children) => {
+            BlockKind::Container { children, .. } => {
                 if let Some(found) =
-                    locate_in_slice(children, ContainerTarget::Blockquote(block.id), block_id)
+                    locate_in_slice(children, ContainerTarget::Container(block.id), block_id)
                 {
                     return Some(found);
                 }
             }
-            BlockKind::Table(table) => {
+            BlockKind::Grid { table, .. } => {
                 for (row_index, row) in table.rows.iter().enumerate() {
                     for (col_index, cell) in row.cells.iter().enumerate() {
                         let cell_target = ContainerTarget::TableCell {
@@ -675,7 +904,7 @@ fn locate_in_slice(
                     }
                 }
             }
-            _ => {}
+            BlockKind::Text { .. } | BlockKind::Leaf { .. } => {}
         }
     }
     None
@@ -692,14 +921,14 @@ fn build_path_in_slice(
             return true;
         }
         match &block.kind {
-            BlockKind::Blockquote(children) => {
+            BlockKind::Container { children, .. } => {
                 path.push(PathSegment::Block(block.id));
                 if build_path_in_slice(children, block_id, path) {
                     return true;
                 }
                 path.pop();
             }
-            BlockKind::Table(table) => {
+            BlockKind::Grid { table, .. } => {
                 for (row_index, row) in table.rows.iter().enumerate() {
                     for (col_index, cell) in row.cells.iter().enumerate() {
                         path.push(PathSegment::TableCell {
@@ -714,7 +943,7 @@ fn build_path_in_slice(
                     }
                 }
             }
-            _ => {}
+            BlockKind::Text { .. } | BlockKind::Leaf { .. } => {}
         }
     }
     false
@@ -726,12 +955,12 @@ fn find_in_slice(blocks: &[BlockNode], id: BlockId) -> Option<&BlockNode> {
             return Some(block);
         }
         match &block.kind {
-            BlockKind::Blockquote(children) => {
+            BlockKind::Container { children, .. } => {
                 if let Some(found) = find_in_slice(children, id) {
                     return Some(found);
                 }
             }
-            BlockKind::Table(table) => {
+            BlockKind::Grid { table, .. } => {
                 for row in &table.rows {
                     for cell in &row.cells {
                         if let Some(found) = find_in_slice(&cell.blocks, id) {
@@ -740,7 +969,7 @@ fn find_in_slice(blocks: &[BlockNode], id: BlockId) -> Option<&BlockNode> {
                     }
                 }
             }
-            _ => {}
+            BlockKind::Text { .. } | BlockKind::Leaf { .. } => {}
         }
     }
     None
@@ -752,12 +981,12 @@ fn find_in_slice_mut(blocks: &mut [BlockNode], id: BlockId) -> Option<&mut Block
             return Some(block);
         }
         match &mut block.kind {
-            BlockKind::Blockquote(children) => {
+            BlockKind::Container { children, .. } => {
                 if let Some(found) = find_in_slice_mut(children, id) {
                     return Some(found);
                 }
             }
-            BlockKind::Table(table) => {
+            BlockKind::Grid { table, .. } => {
                 for row in &mut table.rows {
                     for cell in &mut row.cells {
                         if let Some(found) = find_in_slice_mut(&mut cell.blocks, id) {
@@ -766,7 +995,7 @@ fn find_in_slice_mut(blocks: &mut [BlockNode], id: BlockId) -> Option<&mut Block
                     }
                 }
             }
-            _ => {}
+            BlockKind::Text { .. } | BlockKind::Leaf { .. } => {}
         }
     }
     None

@@ -1,6 +1,7 @@
-use crate::geometry::{Size, pt_to_px};
+use crate::geometry::{Insets, Size, pt_to_px};
 use rich_model::{
-    FontWeight, InlineObject, InlineVAlign, ResolvedTextStyle, RgbaColor, SharedStr, UnderlineKind,
+    CustomPayload, FontWeight, InlineObject, InlineVAlign, ResolvedTextStyle, RgbaColor,
+    SharedStr, UnderlineKind,
 };
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -129,15 +130,26 @@ pub trait TextShaper {
 
     fn measure_inline_object(&mut self, obj: &InlineObject, zoom: f32) -> InlineBoxMetrics;
 
-    /// Measures a [`rich_model::BlockKind::Custom`] block inside `max_width` pixels at `zoom`.
+    /// Measures a custom leaf block (`BlockKind::Leaf`) inside `max_width` pixels at `zoom`.
     fn measure_custom_block(
         &mut self,
         _kind: &str,
-        _data: &serde_json::Value,
+        _data: &CustomPayload,
         max_width: f32,
         zoom: f32,
     ) -> Size {
         Size::new(max_width, pt_to_px(44.0, zoom))
+    }
+
+    /// Measures chrome insets (in pixels) reserved around a custom text, container, or grid block.
+    fn measure_custom_chrome(
+        &mut self,
+        _kind: &str,
+        _data: &CustomPayload,
+        _max_width: f32,
+        zoom: f32,
+    ) -> Insets {
+        Insets::xy(pt_to_px(12.0, zoom), pt_to_px(8.0, zoom))
     }
 }
 

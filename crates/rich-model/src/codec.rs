@@ -2,12 +2,13 @@
 
 use crate::block::{
     BlockKind, BlockNode, ColumnSpec, Document, ListId, ListKind, NumberStyle, TableBlock,
-    TableBorderStyle, TableCell, TableRow,
+    TableBorderStyle, TableCell, TableRow, block_kinds,
 };
 use crate::clipboard::ClipboardFragment;
 use crate::inline::{
     ChipKind, InlineContent, InlineObject, InlineVAlign, OBJECT_REPLACEMENT_CHAR,
 };
+use crate::payload::CustomPayload;
 use crate::style::{
     BaselineShift, BlockStyle, FontWeight, InlineStyle, StyleId, TextAlign, UnderlineKind,
 };
@@ -253,11 +254,11 @@ fn encode_markdown_blocks(blocks: &[BlockNode], line_prefix: &str, output: &mut 
     let mut ordered_counters: HashMap<(ListId, u8), usize> = HashMap::new();
 
     for (index, block) in blocks.iter().enumerate() {
-        let is_list_item = matches!(block.kind, BlockKind::ListItem { .. });
+        let is_list_item = block.kind.list_item_data().is_some();
         let prev_is_list_item = index
             .checked_sub(1)
             .and_then(|prev| blocks.get(prev))
-            .is_some_and(|prev| matches!(prev.kind, BlockKind::ListItem { .. }));
+            .is_some_and(|prev| prev.kind.list_item_data().is_some());
 
         if index > 0 {
             if is_list_item && prev_is_list_item {
@@ -272,87 +273,122 @@ fn encode_markdown_blocks(blocks: &[BlockNode], line_prefix: &str, output: &mut 
         }
 
         match &block.kind {
-            BlockKind::Paragraph(content) => {
-                let rendered = encode_markdown_inline(content);
-                for (line_idx, line) in rendered.split('\n').enumerate() {
-                    if line_idx > 0 {
-                        output.push_str("  \n");
-                    }
-                    output.push_str(line_prefix);
-                    output.push_str(line);
-                }
-            }
-            BlockKind::Heading { level, content, .. } => {
-                output.push_str(line_prefix);
-                let clamped = (*level).clamp(1, 6) as usize;
-                for _ in 0..clamped {
-                    output.push('#');
-                }
-                output.push(' ');
-                output.push_str(&encode_markdown_inline(content));
-            }
-            BlockKind::ListItem {
-                list_id,
+            BlockKind::Text {
                 kind,
-                indent_level,
-                checked,
+                data,
                 content,
-            } => {
-                ordered_counters
-                    .retain(|&(id, level), _| id != *list_id || level <= *indent_level);
-                output.push_str(line_prefix);
-                for _ in 0..(*indent_level as usize) {
-                    output.push_str("  ");
-                }
-                match kind {
-                    ListKind::Bullet => output.push_str("- "),
-                    ListKind::Checklist => {
-                        if checked.unwrap_or(false) {
-                            output.push_str("- [x] ");
-                        } else {
-                            output.push_str("- [ ] ");
-                        }
-                    }
-                    ListKind::Ordered(_) => {
-                        let counter = ordered_counters
-                            .entry((*list_id, *indent_level))
-                            .or_insert(0);
-                        *counter += 1;
-                        output.push_str(&format!("{counter}. "));
-                    }
-                }
-                output.push_str(&encode_markdown_inline(content));
-            }
-            BlockKind::Blockquote(children) => {
-                let nested_prefix = format!("{line_prefix}> ");
-                encode_markdown_blocks(children, &nested_prefix, output);
-            }
-            BlockKind::CodeBlock { language, content } => {
-                output.push_str(line_prefix);
-                output.push_str("```");
-                if let Some(lang) = language {
-                    output.push_str(lang);
-                }
-                output.push('\n');
-                for line in content.text.split('\n') {
+            } => match kind.as_ref() {
+                block_kinds::HEADING => {
+                    let level = block.kind.heading_data().map(|h| h.level).unwrap_or(1);
                     output.push_str(line_prefix);
-                    output.push_str(line);
-                    output.push('\n');
+                    let clamped = level.clamp(1, 6) as usize;
+                    for _ in 0..clamped {
+                        output.push('#');
+                    }
+                    output.push(' ');
+                    output.push_str(&encode_markdown_inline(content));
                 }
-                output.push_str(line_prefix);
-                output.push_str("```");
+                block_kinds::LIST_ITEM => {
+                    if let Some(item) = block.kind.list_item_data() {
+                        ordered_counters.retain(|&(id, level), _| {
+                            id != item.list_id || level <= item.indent_level
+                        });
+                        output.push_str(line_prefix);
+                        for _ in 0..(item.indent_level as usize) {
+                            output.push_str("  ");
+                        }
+                        match item.kind {
+                            ListKind::Bullet => output.push_str("- "),
+                            ListKind::Checklist => {
+                                if item.checked.unwrap_or(false) {
+                                    output.push_str("- [x] ");
+                                } else {
+                                    output.push_str("- [ ] ");
+                                }
+                            }
+                            ListKind::Ordered(_) => {
+                                let counter = ordered_counters
+                                    .entry((item.list_id, item.indent_level))
+                                    .or_insert(0);
+                                *counter += 1;
+                                output.push_str(&format!("{counter}. "));
+                            }
+                        }
+                        output.push_str(&encode_markdown_inline(content));
+                    }
+                }
+                block_kinds::CODE_BLOCK => {
+                    output.push_str(line_prefix);
+                    output.push_str("```");
+                    if let Some(code) = block.kind.code_block_data()
+                        && let Some(lang) = &code.language
+                    {
+                        output.push_str(lang);
+                    }
+                    output.push('\n');
+                    for line in content.text.split('\n') {
+                        output.push_str(line_prefix);
+                        output.push_str(line);
+                        output.push('\n');
+                    }
+                    output.push_str(line_prefix);
+                    output.push_str("```");
+                }
+                block_kinds::PARAGRAPH => {
+                    let rendered = encode_markdown_inline(content);
+                    for (line_idx, line) in rendered.split('\n').enumerate() {
+                        if line_idx > 0 {
+                            output.push_str("  \n");
+                        }
+                        output.push_str(line_prefix);
+                        output.push_str(line);
+                    }
+                }
+                _ => {
+                    output.push_str(line_prefix);
+                    let payload =
+                        serde_json::to_string(data).unwrap_or_else(|_| "null".into());
+                    output.push_str(&format!("<!-- gpui-rich:{kind} {payload} -->\n"));
+                    let rendered = encode_markdown_inline(content);
+                    for (line_idx, line) in rendered.split('\n').enumerate() {
+                        if line_idx > 0 {
+                            output.push_str("  \n");
+                        }
+                        output.push_str(line_prefix);
+                        output.push_str(line);
+                    }
+                }
+            },
+            BlockKind::Container {
+                kind,
+                data,
+                children,
+            } => {
+                if kind.as_ref() == block_kinds::BLOCKQUOTE {
+                    let nested_prefix = format!("{line_prefix}> ");
+                    encode_markdown_blocks(children, &nested_prefix, output);
+                } else {
+                    output.push_str(line_prefix);
+                    let payload =
+                        serde_json::to_string(data).unwrap_or_else(|_| "null".into());
+                    output.push_str(&format!("<!-- gpui-rich:{kind} {payload} -->\n"));
+                    let nested_prefix = format!("{line_prefix}> ");
+                    encode_markdown_blocks(children, &nested_prefix, output);
+                }
             }
-            BlockKind::Table(table) => {
+            BlockKind::Grid { table, .. } => {
                 encode_markdown_table(table, line_prefix, output);
             }
-            BlockKind::HorizontalRule => {
-                output.push_str(line_prefix);
-                output.push_str("---");
-            }
-            BlockKind::Custom { kind, data } => {
-                output.push_str(line_prefix);
-                let payload = serde_json::to_string(data).unwrap_or_else(|_| "null".into());
-                output.push_str(&format!("<!-- gpui-rich:{kind} {payload} -->"));
+            BlockKind::Leaf { kind, data } => {
+                if kind.as_ref() == block_kinds::HORIZONTAL_RULE {
+                    output.push_str(line_prefix);
+                    output.push_str("---");
+                } else {
+                    output.push_str(line_prefix);
+                    let payload =
+                        serde_json::to_string(data).unwrap_or_else(|_| "null".into());
+                    output.push_str(&format!("<!-- gpui-rich:{kind} {payload} -->"));
+                }
             }
         }
     }
@@ -529,14 +565,13 @@ fn parse_markdown_blocks(lines: &[&str], document: &mut Document) -> Vec<BlockNo
                 Some((k, p)) => (k.trim(), p.trim()),
                 None => (inner_trimmed, "null"),
             };
-            let data = serde_json::from_str(payload_str).unwrap_or(serde_json::Value::Null);
+            let data = CustomPayload::from_json(
+                serde_json::from_str(payload_str).unwrap_or(serde_json::Value::Null),
+            );
             let id = document.alloc_block_id();
             blocks.push(BlockNode::new(
                 id,
-                BlockKind::Custom {
-                    kind: kind.to_string(),
-                    data,
-                },
+                BlockKind::leaf(kind, data),
                 BlockStyle {
                     space_before_pt: Some(6.0),
                     space_after_pt: Some(8.0),
@@ -563,10 +598,7 @@ fn parse_markdown_blocks(lines: &[&str], document: &mut Document) -> Vec<BlockNo
             let id = document.alloc_block_id();
             blocks.push(BlockNode::new(
                 id,
-                BlockKind::CodeBlock {
-                    language,
-                    content: InlineContent::plain(code_lines.join("\n")),
-                },
+                BlockKind::code_block(language, InlineContent::plain(code_lines.join("\n"))),
                 BlockStyle::named(StyleId::CODE_BLOCK),
             ));
             continue;
@@ -578,7 +610,7 @@ fn parse_markdown_blocks(lines: &[&str], document: &mut Document) -> Vec<BlockNo
             let id = document.alloc_block_id();
             blocks.push(BlockNode::new(
                 id,
-                BlockKind::HorizontalRule,
+                BlockKind::horizontal_rule(),
                 BlockStyle {
                     space_before_pt: Some(10.0),
                     space_after_pt: Some(10.0),
@@ -596,11 +628,7 @@ fn parse_markdown_blocks(lines: &[&str], document: &mut Document) -> Vec<BlockNo
             let content = parse_markdown_inline(text);
             blocks.push(BlockNode::new(
                 id,
-                BlockKind::Heading {
-                    level,
-                    collapsed: false,
-                    content,
-                },
+                BlockKind::heading(level, false, content),
                 BlockStyle::named(StyleId::heading(level)),
             ));
             index += 1;
@@ -625,14 +653,14 @@ fn parse_markdown_blocks(lines: &[&str], document: &mut Document) -> Vec<BlockNo
                 let child_id = document.alloc_block_id();
                 children.push(BlockNode::new(
                     child_id,
-                    BlockKind::Paragraph(InlineContent::empty()),
+                    BlockKind::paragraph(InlineContent::empty()),
                     BlockStyle::default(),
                 ));
             }
             let id = document.alloc_block_id();
             blocks.push(BlockNode::new(
                 id,
-                BlockKind::Blockquote(children),
+                BlockKind::blockquote(children),
                 BlockStyle {
                     indent_start_pt: 16.0,
                     space_before_pt: Some(6.0),
@@ -678,7 +706,7 @@ fn parse_markdown_blocks(lines: &[&str], document: &mut Document) -> Vec<BlockNo
             let id = document.alloc_block_id();
             blocks.push(BlockNode::new(
                 id,
-                BlockKind::Table(TableBlock {
+                BlockKind::table(TableBlock {
                     columns: vec![ColumnSpec::Auto; col_count],
                     rows: table_rows,
                     border_style: TableBorderStyle::default(),
@@ -706,13 +734,13 @@ fn parse_markdown_blocks(lines: &[&str], document: &mut Document) -> Vec<BlockNo
             style.space_after_pt = Some(4.0);
             blocks.push(BlockNode::new(
                 id,
-                BlockKind::ListItem {
+                BlockKind::list_item(
                     list_id,
                     kind,
                     indent_level,
                     checked,
-                    content: parse_markdown_inline(body),
-                },
+                    parse_markdown_inline(body),
+                ),
                 style,
             ));
             index += 1;
@@ -753,7 +781,7 @@ fn parse_markdown_blocks(lines: &[&str], document: &mut Document) -> Vec<BlockNo
         let id = document.alloc_block_id();
         blocks.push(BlockNode::new(
             id,
-            BlockKind::Paragraph(parse_markdown_inline(&joined)),
+            BlockKind::paragraph(parse_markdown_inline(&joined)),
             BlockStyle::default(),
         ));
     }
@@ -953,7 +981,7 @@ fn build_markdown_table_row(
             cell_id,
             vec![BlockNode::new(
                 para_id,
-                BlockKind::Paragraph(content),
+                BlockKind::paragraph(content),
                 BlockStyle::default().with_align(align),
             )],
         ));

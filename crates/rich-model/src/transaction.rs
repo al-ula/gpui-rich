@@ -546,7 +546,7 @@ impl Document {
         let offset = pos.offset.min(inline.len());
 
         // Inside a code block, Enter inserts a newline rather than splitting into a second frame.
-        if matches!(block.kind, BlockKind::CodeBlock { .. }) {
+        if block.kind.code_block_data().is_some() {
             let mut next_pos = pos.clone();
             next_pos.offset = offset + 1;
             return Some(
@@ -564,32 +564,26 @@ impl Document {
         }
 
         // Pressing Enter on an empty list item outdents or exits the list to a normal paragraph.
-        if let BlockKind::ListItem {
-            list_id,
-            kind,
-            indent_level,
-            checked,
-            content,
-        } = &block.kind
-            && content.is_empty()
+        if let Some(item) = block.kind.list_item_data()
+            && inline.is_empty()
         {
-            let (new_kind, new_style) = if *indent_level > 0 {
-                let next_level = indent_level - 1;
+            let (new_kind, new_style) = if item.indent_level > 0 {
+                let next_level = item.indent_level - 1;
                 let mut next_style = block.style.clone();
                 next_style.indent_start_pt = 24.0 * (next_level as f32 + 1.0);
                 (
-                    BlockKind::ListItem {
-                        list_id: *list_id,
-                        kind: *kind,
-                        indent_level: next_level,
-                        checked: *checked,
-                        content: InlineContent::empty(),
-                    },
+                    BlockKind::list_item(
+                        item.list_id,
+                        item.kind,
+                        next_level,
+                        item.checked,
+                        InlineContent::empty(),
+                    ),
                     next_style,
                 )
             } else {
                 (
-                    BlockKind::Paragraph(InlineContent::empty()),
+                    BlockKind::paragraph(InlineContent::empty()),
                     BlockStyle::default(),
                 )
             };
@@ -606,42 +600,45 @@ impl Document {
 
         let trailing = inline.slice(offset..inline.len());
         let new_block_id = self.alloc_block_id();
-        let (trailing_kind, trailing_style) = match &block.kind {
-            BlockKind::Paragraph(_) => (BlockKind::Paragraph(trailing), block.style.clone()),
-            BlockKind::Heading { level, .. } => {
-                if offset == inline.len() {
-                    (
-                        BlockKind::Paragraph(InlineContent::empty()),
-                        BlockStyle::default(),
-                    )
-                } else {
-                    (
-                        BlockKind::Heading {
-                            level: *level,
-                            collapsed: false,
-                            content: trailing,
-                        },
-                        block.style.clone(),
-                    )
-                }
+        let (trailing_kind, trailing_style) = if block.kind.is_paragraph() {
+            (BlockKind::paragraph(trailing), block.style.clone())
+        } else if let Some(heading) = block.kind.heading_data() {
+            if offset == inline.len() {
+                (
+                    BlockKind::paragraph(InlineContent::empty()),
+                    BlockStyle::default(),
+                )
+            } else {
+                (
+                    BlockKind::heading(heading.level, false, trailing),
+                    block.style.clone(),
+                )
             }
-            BlockKind::ListItem {
-                list_id,
-                kind,
-                indent_level,
-                checked,
-                ..
-            } => (
-                BlockKind::ListItem {
-                    list_id: *list_id,
-                    kind: *kind,
-                    indent_level: *indent_level,
-                    checked: checked.map(|_| false),
-                    content: trailing,
-                },
+        } else if let Some(item) = block.kind.list_item_data() {
+            (
+                BlockKind::list_item(
+                    item.list_id,
+                    item.kind,
+                    item.indent_level,
+                    item.checked.map(|_| false),
+                    trailing,
+                ),
                 block.style.clone(),
-            ),
-            _ => return None,
+            )
+        } else if let BlockKind::Text { kind, data, .. } = &block.kind {
+            if offset == inline.len() {
+                (
+                    BlockKind::paragraph(InlineContent::empty()),
+                    BlockStyle::default(),
+                )
+            } else {
+                (
+                    BlockKind::text(kind.clone(), data.clone(), trailing),
+                    block.style.clone(),
+                )
+            }
+        } else {
+            return None;
         };
 
         let mut steps = Vec::new();
@@ -686,52 +683,47 @@ impl Document {
         let block = self.find_block(leaf_id)?;
 
         // Backspace at offset 0 of a list item or heading converts/outdents before merging upward.
-        match &block.kind {
-            BlockKind::ListItem {
-                list_id,
-                kind,
-                indent_level,
-                checked,
-                content,
-            } => {
-                let (new_kind, new_style) = if *indent_level > 0 {
-                    let next_level = indent_level - 1;
-                    let mut next_style = block.style.clone();
-                    next_style.indent_start_pt = 24.0 * (next_level as f32 + 1.0);
-                    (
-                        BlockKind::ListItem {
-                            list_id: *list_id,
-                            kind: *kind,
-                            indent_level: next_level,
-                            checked: *checked,
-                            content: content.clone(),
-                        },
-                        next_style,
-                    )
-                } else {
-                    (
-                        BlockKind::Paragraph(content.clone()),
-                        BlockStyle::default(),
-                    )
-                };
-                return self.build_convert_block_transaction(
-                    leaf_id,
-                    new_kind,
-                    new_style,
-                    selection_before,
-                    Some(DocumentSelection::caret(pos.clone(), Affinity::Downstream)),
-                );
-            }
-            BlockKind::Heading { content, .. } => {
-                return self.build_convert_block_transaction(
-                    leaf_id,
-                    BlockKind::Paragraph(content.clone()),
+        if let Some(item) = block.kind.list_item_data()
+            && let Some(content) = block.kind.inline_content()
+        {
+            let (new_kind, new_style) = if item.indent_level > 0 {
+                let next_level = item.indent_level - 1;
+                let mut next_style = block.style.clone();
+                next_style.indent_start_pt = 24.0 * (next_level as f32 + 1.0);
+                (
+                    BlockKind::list_item(
+                        item.list_id,
+                        item.kind,
+                        next_level,
+                        item.checked,
+                        content.clone(),
+                    ),
+                    next_style,
+                )
+            } else {
+                (
+                    BlockKind::paragraph(content.clone()),
                     BlockStyle::default(),
-                    selection_before,
-                    Some(DocumentSelection::caret(pos.clone(), Affinity::Downstream)),
-                );
-            }
-            _ => {}
+                )
+            };
+            return self.build_convert_block_transaction(
+                leaf_id,
+                new_kind,
+                new_style,
+                selection_before,
+                Some(DocumentSelection::caret(pos.clone(), Affinity::Downstream)),
+            );
+        }
+        if block.kind.heading_data().is_some()
+            && let Some(content) = block.kind.inline_content()
+        {
+            return self.build_convert_block_transaction(
+                leaf_id,
+                BlockKind::paragraph(content.clone()),
+                BlockStyle::default(),
+                selection_before,
+                Some(DocumentSelection::caret(pos.clone(), Affinity::Downstream)),
+            );
         }
 
         if block_index == 0 {
@@ -833,7 +825,7 @@ impl Document {
         columns: Vec<ColumnSpec>,
         selection_before: Option<DocumentSelection>,
     ) -> Option<Transaction> {
-        let BlockKind::Table(table) = &self.find_block(table_id)?.kind else {
+        let BlockKind::Grid { kind, data, table } = &self.find_block(table_id)?.kind else {
             return None;
         };
         let mut next_table = table.clone();
@@ -841,7 +833,7 @@ impl Document {
         Some(
             Transaction::new(vec![Step::SetBlockKind {
                 block_id: table_id,
-                kind: BlockKind::Table(next_table),
+                kind: BlockKind::grid(kind.clone(), data.clone(), next_table),
             }])
             .with_selections(selection_before.clone(), selection_before),
         )
@@ -855,7 +847,12 @@ impl Document {
         after: bool,
         selection_before: Option<DocumentSelection>,
     ) -> Option<Transaction> {
-        let BlockKind::Table(table) = self.find_block(table_id)?.kind.clone() else {
+        let BlockKind::Grid {
+            kind: grid_kind,
+            data: grid_data,
+            table,
+        } = self.find_block(table_id)?.kind.clone()
+        else {
             return None;
         };
         if table.rows.is_empty() {
@@ -901,7 +898,7 @@ impl Document {
                 cell_id,
                 vec![BlockNode::new(
                     para_id,
-                    BlockKind::Paragraph(InlineContent::empty()),
+                    BlockKind::paragraph(InlineContent::empty()),
                     BlockStyle::default(),
                 )],
             ));
@@ -923,7 +920,7 @@ impl Document {
         Some(
             Transaction::new(vec![Step::SetBlockKind {
                 block_id: table_id,
-                kind: BlockKind::Table(next_table),
+                kind: BlockKind::grid(grid_kind, grid_data, next_table),
             }])
             .with_selections(selection_before, selection_after),
         )
@@ -937,7 +934,12 @@ impl Document {
         row_range: Range<usize>,
         selection_before: Option<DocumentSelection>,
     ) -> Option<Transaction> {
-        let BlockKind::Table(table) = self.find_block(table_id)?.kind.clone() else {
+        let BlockKind::Grid {
+            kind: grid_kind,
+            data: grid_data,
+            table,
+        } = self.find_block(table_id)?.kind.clone()
+        else {
             return None;
         };
         let row_count = table.rows.len();
@@ -954,7 +956,7 @@ impl Document {
             return Some(
                 Transaction::new(vec![Step::SetBlockKind {
                     block_id: table_id,
-                    kind: BlockKind::Paragraph(InlineContent::empty()),
+                    kind: BlockKind::paragraph(InlineContent::empty()),
                 }])
                 .with_selections(
                     selection_before,
@@ -1028,7 +1030,7 @@ impl Document {
         Some(
             Transaction::new(vec![Step::SetBlockKind {
                 block_id: table_id,
-                kind: BlockKind::Table(next_table),
+                kind: BlockKind::grid(grid_kind, grid_data, next_table),
             }])
             .with_selections(selection_before, selection_after),
         )
@@ -1042,7 +1044,12 @@ impl Document {
         after: bool,
         selection_before: Option<DocumentSelection>,
     ) -> Option<Transaction> {
-        let BlockKind::Table(table) = self.find_block(table_id)?.kind.clone() else {
+        let BlockKind::Grid {
+            kind: grid_kind,
+            data: grid_data,
+            table,
+        } = self.find_block(table_id)?.kind.clone()
+        else {
             return None;
         };
         let (col_count, placements, _) = table.resolve_grid();
@@ -1102,7 +1109,7 @@ impl Document {
                         cell_id,
                         vec![BlockNode::new(
                             para_id,
-                            BlockKind::Paragraph(InlineContent::empty()),
+                            BlockKind::paragraph(InlineContent::empty()),
                             BlockStyle::default(),
                         )],
                     ),
@@ -1119,7 +1126,7 @@ impl Document {
         Some(
             Transaction::new(vec![Step::SetBlockKind {
                 block_id: table_id,
-                kind: BlockKind::Table(next_table),
+                kind: BlockKind::grid(grid_kind, grid_data, next_table),
             }])
             .with_selections(selection_before, selection_after),
         )
@@ -1133,7 +1140,12 @@ impl Document {
         col_range: Range<usize>,
         selection_before: Option<DocumentSelection>,
     ) -> Option<Transaction> {
-        let BlockKind::Table(table) = self.find_block(table_id)?.kind.clone() else {
+        let BlockKind::Grid {
+            kind: grid_kind,
+            data: grid_data,
+            table,
+        } = self.find_block(table_id)?.kind.clone()
+        else {
             return None;
         };
         let (col_count, placements, _) = table.resolve_grid();
@@ -1147,7 +1159,7 @@ impl Document {
             return Some(
                 Transaction::new(vec![Step::SetBlockKind {
                     block_id: table_id,
-                    kind: BlockKind::Paragraph(InlineContent::empty()),
+                    kind: BlockKind::paragraph(InlineContent::empty()),
                 }])
                 .with_selections(
                     selection_before,
@@ -1200,7 +1212,7 @@ impl Document {
         Some(
             Transaction::new(vec![Step::SetBlockKind {
                 block_id: table_id,
-                kind: BlockKind::Table(next_table),
+                kind: BlockKind::grid(grid_kind, grid_data, next_table),
             }])
             .with_selections(selection_before, selection_after),
         )
@@ -1215,7 +1227,12 @@ impl Document {
         focus_visual: (usize, usize),
         selection_before: Option<DocumentSelection>,
     ) -> Option<Transaction> {
-        let BlockKind::Table(table) = self.find_block(table_id)?.kind.clone() else {
+        let BlockKind::Grid {
+            kind: grid_kind,
+            data: grid_data,
+            table,
+        } = self.find_block(table_id)?.kind.clone()
+        else {
             return None;
         };
         let row_count = table.rows.len();
@@ -1283,10 +1300,11 @@ impl Document {
                 .and_then(|row| row.cells.get(placement.cell_index))
             {
                 for block in &cell.blocks {
-                    let is_empty_para = matches!(
-                        &block.kind,
-                        BlockKind::Paragraph(content) if content.is_empty()
-                    );
+                    let is_empty_para = block.kind.is_paragraph()
+                        && block
+                            .kind
+                            .inline_content()
+                            .is_some_and(InlineContent::is_empty);
                     if !is_empty_para {
                         absorbed_blocks.push(block.clone());
                     }
@@ -1303,10 +1321,11 @@ impl Document {
             anchor_cell.rowspan = (r_max - r_min + 1) as u16;
             if !absorbed_blocks.is_empty() {
                 if anchor_cell.blocks.len() == 1
-                    && matches!(
-                        &anchor_cell.blocks[0].kind,
-                        BlockKind::Paragraph(content) if content.is_empty()
-                    )
+                    && anchor_cell.blocks[0].kind.is_paragraph()
+                    && anchor_cell.blocks[0]
+                        .kind
+                        .inline_content()
+                        .is_some_and(InlineContent::is_empty)
                 {
                     anchor_cell.blocks = absorbed_blocks;
                 } else {
@@ -1348,7 +1367,7 @@ impl Document {
         Some(
             Transaction::new(vec![Step::SetBlockKind {
                 block_id: table_id,
-                kind: BlockKind::Table(next_table),
+                kind: BlockKind::grid(grid_kind, grid_data, next_table),
             }])
             .with_selections(selection_before, selection_after),
         )
@@ -1363,7 +1382,12 @@ impl Document {
         cell_index: usize,
         selection_before: Option<DocumentSelection>,
     ) -> Option<Transaction> {
-        let BlockKind::Table(table) = self.find_block(table_id)?.kind.clone() else {
+        let BlockKind::Grid {
+            kind: grid_kind,
+            data: grid_data,
+            table,
+        } = self.find_block(table_id)?.kind.clone()
+        else {
             return None;
         };
         let (_, placements, _) = table.resolve_grid();
@@ -1411,7 +1435,7 @@ impl Document {
                             cell_id,
                             vec![BlockNode::new(
                                 para_id,
-                                BlockKind::Paragraph(InlineContent::empty()),
+                                BlockKind::paragraph(InlineContent::empty()),
                                 BlockStyle::default(),
                             )],
                         ),
@@ -1430,7 +1454,7 @@ impl Document {
         Some(
             Transaction::new(vec![Step::SetBlockKind {
                 block_id: table_id,
-                kind: BlockKind::Table(next_table),
+                kind: BlockKind::grid(grid_kind, grid_data, next_table),
             }])
             .with_selections(selection_before, selection_after),
         )
@@ -1446,9 +1470,7 @@ impl Document {
         current_cell_index: usize,
         forward: bool,
     ) -> Option<TableCellStep> {
-        let BlockKind::Table(table) = &self.find_block(table_id)?.kind else {
-            return None;
-        };
+        let table = self.find_block(table_id)?.kind.table_block()?;
         let mut cell_order: Vec<(usize, usize, BlockId)> = Vec::new();
         for (row_idx, row) in table.rows.iter().enumerate() {
             for (cell_idx, cell) in row.cells.iter().enumerate() {
@@ -1507,7 +1529,7 @@ impl Document {
         let mut current = target;
         while let Some(parent_id) = match current {
             ContainerTarget::Root => None,
-            ContainerTarget::Blockquote(quote_id) => Some(quote_id),
+            ContainerTarget::Container(container_id) => Some(container_id),
             ContainerTarget::TableCell { table_id, .. } => Some(table_id),
         } {
             if let Some(parent_block) = self.find_block_mut(parent_id) {
@@ -1533,17 +1555,17 @@ fn bump_blocks_using_named_style(
             affected.push(block.id);
         }
         match &mut block.kind {
-            BlockKind::Blockquote(children) => {
+            BlockKind::Container { children, .. } => {
                 bump_blocks_using_named_style(children, style_id, affected);
             }
-            BlockKind::Table(table) => {
+            BlockKind::Grid { table, .. } => {
                 for row in &mut table.rows {
                     for cell in &mut row.cells {
                         bump_blocks_using_named_style(&mut cell.blocks, style_id, affected);
                     }
                 }
             }
-            _ => {}
+            BlockKind::Text { .. } | BlockKind::Leaf { .. } => {}
         }
     }
 }

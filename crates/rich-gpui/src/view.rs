@@ -3,7 +3,10 @@
 
 use crate::asset::{AssetProvider, LoadedAsset, decode_image_asset};
 use crate::element::RichDocumentElement;
-use crate::extension::{CustomCommandResult, ExtensionRegistry, NodeExtension};
+use crate::extension::{
+    CustomCommandResult, ExtensionRegistry, NodeExtension, TypedBlockExtension,
+    TypedInlineExtension,
+};
 use crate::shaper::{FontResolver, GpuiGlyphBackend, GpuiShaper};
 use crate::theme::RichTheme;
 use gpui_kit::{
@@ -19,7 +22,8 @@ use rich_layout::{
 use rich_model::{
     Affinity, BlockId, BlockKind, BlockNode, BlockStyle, ChangeSet, ChipKind, ClipboardBlock,
     ClipboardFragment, CodecError, ColumnSpec, CommandDecision, CommandMiddleware, CommandOutcome,
-    CommandSource, CrdtSyncBridge, DecorationProvider, DocPos, Document, DocumentCodec,
+    CommandSource, CrdtSyncBridge, CustomPayload, DecorationProvider, DocPos, Document,
+    DocumentCodec,
     DocumentSelection, Edges, History, HistoryMergeGroup, HorizontalLayout, InlineContent,
     InlineObject, InlineObjectId, InlineStyle, InteractionPolicy, LinkTarget, ListKind, MarkKind,
     MoveDirection, MoveUnit, NamedStyle, NumberStyle, OBJECT_REPLACEMENT_UTF8_LEN, PathSegment,
@@ -589,9 +593,7 @@ impl RichDocumentView {
                 anchor_cell,
                 focus_cell,
             } => {
-                let BlockKind::Table(table) = &self.document.find_block(*table_id)?.kind else {
-                    return None;
-                };
+                let table = self.document.find_block(*table_id)?.kind.table_block()?;
                 let (_, placements, occupancy) = table.resolve_grid();
                 let r_min = anchor_cell.0.min(focus_cell.0);
                 let c_min = anchor_cell.1.min(focus_cell.1);
@@ -611,9 +613,7 @@ impl RichDocumentView {
             }
             DocumentSelection::Text { focus, .. } => {
                 let (table_id, row, cell_index) = table_cell_of(focus)?;
-                let BlockKind::Table(table) = &self.document.find_block(table_id)?.kind else {
-                    return None;
-                };
+                let table = self.document.find_block(table_id)?.kind.table_block()?;
                 let placement = table.placement_for_stored_cell(row, cell_index)?;
                 Some(ActiveTableContext {
                     table_id,
@@ -718,6 +718,26 @@ impl RichDocumentView {
         self
     }
 
+    /// Builder method registering a strongly typed [`TypedBlockExtension`] for `kind`.
+    pub fn with_typed_block_extension(
+        mut self,
+        kind: impl Into<String>,
+        extension: impl TypedBlockExtension + 'static,
+    ) -> Self {
+        self.extensions.register_typed_block(kind, extension);
+        self
+    }
+
+    /// Builder method registering a strongly typed [`TypedInlineExtension`] for `kind`.
+    pub fn with_typed_inline_extension(
+        mut self,
+        kind: impl Into<String>,
+        extension: impl TypedInlineExtension + 'static,
+    ) -> Self {
+        self.extensions.register_typed_inline(kind, extension);
+        self
+    }
+
     /// Registers a custom [`NodeExtension`] for `kind` and clears cached layouts for resizing.
     pub fn register_node_extension(
         &mut self,
@@ -726,6 +746,30 @@ impl RichDocumentView {
         cx: &mut Context<Self>,
     ) {
         self.extensions.register_node(kind, extension);
+        self.flow.cache.clear();
+        cx.notify();
+    }
+
+    /// Registers a strongly typed [`TypedBlockExtension`] for `kind` and clears cached layouts.
+    pub fn register_typed_block_extension(
+        &mut self,
+        kind: impl Into<String>,
+        extension: impl TypedBlockExtension + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.extensions.register_typed_block(kind, extension);
+        self.flow.cache.clear();
+        cx.notify();
+    }
+
+    /// Registers a strongly typed [`TypedInlineExtension`] for `kind` and clears cached layouts.
+    pub fn register_typed_inline_extension(
+        &mut self,
+        kind: impl Into<String>,
+        extension: impl TypedInlineExtension + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.extensions.register_typed_inline(kind, extension);
         self.flow.cache.clear();
         cx.notify();
     }
@@ -745,7 +789,7 @@ impl RichDocumentView {
         mut self,
         id: impl Into<String>,
         handler: impl Fn(
-            &serde_json::Value,
+            &CustomPayload,
             &mut Document,
             Option<&DocumentSelection>,
         ) -> CustomCommandResult
@@ -760,7 +804,7 @@ impl RichDocumentView {
         &mut self,
         id: impl Into<String>,
         handler: impl Fn(
-            &serde_json::Value,
+            &CustomPayload,
             &mut Document,
             Option<&DocumentSelection>,
         ) -> CustomCommandResult
@@ -1509,7 +1553,7 @@ impl RichDocumentView {
         let is_code_block = self
             .document
             .find_block(block_id)
-            .is_some_and(|block| matches!(block.kind, BlockKind::CodeBlock { .. }));
+            .is_some_and(|block| block.kind.code_block_data().is_some());
 
         // Multi-line paste outside a code block splits into sibling paragraphs atomically.
         if normalized.contains('\n') && !is_code_block {
@@ -1635,7 +1679,7 @@ impl RichDocumentView {
             }
             let new_block = rich_model::BlockNode::new(
                 new_id,
-                BlockKind::Paragraph(content),
+                BlockKind::paragraph(content),
                 BlockStyle::default(),
             );
             steps.push(Step::InsertBlockIn {
@@ -1930,44 +1974,40 @@ impl RichDocumentView {
         };
         let selection_before = self.selection.clone();
 
-        match block.kind {
-            BlockKind::ListItem {
-                list_id,
-                kind,
-                indent_level,
-                checked,
-                content,
-            } => {
-                if indent_level >= MAX_LIST_INDENT_LEVEL {
-                    return CommandOutcome::NoOp;
-                }
-                let next_level = indent_level + 1;
-                let mut next_style = block.style.clone();
-                next_style.indent_start_pt = 24.0 * (next_level as f32 + 1.0);
-                let Some(transaction) = self.document.build_convert_block_transaction(
-                    block_id,
-                    BlockKind::ListItem {
-                        list_id,
-                        kind,
-                        indent_level: next_level,
-                        checked,
-                        content,
-                    },
-                    next_style,
-                    selection_before.clone(),
-                    selection_before,
-                ) else {
-                    return CommandOutcome::NoOp;
-                };
-                self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
-                CommandOutcome::Executed
+        if let Some(item) = block.kind.list_item_data()
+            && let Some(content) = block.kind.inline_content().cloned()
+        {
+            if item.indent_level >= MAX_LIST_INDENT_LEVEL {
+                return CommandOutcome::NoOp;
             }
-            BlockKind::CodeBlock { .. } => self.execute_insert_text("    ", cx),
-            BlockKind::Paragraph(_) | BlockKind::Heading { .. } => {
-                self.execute_insert_text("\t", cx)
-            }
-            _ => CommandOutcome::NoOp,
+            let next_level = item.indent_level + 1;
+            let mut next_style = block.style.clone();
+            next_style.indent_start_pt = 24.0 * (next_level as f32 + 1.0);
+            let Some(transaction) = self.document.build_convert_block_transaction(
+                block_id,
+                BlockKind::list_item(
+                    item.list_id,
+                    item.kind,
+                    next_level,
+                    item.checked,
+                    content,
+                ),
+                next_style,
+                selection_before.clone(),
+                selection_before,
+            ) else {
+                return CommandOutcome::NoOp;
+            };
+            self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+            return CommandOutcome::Executed;
         }
+        if block.kind.code_block_data().is_some() {
+            return self.execute_insert_text("    ", cx);
+        }
+        if block.kind.inline_content().is_some() {
+            return self.execute_insert_text("\t", cx);
+        }
+        CommandOutcome::NoOp
     }
 
     fn execute_outdent(&mut self, cx: &mut Context<Self>) -> CommandOutcome {
@@ -1987,91 +2027,87 @@ impl RichDocumentView {
         };
         let selection_before = self.selection.clone();
 
-        match block.kind {
-            BlockKind::ListItem {
-                list_id,
-                kind,
-                indent_level,
-                checked,
-                content,
-            } => {
-                let (next_kind, next_style) = if indent_level > 0 {
-                    let next_level = indent_level - 1;
-                    let mut style = block.style.clone();
-                    style.indent_start_pt = 24.0 * (next_level as f32 + 1.0);
-                    (
-                        BlockKind::ListItem {
-                            list_id,
-                            kind,
-                            indent_level: next_level,
-                            checked,
-                            content,
-                        },
-                        style,
-                    )
-                } else {
-                    (BlockKind::Paragraph(content), BlockStyle::default())
-                };
-                let Some(transaction) = self.document.build_convert_block_transaction(
-                    block_id,
-                    next_kind,
-                    next_style,
-                    selection_before.clone(),
-                    selection_before,
-                ) else {
-                    return CommandOutcome::NoOp;
-                };
-                self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
-                CommandOutcome::Executed
-            }
-            BlockKind::CodeBlock { content, .. } => {
-                let offset = focus.offset.min(content.len());
-                let line_start = content.text[..offset]
-                    .rfind('\n')
-                    .map(|index| index + 1)
-                    .unwrap_or(0);
-                let line_slice = content.text.get(line_start..).unwrap_or("");
-                let remove_len = if line_slice.starts_with('\t') {
-                    1
-                } else {
-                    line_slice
-                        .bytes()
-                        .take(4)
-                        .take_while(|&byte| byte == b' ')
-                        .count()
-                };
-                if remove_len == 0 {
-                    return CommandOutcome::NoOp;
-                }
-                let mut next_pos = focus;
-                next_pos.offset = offset.saturating_sub(remove_len).max(line_start);
-                let transaction = Transaction::new(vec![Step::DeleteRange {
-                    block_id,
-                    range: line_start..(line_start + remove_len),
-                }])
-                .with_selections(
-                    selection_before,
-                    Some(DocumentSelection::caret(next_pos, Affinity::Downstream)),
-                );
-                self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
-                CommandOutcome::Executed
-            }
-            BlockKind::Paragraph(_) | BlockKind::Heading { .. } => {
-                if block.style.indent_start_pt <= 0.0 {
-                    return CommandOutcome::NoOp;
-                }
-                let mut next_style = block.style;
-                next_style.indent_start_pt = (next_style.indent_start_pt - 24.0).max(0.0);
-                let transaction = Transaction::new(vec![Step::SetBlockStyle {
-                    block_id,
-                    style: next_style,
-                }])
-                .with_selections(selection_before.clone(), selection_before);
-                self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
-                CommandOutcome::Executed
-            }
-            _ => CommandOutcome::NoOp,
+        if let Some(item) = block.kind.list_item_data()
+            && let Some(content) = block.kind.inline_content().cloned()
+        {
+            let (next_kind, next_style) = if item.indent_level > 0 {
+                let next_level = item.indent_level - 1;
+                let mut style = block.style.clone();
+                style.indent_start_pt = 24.0 * (next_level as f32 + 1.0);
+                (
+                    BlockKind::list_item(
+                        item.list_id,
+                        item.kind,
+                        next_level,
+                        item.checked,
+                        content,
+                    ),
+                    style,
+                )
+            } else {
+                (BlockKind::paragraph(content), BlockStyle::default())
+            };
+            let Some(transaction) = self.document.build_convert_block_transaction(
+                block_id,
+                next_kind,
+                next_style,
+                selection_before.clone(),
+                selection_before,
+            ) else {
+                return CommandOutcome::NoOp;
+            };
+            self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+            return CommandOutcome::Executed;
         }
+        if block.kind.code_block_data().is_some()
+            && let Some(content) = block.kind.inline_content()
+        {
+            let offset = focus.offset.min(content.len());
+            let line_start = content.text[..offset]
+                .rfind('\n')
+                .map(|index| index + 1)
+                .unwrap_or(0);
+            let line_slice = content.text.get(line_start..).unwrap_or("");
+            let remove_len = if line_slice.starts_with('\t') {
+                1
+            } else {
+                line_slice
+                    .bytes()
+                    .take(4)
+                    .take_while(|&byte| byte == b' ')
+                    .count()
+            };
+            if remove_len == 0 {
+                return CommandOutcome::NoOp;
+            }
+            let mut next_pos = focus;
+            next_pos.offset = offset.saturating_sub(remove_len).max(line_start);
+            let transaction = Transaction::new(vec![Step::DeleteRange {
+                block_id,
+                range: line_start..(line_start + remove_len),
+            }])
+            .with_selections(
+                selection_before,
+                Some(DocumentSelection::caret(next_pos, Affinity::Downstream)),
+            );
+            self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+            return CommandOutcome::Executed;
+        }
+        if block.kind.inline_content().is_some() {
+            if block.style.indent_start_pt <= 0.0 {
+                return CommandOutcome::NoOp;
+            }
+            let mut next_style = block.style;
+            next_style.indent_start_pt = (next_style.indent_start_pt - 24.0).max(0.0);
+            let transaction = Transaction::new(vec![Step::SetBlockStyle {
+                block_id,
+                style: next_style,
+            }])
+            .with_selections(selection_before.clone(), selection_before);
+            self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+            return CommandOutcome::Executed;
+        }
+        CommandOutcome::NoOp
     }
 
     fn execute_insert_inline_object(
@@ -2381,27 +2417,28 @@ impl RichDocumentView {
                 continue;
             };
             let align = block.style.align;
-            let mut content = match &block.kind {
-                BlockKind::Paragraph(content)
-                | BlockKind::Heading { content, .. }
-                | BlockKind::ListItem { content, .. } => content.clone(),
-                _ => continue,
+            if block.kind.code_block_data().is_some() {
+                continue;
+            }
+            let Some(mut content) = block.kind.inline_content().cloned() else {
+                continue;
             };
             let has_inline_size = content
                 .spans
                 .iter()
                 .any(|span| span.style.font_size_pt.is_some());
 
-            let already_matches = match (&block.kind, clamped_level) {
-                (BlockKind::Heading { level, .. }, Some(target)) => {
-                    *level == target
+            let already_matches = match clamped_level {
+                Some(target) => {
+                    block.kind.heading_data().is_some_and(|h| h.level == target)
                         && block.style.named_style == Some(StyleId::heading(target))
                         && !has_inline_size
                 }
-                (BlockKind::Paragraph(_), None) => {
-                    block.style.named_style == Some(StyleId::NORMAL) && !has_inline_size
+                None => {
+                    block.kind.is_paragraph()
+                        && block.style.named_style == Some(StyleId::NORMAL)
+                        && !has_inline_size
                 }
-                _ => false,
             };
             if already_matches {
                 continue;
@@ -2417,15 +2454,11 @@ impl RichDocumentView {
 
             let (next_kind, next_style) = match clamped_level {
                 Some(level) => (
-                    BlockKind::Heading {
-                        level,
-                        collapsed: false,
-                        content,
-                    },
+                    BlockKind::heading(level, false, content),
                     BlockStyle::named(StyleId::heading(level)).with_align(align),
                 ),
                 None => (
-                    BlockKind::Paragraph(content),
+                    BlockKind::paragraph(content),
                     BlockStyle::default().with_align(align),
                 ),
             };
@@ -2482,12 +2515,7 @@ impl RichDocumentView {
             .into_iter()
             .filter(|block_id| {
                 self.document.find_block(*block_id).is_some_and(|block| {
-                    matches!(
-                        block.kind,
-                        BlockKind::Paragraph(_)
-                            | BlockKind::Heading { .. }
-                            | BlockKind::ListItem { .. }
-                    )
+                    block.kind.inline_content().is_some() && block.kind.code_block_data().is_none()
                 })
             })
             .collect();
@@ -2497,7 +2525,10 @@ impl RichDocumentView {
 
         let all_already_target = convertible.iter().all(|block_id| {
             self.document.find_block(*block_id).is_some_and(|block| {
-                matches!(block.kind, BlockKind::ListItem { kind, .. } if kind == target_kind)
+                block
+                    .kind
+                    .list_item_data()
+                    .is_some_and(|item| item.kind == target_kind)
             })
         });
 
@@ -2514,22 +2545,18 @@ impl RichDocumentView {
                 continue;
             };
             let align = block.style.align;
-            let (content, existing_indent, existing_checked) = match &block.kind {
-                BlockKind::Paragraph(content) | BlockKind::Heading { content, .. } => {
-                    (content.clone(), 0u8, None)
-                }
-                BlockKind::ListItem {
-                    indent_level,
-                    checked,
-                    content,
-                    ..
-                } => (content.clone(), *indent_level, *checked),
-                _ => continue,
+            let Some(content) = block.kind.inline_content().cloned() else {
+                continue;
             };
+            let (existing_indent, existing_checked) = block
+                .kind
+                .list_item_data()
+                .map(|item| (item.indent_level, item.checked))
+                .unwrap_or((0, None));
 
             let (next_kind, next_style) = if all_already_target {
                 (
-                    BlockKind::Paragraph(content),
+                    BlockKind::paragraph(content),
                     BlockStyle::default().with_align(align),
                 )
             } else {
@@ -2541,13 +2568,13 @@ impl RichDocumentView {
                     _ => None,
                 };
                 (
-                    BlockKind::ListItem {
-                        list_id: shared_list_id,
-                        kind: target_kind,
-                        indent_level: existing_indent,
+                    BlockKind::list_item(
+                        shared_list_id,
+                        target_kind,
+                        existing_indent,
                         checked,
                         content,
-                    },
+                    ),
                     style,
                 )
             };
@@ -2605,7 +2632,7 @@ impl RichDocumentView {
         if self
             .document
             .find_block(first_block_id)
-            .is_some_and(|block| matches!(block.kind, BlockKind::CodeBlock { .. }))
+            .is_some_and(|block| block.kind.code_block_data().is_some())
         {
             let plain = plain_fallback
                 .map(ToOwned::to_owned)
@@ -2726,7 +2753,7 @@ impl RichDocumentView {
                     let tail_id = self.document.alloc_block_id();
                     pasted_nodes.push(BlockNode::new(
                         tail_id,
-                        BlockKind::Paragraph(trailing_after_caret),
+                        BlockKind::paragraph(trailing_after_caret),
                         BlockStyle::default(),
                     ));
                     caret_block_id = tail_id;
@@ -2777,7 +2804,7 @@ impl RichDocumentView {
                 let tail_id = self.document.alloc_block_id();
                 pasted_nodes.push(BlockNode::new(
                     tail_id,
-                    BlockKind::Paragraph(trailing_after_caret.clone()),
+                    BlockKind::paragraph(trailing_after_caret.clone()),
                     BlockStyle::default(),
                 ));
                 caret_block_id = tail_id;
@@ -2843,7 +2870,7 @@ impl RichDocumentView {
     fn execute_custom_command(
         &mut self,
         id: &str,
-        payload: &serde_json::Value,
+        payload: &CustomPayload,
         cx: &mut Context<Self>,
     ) -> CommandOutcome {
         let Some(result) =
@@ -2870,9 +2897,13 @@ impl RichDocumentView {
         block_id: BlockId,
         cx: &mut Context<Self>,
     ) -> CommandOutcome {
-        let Some(BlockKind::CodeBlock { content, .. }) =
-            self.document.find_block(block_id).map(|block| &block.kind)
-        else {
+        let Some(block) = self.document.find_block(block_id) else {
+            return CommandOutcome::NoOp;
+        };
+        if block.kind.code_block_data().is_none() {
+            return CommandOutcome::NoOp;
+        }
+        let Some(content) = block.kind.inline_content() else {
             return CommandOutcome::NoOp;
         };
         cx.write_to_clipboard(ClipboardItem::new_string(content.text.clone()));
@@ -2904,12 +2935,14 @@ impl RichDocumentView {
         block_id: BlockId,
         cx: &mut Context<Self>,
     ) -> CommandOutcome {
-        let Some(BlockKind::ListItem {
-            checked: Some(_), ..
-        }) = self.document.find_block(block_id).map(|block| &block.kind)
-        else {
+        let is_checklist = self
+            .document
+            .find_block(block_id)
+            .and_then(|block| block.kind.list_item_data())
+            .is_some_and(|item| item.checked.is_some());
+        if !is_checklist {
             return CommandOutcome::NoOp;
-        };
+        }
         let selection_before = self.selection.clone();
         let transaction = Transaction::new(vec![Step::ToggleChecklist { block_id }])
             .with_selections(selection_before.clone(), selection_before);
@@ -3292,16 +3325,16 @@ impl RichDocumentView {
         let siblings = self.document.container_blocks(target)?;
         if index > 0
             && let Some(prev) = siblings.get(index - 1)
-            && let BlockKind::ListItem { list_id, kind, .. } = prev.kind
-            && kind == target_kind
+            && let Some(item) = prev.kind.list_item_data()
+            && item.kind == target_kind
         {
-            return Some(list_id);
+            return Some(item.list_id);
         }
         if let Some(next) = siblings.get(index + 1)
-            && let BlockKind::ListItem { list_id, kind, .. } = next.kind
-            && kind == target_kind
+            && let Some(item) = next.kind.list_item_data()
+            && item.kind == target_kind
         {
-            return Some(list_id);
+            return Some(item.list_id);
         }
         None
     }
@@ -3371,20 +3404,22 @@ impl RichDocumentView {
     pub fn active_heading_level(&self) -> Option<u8> {
         let (_, focus, _) = self.active_text_selection()?;
         let block_id = focus.leaf_block_id()?;
-        match self.document.find_block(block_id)?.kind {
-            BlockKind::Heading { level, .. } => Some(level),
-            _ => None,
-        }
+        self.document
+            .find_block(block_id)?
+            .kind
+            .heading_data()
+            .map(|heading| heading.level)
     }
 
     /// Returns the [`ListKind`] when the focused block is a list item, or `None` otherwise.
     pub fn active_list_kind(&self) -> Option<ListKind> {
         let (_, focus, _) = self.active_text_selection()?;
         let block_id = focus.leaf_block_id()?;
-        match self.document.find_block(block_id)?.kind {
-            BlockKind::ListItem { kind, .. } => Some(kind),
-            _ => None,
-        }
+        self.document
+            .find_block(block_id)?
+            .kind
+            .list_item_data()
+            .map(|item| item.kind)
     }
 
     fn execute_clear_formatting(&mut self, cx: &mut Context<Self>) -> CommandOutcome {
@@ -3651,9 +3686,9 @@ impl RichDocumentView {
     pub fn selected_heading_level(&self) -> Option<SelectionValue<Option<u8>>> {
         let block_ids = self.selected_leaf_block_ids();
         let first_id = *block_ids.first()?;
-        let heading_of = |block_id: BlockId| match self.document.find_block(block_id)?.kind {
-            BlockKind::Heading { level, .. } => Some(Some(level)),
-            _ => Some(None),
+        let heading_of = |block_id: BlockId| {
+            let block = self.document.find_block(block_id)?;
+            Some(block.kind.heading_data().map(|heading| heading.level))
         };
         let first_level = heading_of(first_id)?;
         for block_id in block_ids.into_iter().skip(1) {
@@ -3688,9 +3723,7 @@ impl RichDocumentView {
     }
 
     fn first_pos_in_table_cell(&self, table_id: BlockId, cell_coords: (usize, usize)) -> Option<DocPos> {
-        let BlockKind::Table(table) = &self.document.find_block(table_id)?.kind else {
-            return None;
-        };
+        let table = self.document.find_block(table_id)?.kind.table_block()?;
         let (_, placements, occupancy) = table.resolve_grid();
         let placement_idx = occupancy
             .get(cell_coords.0)
@@ -4952,9 +4985,9 @@ fn selection_from_drag_positions(
     {
         let (anchor_visual, focus_visual) = match document
             .find_block(anchor_table)
-            .map(|block| &block.kind)
+            .and_then(|block| block.kind.table_block())
         {
-            Some(BlockKind::Table(table)) => {
+            Some(table) => {
                 let a_col = table
                     .placement_for_stored_cell(anchor_row, anchor_cell_idx)
                     .map(|p| p.visual_col)
@@ -4965,7 +4998,7 @@ fn selection_from_drag_positions(
                     .unwrap_or(focus_cell_idx);
                 ((anchor_row, a_col), (focus_row, f_col))
             }
-            _ => ((anchor_row, anchor_cell_idx), (focus_row, focus_cell_idx)),
+            None => ((anchor_row, anchor_cell_idx), (focus_row, focus_cell_idx)),
         };
         return DocumentSelection::TableCells {
             table_id: anchor_table,
@@ -4998,12 +5031,12 @@ fn last_text_pos_in_nodes(nodes: &[BlockNode]) -> Option<(BlockId, usize)> {
             return Some((node.id, inline.len()));
         }
         match &node.kind {
-            BlockKind::Blockquote(children) => {
+            BlockKind::Container { children, .. } => {
                 if let Some(found) = last_text_pos_in_nodes(children) {
                     return Some(found);
                 }
             }
-            BlockKind::Table(table) => {
+            BlockKind::Grid { table, .. } => {
                 for row in table.rows.iter().rev() {
                     for cell in row.cells.iter().rev() {
                         if let Some(found) = last_text_pos_in_nodes(&cell.blocks) {
@@ -5012,7 +5045,7 @@ fn last_text_pos_in_nodes(nodes: &[BlockNode]) -> Option<(BlockId, usize)> {
                     }
                 }
             }
-            _ => {}
+            BlockKind::Text { .. } | BlockKind::Leaf { .. } => {}
         }
     }
     None

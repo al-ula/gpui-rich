@@ -1298,6 +1298,7 @@ dependencies = [
  "rich-gpui",
  "rich-layout",
  "rich-model",
+ "serde",
  "serde_json",
 ]
 
@@ -5575,6 +5576,7 @@ dependencies = [
  "gpui-kit",
  "rich-layout",
  "rich-model",
+ "serde",
  "serde_json",
  "unicode-segmentation",
 ]

@@ -268,7 +268,7 @@ impl CrdtSyncBridge {
                                     order_key: OrderKey::between(None, None, clock.replica),
                                     block: BlockNode::new(
                                         *block_id,
-                                        crate::block::BlockKind::HorizontalRule,
+                                        crate::block::BlockKind::horizontal_rule(),
                                         crate::style::BlockStyle::default(),
                                     ),
                                     clock: *clock,

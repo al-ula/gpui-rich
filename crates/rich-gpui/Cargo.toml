@@ -13,3 +13,4 @@ rich-model.workspace = true
 rich-layout.workspace = true
 unicode-segmentation.workspace = true
 serde_json.workspace = true
+serde.workspace = true

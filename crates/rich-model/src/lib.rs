@@ -4,6 +4,7 @@ pub mod codec;
 pub mod command;
 pub mod decoration;
 pub mod inline;
+pub mod payload;
 pub mod selection;
 pub mod style;
 pub mod sync;
@@ -15,6 +16,7 @@ pub use codec::*;
 pub use command::*;
 pub use decoration::*;
 pub use inline::*;
+pub use payload::*;
 pub use selection::*;
 pub use style::*;
 pub use sync::*;
@@ -173,7 +175,7 @@ mod tests {
         let quote_child_id = doc.alloc_block_id();
         let quote_child = BlockNode::new(
             quote_child_id,
-            BlockKind::Paragraph(InlineContent::plain("Alpha Beta")),
+            BlockKind::paragraph(InlineContent::plain("Alpha Beta")),
             BlockStyle::default(),
         );
         let quote_id = doc.add_blockquote(vec![quote_child]);
@@ -195,7 +197,7 @@ mod tests {
         assert!(applied_split.change_set.dirty_blocks.contains(&quote_id));
 
         let children = doc
-            .container_blocks(ContainerTarget::Blockquote(quote_id))
+            .container_blocks(ContainerTarget::Container(quote_id))
             .unwrap();
         assert_eq!(children.len(), 2);
         assert_eq!(children[0].kind.inline_content().unwrap().text, "Alpha ");
@@ -213,7 +215,7 @@ mod tests {
         let applied_merge = doc.apply(merge_tx);
         history.push_inverse(applied_merge.inverse);
         assert_eq!(
-            doc.container_blocks(ContainerTarget::Blockquote(quote_id))
+            doc.container_blocks(ContainerTarget::Container(quote_id))
                 .unwrap()
                 .len(),
             1
@@ -231,14 +233,14 @@ mod tests {
         // Undo merge then undo split restores single original paragraph.
         history.undo(&mut doc).unwrap();
         assert_eq!(
-            doc.container_blocks(ContainerTarget::Blockquote(quote_id))
+            doc.container_blocks(ContainerTarget::Container(quote_id))
                 .unwrap()
                 .len(),
             2
         );
         history.undo(&mut doc).unwrap();
         assert_eq!(
-            doc.container_blocks(ContainerTarget::Blockquote(quote_id))
+            doc.container_blocks(ContainerTarget::Container(quote_id))
                 .unwrap()
                 .len(),
             1
@@ -312,14 +314,14 @@ mod tests {
         body.push_text(" ", InlineStyle::default());
         body.push_text("link", InlineStyle::default().with_link("https://gpui.rs"));
         body.push_object(
-            InlineObject::Custom {
-                kind: "badge".into(),
-                data: serde_json::json!({ "text": "v2" }),
-            },
+            InlineObject::custom("badge", CustomPayload::from_json(serde_json::json!({ "text": "v2" }))),
             InlineStyle::default(),
         );
         let paragraph_id = document.add_paragraph(body, BlockStyle::default().with_align(TextAlign::Center));
-        let custom_block_id = document.add_custom_block("callout", serde_json::json!({ "tone": "info" }));
+        let custom_block_id = document.add_custom_block(
+            "callout",
+            CustomPayload::from_json(serde_json::json!({ "tone": "info" })),
+        );
 
         // Verify clearing underline via mapped_spans_in_range + RestoreSpans is reversible.
         let base_style = document.config.default_style.clone();
@@ -390,7 +392,7 @@ mod tests {
             );
             assert!(matches!(
                 content.objects.first().map(|entry| &entry.object),
-                Some(InlineObject::Custom { kind, .. }) if kind == "badge"
+                Some(InlineObject::Custom { kind, .. }) if kind.as_ref() == "badge"
             ));
         } else {
             panic!("expected paragraph block after HTML roundtrip");
@@ -415,12 +417,12 @@ mod tests {
 
         let mutating_custom = RichCommand::Custom {
             id: "app.insert_callout".into(),
-            payload: serde_json::json!({}),
+            payload: CustomPayload::empty(),
             mutates_document: true,
         };
         let readonly_custom = RichCommand::Custom {
             id: "app.inspect_callout".into(),
-            payload: serde_json::json!({}),
+            payload: CustomPayload::empty(),
             mutates_document: false,
         };
         assert_eq!(mutating_custom.command_id(), "app.insert_callout");
@@ -530,7 +532,7 @@ mod tests {
                     cid,
                     vec![BlockNode::new(
                         pid,
-                        BlockKind::Paragraph(InlineContent::plain(format!("R{r}C{c}"))),
+                        BlockKind::paragraph(InlineContent::plain(format!("R{r}C{c}"))),
                         BlockStyle::default(),
                     )],
                 ));
@@ -542,7 +544,7 @@ mod tests {
         }
         doc.push_block(BlockNode::new(
             table_id,
-            BlockKind::Table(TableBlock {
+            BlockKind::table(TableBlock {
                 columns: vec![ColumnSpec::Auto; 2],
                 rows,
                 border_style: TableBorderStyle::default(),
@@ -558,9 +560,7 @@ mod tests {
             .unwrap();
         let applied = doc.apply(merge_tx);
         history.push_inverse(applied.inverse);
-        let BlockKind::Table(merged) = &doc.find_block(table_id).unwrap().kind else {
-            panic!("expected table");
-        };
+        let merged = doc.find_block(table_id).unwrap().kind.table_block().unwrap();
         assert_eq!(merged.rows[0].cells.len(), 1);
         assert_eq!(merged.rows[0].cells[0].colspan, 2);
         assert_eq!(merged.rows[0].cells[0].blocks.len(), 2);
@@ -571,9 +571,7 @@ mod tests {
             .unwrap();
         let applied = doc.apply(insert_col_tx);
         history.push_inverse(applied.inverse);
-        let BlockKind::Table(after_col) = &doc.find_block(table_id).unwrap().kind else {
-            panic!("expected table");
-        };
+        let after_col = doc.find_block(table_id).unwrap().kind.table_block().unwrap();
         assert_eq!(after_col.grid_col_count(), 3);
         assert_eq!(after_col.rows[0].cells[0].colspan, 3);
         assert_eq!(after_col.rows[1].cells.len(), 3);
@@ -584,9 +582,7 @@ mod tests {
             .unwrap();
         let applied = doc.apply(split_tx);
         history.push_inverse(applied.inverse);
-        let BlockKind::Table(after_split) = &doc.find_block(table_id).unwrap().kind else {
-            panic!("expected table");
-        };
+        let after_split = doc.find_block(table_id).unwrap().kind.table_block().unwrap();
         assert_eq!(after_split.rows[0].cells.len(), 3);
         assert_eq!(after_split.rows[0].cells[0].colspan, 1);
 
@@ -596,18 +592,14 @@ mod tests {
             .unwrap();
         let applied = doc.apply(insert_row_tx);
         history.push_inverse(applied.inverse);
-        let BlockKind::Table(after_row) = &doc.find_block(table_id).unwrap().kind else {
-            panic!("expected table");
-        };
+        let after_row = doc.find_block(table_id).unwrap().kind.table_block().unwrap();
         assert_eq!(after_row.rows.len(), 3);
 
         // Undo all 4 operations restores exact 2x2 table.
         for _ in 0..4 {
             history.undo(&mut doc).unwrap();
         }
-        let BlockKind::Table(restored) = &doc.find_block(table_id).unwrap().kind else {
-            panic!("expected table");
-        };
+        let restored = doc.find_block(table_id).unwrap().kind.table_block().unwrap();
         assert_eq!(restored.rows.len(), 2);
         assert_eq!(restored.rows[0].cells.len(), 2);
         assert_eq!(restored.rows[0].cells[0].colspan, 1);
@@ -641,13 +633,14 @@ mod tests {
             block_id: task_id,
         }]));
         history.push_inverse(toggle.inverse);
-        assert!(matches!(
-            doc.find_block(task_id).unwrap().kind,
-            BlockKind::ListItem {
-                checked: Some(true),
-                ..
-            }
-        ));
+        assert_eq!(
+            doc.find_block(task_id)
+                .unwrap()
+                .kind
+                .list_item_data()
+                .and_then(|item| item.checked),
+            Some(true)
+        );
 
         let resize = doc.apply(Transaction::new(vec![Step::UpdateInlineObject {
             block_id: para_id,
@@ -679,13 +672,14 @@ mod tests {
 
         history.undo(&mut doc).unwrap();
         history.undo(&mut doc).unwrap();
-        assert!(matches!(
-            doc.find_block(task_id).unwrap().kind,
-            BlockKind::ListItem {
-                checked: Some(false),
-                ..
-            }
-        ));
+        assert_eq!(
+            doc.find_block(task_id)
+                .unwrap()
+                .kind
+                .list_item_data()
+                .and_then(|item| item.checked),
+            Some(false)
+        );
         assert!(matches!(
             doc.find_block(para_id)
                 .unwrap()
@@ -726,25 +720,26 @@ fn main() {}
 ---";
         let decoded = registry.decode_as("markdown", source_md).unwrap();
         assert_eq!(decoded.blocks.len(), 8);
-        assert!(matches!(decoded.blocks[0].kind, BlockKind::Heading { level: 1, .. }));
+        assert_eq!(decoded.blocks[0].kind.heading_data().map(|h| h.level), Some(1));
         assert!(matches!(
-            decoded.blocks[2].kind,
-            BlockKind::ListItem {
+            decoded.blocks[2].kind.list_item_data(),
+            Some(ListItemData {
                 kind: ListKind::Checklist,
                 checked: Some(true),
                 ..
-            }
+            })
         ));
-        assert!(matches!(decoded.blocks[4].kind, BlockKind::Blockquote(_)));
-        assert!(matches!(
-            decoded.blocks[5].kind,
-            BlockKind::CodeBlock {
-                language: Some(ref lang),
-                ..
-            } if lang == "rust"
-        ));
-        assert!(matches!(decoded.blocks[6].kind, BlockKind::Table(_)));
-        assert!(matches!(decoded.blocks[7].kind, BlockKind::HorizontalRule));
+        assert!(decoded.blocks[4].kind.is_blockquote());
+        assert_eq!(
+            decoded.blocks[5]
+                .kind
+                .code_block_data()
+                .and_then(|code| code.language.clone())
+                .as_deref(),
+            Some("rust")
+        );
+        assert!(decoded.blocks[6].kind.is_builtin_table());
+        assert!(decoded.blocks[7].kind.is_horizontal_rule());
 
         let reencoded_md = registry.encode_as("markdown", &decoded).unwrap();
         let reparsed_md = registry.decode_as("markdown", &reencoded_md).unwrap();
@@ -768,7 +763,7 @@ fn main() {}
         // Replica A edits p1 and appends block 100.
         let new_a = BlockNode::new(
             BlockId(100),
-            BlockKind::Paragraph(InlineContent::plain("From A")),
+            BlockKind::paragraph(InlineContent::plain("From A")),
             BlockStyle::default(),
         );
         let applied_a = doc_a.apply(Transaction::new(vec![
@@ -789,7 +784,7 @@ fn main() {}
         // Replica B concurrently edits p1 and appends block 200.
         let new_b = BlockNode::new(
             BlockId(200),
-            BlockKind::Paragraph(InlineContent::plain("From B")),
+            BlockKind::paragraph(InlineContent::plain("From B")),
             BlockStyle::default(),
         );
         let applied_b = doc_b.apply(Transaction::new(vec![
@@ -843,5 +838,57 @@ fn main() {}
             .collect();
         assert_eq!(texts_a, texts_b);
         assert_eq!(texts_a.len(), 3);
+    }
+
+    #[test]
+    fn custom_payload_typed_raw_roundtrip_and_custom_container_editing() {
+        #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct CalloutMeta {
+            title: String,
+            tone: String,
+        }
+
+        let meta = CalloutMeta {
+            title: "Note".into(),
+            tone: "info".into(),
+        };
+        let typed = CustomPayload::typed(meta.clone());
+        assert_eq!(typed.downcast_ref::<CalloutMeta>(), Some(&meta));
+
+        let mut doc = Document::new();
+        let child_id = doc.alloc_block_id();
+        let child = BlockNode::new(
+            child_id,
+            BlockKind::paragraph(InlineContent::plain("First Second")),
+            BlockStyle::default(),
+        );
+        let container_id = doc.add_custom_container("callout", typed, vec![child]);
+
+        // JSON round-trip turns Typed payload into Raw while preserving Document equality and lazy decoding.
+        let json = doc.to_json_pretty().unwrap();
+        let parsed = Document::from_json(&json).unwrap();
+        assert_eq!(doc, parsed);
+        let raw_payload = parsed.find_block(container_id).unwrap().kind.data();
+        assert!(!raw_payload.is_typed());
+        assert_eq!(
+            raw_payload.as_typed::<CalloutMeta>().as_deref(),
+            Some(&meta)
+        );
+
+        // Splitting a paragraph inside a custom Container updates container children and bumps ancestor version.
+        let before_version = doc.find_block(container_id).unwrap().version;
+        let split_pos = doc.doc_pos_for_block(child_id, 6).unwrap();
+        let split_tx = doc
+            .build_split_block_transaction(&split_pos, None)
+            .unwrap();
+        let applied = doc.apply(split_tx);
+        assert!(doc.find_block(container_id).unwrap().version > before_version);
+        assert!(applied.change_set.dirty_blocks.contains(&container_id));
+        let children = doc
+            .container_blocks(ContainerTarget::Container(container_id))
+            .unwrap();
+        assert_eq!(children.len(), 2);
+        assert_eq!(children[0].kind.inline_content().unwrap().text, "First ");
+        assert_eq!(children[1].kind.inline_content().unwrap().text, "Second");
     }
 }

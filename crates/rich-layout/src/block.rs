@@ -1,9 +1,10 @@
-use crate::geometry::{Point, Rect, pt_to_px};
+use crate::geometry::{Insets, Point, Rect, pt_to_px};
 use crate::line::{HitResult, ParagraphLayout, layout_paragraph};
 use crate::shaper::{GlyphBackend, TextShaper};
 use rich_model::{
-    BlockId, BlockKind, BlockNode, CellVAlign, ColumnSpec, DocumentLayoutConfig, ListKind,
-    NumberStyle, RgbaColor, StyleSheet, TableBlock, TableBorderStyle,
+    BlockId, BlockKind, BlockNode, CellVAlign, ColumnSpec, CustomPayload, DocumentLayoutConfig,
+    ListKind, NumberStyle, RgbaColor, SharedStr, StyleSheet, TableBlock, TableBorderStyle,
+    block_kinds,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -72,9 +73,32 @@ pub enum BlockLayoutKind<B: GlyphBackend> {
     HorizontalRule {
         rule_y: f32,
     },
-    Custom {
-        kind: String,
-        data: serde_json::Value,
+    CustomText {
+        kind: SharedStr,
+        data: CustomPayload,
+        bounds: Rect,
+        chrome: Insets,
+        content_origin: Point,
+        paragraph: ParagraphLayout<B>,
+    },
+    CustomContainer {
+        kind: SharedStr,
+        data: CustomPayload,
+        bounds: Rect,
+        chrome: Insets,
+        children: Vec<PlacedChildBlock<B>>,
+    },
+    CustomGrid {
+        kind: SharedStr,
+        data: CustomPayload,
+        bounds: Rect,
+        chrome: Insets,
+        content_origin: Point,
+        table: TableLayout<B>,
+    },
+    CustomLeaf {
+        kind: SharedStr,
+        data: CustomPayload,
         bounds: Rect,
     },
 }
@@ -96,17 +120,39 @@ impl<B: GlyphBackend> BlockLayout<B> {
             BlockLayoutKind::Paragraph(p)
             | BlockLayoutKind::Heading { paragraph: p, .. }
             | BlockLayoutKind::ListItem { paragraph: p, .. }
-            | BlockLayoutKind::CodeBlock { paragraph: p, .. } => Some(p),
+            | BlockLayoutKind::CodeBlock { paragraph: p, .. }
+            | BlockLayoutKind::CustomText { paragraph: p, .. } => Some(p),
             BlockLayoutKind::Blockquote { .. }
+            | BlockLayoutKind::CustomContainer { .. }
             | BlockLayoutKind::Table(_)
+            | BlockLayoutKind::CustomGrid { .. }
             | BlockLayoutKind::HorizontalRule { .. }
-            | BlockLayoutKind::Custom { .. } => None,
+            | BlockLayoutKind::CustomLeaf { .. } => None,
+        }
+    }
+
+    pub fn children(&self) -> Option<&[PlacedChildBlock<B>]> {
+        match &self.kind {
+            BlockLayoutKind::Blockquote { children, .. }
+            | BlockLayoutKind::CustomContainer { children, .. } => Some(children),
+            _ => None,
+        }
+    }
+
+    pub fn table_layout(&self) -> Option<&TableLayout<B>> {
+        match &self.kind {
+            BlockLayoutKind::Table(table) | BlockLayoutKind::CustomGrid { table, .. } => {
+                Some(table)
+            }
+            _ => None,
         }
     }
 
     pub fn content_origin(&self) -> Point {
         match &self.kind {
-            BlockLayoutKind::CodeBlock { content_origin, .. } => *content_origin,
+            BlockLayoutKind::CodeBlock { content_origin, .. }
+            | BlockLayoutKind::CustomText { content_origin, .. }
+            | BlockLayoutKind::CustomGrid { content_origin, .. } => *content_origin,
             _ => Point::new(0.0, 0.0),
         }
     }
@@ -235,207 +281,314 @@ pub fn layout_block<S: TextShaper>(
     let space_after_px = pt_to_px(block.style.resolved_space_after(sheet), zoom);
 
     match &block.kind {
-        BlockKind::Paragraph(content) => {
-            let para = layout_paragraph(content, &block.style, sheet, config, max_width, zoom, shaper);
-            let height = para.height;
-            BlockLayout {
-                id: block.id,
-                version: block.version,
-                width: max_width,
-                height,
-                space_before_px,
-                space_after_px,
-                kind: BlockLayoutKind::Paragraph(para),
-            }
-        }
-        BlockKind::Heading {
-            level,
-            collapsed,
-            content,
-        } => {
-            let para = layout_paragraph(content, &block.style, sheet, config, max_width, zoom, shaper);
-            let height = para.height;
-            let chevron_size = pt_to_px(16.0, zoom);
-            let first_line_center = para
-                .lines
-                .first()
-                .map(|line| line.baseline_y - line.ascent * 0.38)
-                .unwrap_or(height * 0.5);
-            let chevron_rect = Rect::new(
-                -chevron_size - pt_to_px(4.0, zoom),
-                first_line_center - chevron_size * 0.5,
-                chevron_size,
-                chevron_size,
-            );
-            BlockLayout {
-                id: block.id,
-                version: block.version,
-                width: max_width,
-                height,
-                space_before_px,
-                space_after_px,
-                kind: BlockLayoutKind::Heading {
-                    level: *level,
-                    collapsed: *collapsed,
-                    chevron_rect,
-                    paragraph: para,
-                },
-            }
-        }
-        BlockKind::ListItem {
+        BlockKind::Text {
             kind,
-            indent_level,
-            checked,
+            data,
             content,
-            ..
-        } => {
-            let para = layout_paragraph(content, &block.style, sheet, config, max_width, zoom, shaper);
-            let height = para.height;
-            let marker = list_marker.map(str::to_string).unwrap_or_else(|| {
-                default_list_marker(*kind, *indent_level, 1, *checked)
-            });
-            let indent_start = pt_to_px(block.style.indent_start_pt, zoom);
-            let gutter_x = (indent_start - pt_to_px(18.0, zoom)).max(0.0);
-            let baseline_y = para
-                .lines
-                .first()
-                .map(|line| line.baseline_y)
-                .unwrap_or(pt_to_px(11.0, zoom));
-            let checkbox_rect = checked.map(|_| {
-                let box_size = pt_to_px(10.5, zoom);
-                let center_y = para
+        } => match kind.as_ref() {
+            block_kinds::PARAGRAPH => {
+                let para =
+                    layout_paragraph(content, &block.style, sheet, config, max_width, zoom, shaper);
+                let height = para.height;
+                BlockLayout {
+                    id: block.id,
+                    version: block.version,
+                    width: max_width,
+                    height,
+                    space_before_px,
+                    space_after_px,
+                    kind: BlockLayoutKind::Paragraph(para),
+                }
+            }
+            block_kinds::HEADING => {
+                let heading = block.kind.heading_data().unwrap_or(rich_model::HeadingData {
+                    level: 1,
+                    collapsed: false,
+                });
+                let para =
+                    layout_paragraph(content, &block.style, sheet, config, max_width, zoom, shaper);
+                let height = para.height;
+                let chevron_size = pt_to_px(16.0, zoom);
+                let first_line_center = para
                     .lines
                     .first()
                     .map(|line| line.baseline_y - line.ascent * 0.38)
-                    .unwrap_or(baseline_y - box_size * 0.5);
-                Rect::new(gutter_x, center_y - box_size * 0.5, box_size, box_size)
-            });
-            BlockLayout {
-                id: block.id,
-                version: block.version,
-                width: max_width,
-                height,
-                space_before_px,
-                space_after_px,
-                kind: BlockLayoutKind::ListItem {
-                    marker,
-                    checked: *checked,
-                    marker_origin: Point::new(gutter_x, baseline_y),
-                    checkbox_rect,
-                    paragraph: para,
-                },
-            }
-        }
-        BlockKind::Blockquote(children) => {
-            let indent_px = pt_to_px(block.style.indent_start_pt.max(14.0), zoom);
-            let child_max_w = (max_width - indent_px).max(40.0);
-            let mut placed = Vec::with_capacity(children.len());
-            let mut y = 0.0f32;
-            let mut prev_after = 0.0f32;
-
-            for (i, child) in children.iter().enumerate() {
-                let child_layout =
-                    cache.get_or_layout(child, None, sheet, config, child_max_w, zoom, shaper);
-                if i > 0 {
-                    y += prev_after.max(child_layout.space_before_px);
+                    .unwrap_or(height * 0.5);
+                let chevron_rect = Rect::new(
+                    -chevron_size - pt_to_px(4.0, zoom),
+                    first_line_center - chevron_size * 0.5,
+                    chevron_size,
+                    chevron_size,
+                );
+                BlockLayout {
+                    id: block.id,
+                    version: block.version,
+                    width: max_width,
+                    height,
+                    space_before_px,
+                    space_after_px,
+                    kind: BlockLayoutKind::Heading {
+                        level: heading.level,
+                        collapsed: heading.collapsed,
+                        chevron_rect,
+                        paragraph: para,
+                    },
                 }
-                let ch = child_layout.height;
-                prev_after = child_layout.space_after_px;
-                placed.push(PlacedChildBlock {
-                    x: indent_px,
-                    y,
-                    layout: child_layout,
+            }
+            block_kinds::LIST_ITEM => {
+                let item = block.kind.list_item_data().unwrap_or(rich_model::ListItemData {
+                    list_id: rich_model::ListId(1),
+                    kind: ListKind::Bullet,
+                    indent_level: 0,
+                    checked: None,
                 });
-                y += ch;
+                let para =
+                    layout_paragraph(content, &block.style, sheet, config, max_width, zoom, shaper);
+                let height = para.height;
+                let marker = list_marker.map(str::to_string).unwrap_or_else(|| {
+                    default_list_marker(item.kind, item.indent_level, 1, item.checked)
+                });
+                let indent_start = pt_to_px(block.style.indent_start_pt, zoom);
+                let gutter_x = (indent_start - pt_to_px(18.0, zoom)).max(0.0);
+                let baseline_y = para
+                    .lines
+                    .first()
+                    .map(|line| line.baseline_y)
+                    .unwrap_or(pt_to_px(11.0, zoom));
+                let checkbox_rect = item.checked.map(|_| {
+                    let box_size = pt_to_px(10.5, zoom);
+                    let center_y = para
+                        .lines
+                        .first()
+                        .map(|line| line.baseline_y - line.ascent * 0.38)
+                        .unwrap_or(baseline_y - box_size * 0.5);
+                    Rect::new(gutter_x, center_y - box_size * 0.5, box_size, box_size)
+                });
+                BlockLayout {
+                    id: block.id,
+                    version: block.version,
+                    width: max_width,
+                    height,
+                    space_before_px,
+                    space_after_px,
+                    kind: BlockLayoutKind::ListItem {
+                        marker,
+                        checked: item.checked,
+                        marker_origin: Point::new(gutter_x, baseline_y),
+                        checkbox_rect,
+                        paragraph: para,
+                    },
+                }
             }
-            let total_h = y.max(pt_to_px(16.0, zoom));
-            let bar_w = pt_to_px(3.0, zoom).max(2.0);
-            BlockLayout {
-                id: block.id,
-                version: block.version,
-                width: max_width,
-                height: total_h,
-                space_before_px,
-                space_after_px,
-                kind: BlockLayoutKind::Blockquote {
-                    bar_rect: Rect::new(0.0, 0.0, bar_w, total_h),
-                    children: placed,
-                },
+            block_kinds::CODE_BLOCK => {
+                let language = block
+                    .kind
+                    .code_block_data()
+                    .and_then(|code| code.language.clone());
+                let pad_x = pt_to_px(12.0, zoom);
+                let pad_y = pt_to_px(10.0, zoom);
+                let header_h = pt_to_px(20.0, zoom);
+                let inner_w = (max_width - 2.0 * pad_x).max(40.0);
+                let para =
+                    layout_paragraph(content, &block.style, sheet, config, inner_w, zoom, shaper);
+                let total_h = header_h + para.height + 2.0 * pad_y;
+                let button_w = pt_to_px(44.0, zoom);
+                let button_h = pt_to_px(15.0, zoom);
+                let copy_button_rect = Rect::new(
+                    (max_width - button_w - pt_to_px(8.0, zoom)).max(pt_to_px(4.0, zoom)),
+                    pt_to_px(4.5, zoom),
+                    button_w,
+                    button_h,
+                );
+                BlockLayout {
+                    id: block.id,
+                    version: block.version,
+                    width: max_width,
+                    height: total_h,
+                    space_before_px,
+                    space_after_px,
+                    kind: BlockLayoutKind::CodeBlock {
+                        language,
+                        frame_rect: Rect::new(0.0, 0.0, max_width, total_h),
+                        copy_button_rect,
+                        content_origin: Point::new(pad_x, header_h + pad_y),
+                        paragraph: para,
+                    },
+                }
+            }
+            _ => {
+                let chrome = shaper.measure_custom_chrome(kind, data, max_width, zoom);
+                let inner_w = (max_width - chrome.horizontal()).max(40.0);
+                let para =
+                    layout_paragraph(content, &block.style, sheet, config, inner_w, zoom, shaper);
+                let total_h = (chrome.top + para.height + chrome.bottom).max(1.0);
+                BlockLayout {
+                    id: block.id,
+                    version: block.version,
+                    width: max_width,
+                    height: total_h,
+                    space_before_px,
+                    space_after_px,
+                    kind: BlockLayoutKind::CustomText {
+                        kind: kind.clone(),
+                        data: data.clone(),
+                        bounds: Rect::new(0.0, 0.0, max_width, total_h),
+                        chrome,
+                        content_origin: Point::new(chrome.left, chrome.top),
+                        paragraph: para,
+                    },
+                }
+            }
+        },
+        BlockKind::Container {
+            kind,
+            data,
+            children,
+        } => {
+            if kind.as_ref() == block_kinds::BLOCKQUOTE {
+                let indent_px = pt_to_px(block.style.indent_start_pt.max(14.0), zoom);
+                let child_max_w = (max_width - indent_px).max(40.0);
+                let mut placed = Vec::with_capacity(children.len());
+                let mut y = 0.0f32;
+                let mut prev_after = 0.0f32;
+
+                for (i, child) in children.iter().enumerate() {
+                    let child_layout =
+                        cache.get_or_layout(child, None, sheet, config, child_max_w, zoom, shaper);
+                    if i > 0 {
+                        y += prev_after.max(child_layout.space_before_px);
+                    }
+                    let ch = child_layout.height;
+                    prev_after = child_layout.space_after_px;
+                    placed.push(PlacedChildBlock {
+                        x: indent_px,
+                        y,
+                        layout: child_layout,
+                    });
+                    y += ch;
+                }
+                let total_h = y.max(pt_to_px(16.0, zoom));
+                let bar_w = pt_to_px(3.0, zoom).max(2.0);
+                BlockLayout {
+                    id: block.id,
+                    version: block.version,
+                    width: max_width,
+                    height: total_h,
+                    space_before_px,
+                    space_after_px,
+                    kind: BlockLayoutKind::Blockquote {
+                        bar_rect: Rect::new(0.0, 0.0, bar_w, total_h),
+                        children: placed,
+                    },
+                }
+            } else {
+                let chrome = shaper.measure_custom_chrome(kind, data, max_width, zoom);
+                let child_max_w = (max_width - chrome.horizontal()).max(40.0);
+                let mut placed = Vec::with_capacity(children.len());
+                let mut y = chrome.top;
+                let mut prev_after = 0.0f32;
+
+                for (i, child) in children.iter().enumerate() {
+                    let child_layout =
+                        cache.get_or_layout(child, None, sheet, config, child_max_w, zoom, shaper);
+                    if i > 0 {
+                        y += prev_after.max(child_layout.space_before_px);
+                    }
+                    let ch = child_layout.height;
+                    prev_after = child_layout.space_after_px;
+                    placed.push(PlacedChildBlock {
+                        x: chrome.left,
+                        y,
+                        layout: child_layout,
+                    });
+                    y += ch;
+                }
+                let min_h = chrome.vertical() + pt_to_px(16.0, zoom);
+                let total_h = (y + chrome.bottom).max(min_h);
+                BlockLayout {
+                    id: block.id,
+                    version: block.version,
+                    width: max_width,
+                    height: total_h,
+                    space_before_px,
+                    space_after_px,
+                    kind: BlockLayoutKind::CustomContainer {
+                        kind: kind.clone(),
+                        data: data.clone(),
+                        bounds: Rect::new(0.0, 0.0, max_width, total_h),
+                        chrome,
+                        children: placed,
+                    },
+                }
             }
         }
-        BlockKind::CodeBlock { language, content } => {
-            let pad_x = pt_to_px(12.0, zoom);
-            let pad_y = pt_to_px(10.0, zoom);
-            let header_h = pt_to_px(20.0, zoom);
-            let inner_w = (max_width - 2.0 * pad_x).max(40.0);
-            let para = layout_paragraph(content, &block.style, sheet, config, inner_w, zoom, shaper);
-            let total_h = header_h + para.height + 2.0 * pad_y;
-            let button_w = pt_to_px(44.0, zoom);
-            let button_h = pt_to_px(15.0, zoom);
-            let copy_button_rect = Rect::new(
-                (max_width - button_w - pt_to_px(8.0, zoom)).max(pt_to_px(4.0, zoom)),
-                pt_to_px(4.5, zoom),
-                button_w,
-                button_h,
-            );
-            BlockLayout {
-                id: block.id,
-                version: block.version,
-                width: max_width,
-                height: total_h,
-                space_before_px,
-                space_after_px,
-                kind: BlockLayoutKind::CodeBlock {
-                    language: language.clone(),
-                    frame_rect: Rect::new(0.0, 0.0, max_width, total_h),
-                    copy_button_rect,
-                    content_origin: Point::new(pad_x, header_h + pad_y),
-                    paragraph: para,
-                },
+        BlockKind::Grid { kind, data, table } => {
+            if kind.as_ref() == block_kinds::TABLE {
+                let t_layout = layout_table(table, sheet, config, max_width, zoom, cache, shaper);
+                let total_h = t_layout.total_height;
+                let total_w = t_layout.total_width;
+                BlockLayout {
+                    id: block.id,
+                    version: block.version,
+                    width: total_w,
+                    height: total_h,
+                    space_before_px: space_before_px.max(pt_to_px(6.0, zoom)),
+                    space_after_px: space_after_px.max(pt_to_px(10.0, zoom)),
+                    kind: BlockLayoutKind::Table(t_layout),
+                }
+            } else {
+                let chrome = shaper.measure_custom_chrome(kind, data, max_width, zoom);
+                let inner_w = (max_width - chrome.horizontal()).max(40.0);
+                let t_layout = layout_table(table, sheet, config, inner_w, zoom, cache, shaper);
+                let total_w = (t_layout.total_width + chrome.horizontal()).max(max_width);
+                let total_h = (chrome.top + t_layout.total_height + chrome.bottom).max(1.0);
+                BlockLayout {
+                    id: block.id,
+                    version: block.version,
+                    width: total_w,
+                    height: total_h,
+                    space_before_px: space_before_px.max(pt_to_px(6.0, zoom)),
+                    space_after_px: space_after_px.max(pt_to_px(10.0, zoom)),
+                    kind: BlockLayoutKind::CustomGrid {
+                        kind: kind.clone(),
+                        data: data.clone(),
+                        bounds: Rect::new(0.0, 0.0, total_w, total_h),
+                        chrome,
+                        content_origin: Point::new(chrome.left, chrome.top),
+                        table: t_layout,
+                    },
+                }
             }
         }
-        BlockKind::Table(table) => {
-            let t_layout = layout_table(table, sheet, config, max_width, zoom, cache, shaper);
-            let total_h = t_layout.total_height;
-            let total_w = t_layout.total_width;
-            BlockLayout {
-                id: block.id,
-                version: block.version,
-                width: total_w,
-                height: total_h,
-                space_before_px: space_before_px.max(pt_to_px(6.0, zoom)),
-                space_after_px: space_after_px.max(pt_to_px(10.0, zoom)),
-                kind: BlockLayoutKind::Table(t_layout),
-            }
-        }
-        BlockKind::HorizontalRule => {
-            let h = pt_to_px(12.0, zoom);
-            BlockLayout {
-                id: block.id,
-                version: block.version,
-                width: max_width,
-                height: h,
-                space_before_px,
-                space_after_px,
-                kind: BlockLayoutKind::HorizontalRule { rule_y: h * 0.5 },
-            }
-        }
-        BlockKind::Custom { kind, data } => {
-            let measured = shaper.measure_custom_block(kind, data, max_width, zoom);
-            let width = measured.width.clamp(1.0, max_width.max(1.0));
-            let height = measured.height.max(1.0);
-            BlockLayout {
-                id: block.id,
-                version: block.version,
-                width,
-                height,
-                space_before_px,
-                space_after_px,
-                kind: BlockLayoutKind::Custom {
-                    kind: kind.clone(),
-                    data: data.clone(),
-                    bounds: Rect::new(0.0, 0.0, width, height),
-                },
+        BlockKind::Leaf { kind, data } => {
+            if kind.as_ref() == block_kinds::HORIZONTAL_RULE {
+                let h = pt_to_px(12.0, zoom);
+                BlockLayout {
+                    id: block.id,
+                    version: block.version,
+                    width: max_width,
+                    height: h,
+                    space_before_px,
+                    space_after_px,
+                    kind: BlockLayoutKind::HorizontalRule { rule_y: h * 0.5 },
+                }
+            } else {
+                let measured = shaper.measure_custom_block(kind, data, max_width, zoom);
+                let width = measured.width.clamp(1.0, max_width.max(1.0));
+                let height = measured.height.max(1.0);
+                BlockLayout {
+                    id: block.id,
+                    version: block.version,
+                    width,
+                    height,
+                    space_before_px,
+                    space_after_px,
+                    kind: BlockLayoutKind::CustomLeaf {
+                        kind: kind.clone(),
+                        data: data.clone(),
+                        bounds: Rect::new(0.0, 0.0, width, height),
+                    },
+                }
             }
         }
     }

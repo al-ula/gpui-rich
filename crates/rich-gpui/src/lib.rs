@@ -14,7 +14,8 @@ pub use asset::{
 pub use element::RichDocumentElement;
 pub use extension::{
     CustomBlockRenderContext, CustomCommandHandler, CustomCommandResult, CustomInlineRenderContext,
-    CustomRenderOutput, DirectPaintCallback, ExtensionRegistry, NodeExtension,
+    CustomRenderOutput, DirectPaintCallback, ExtensionRegistry, NodeExtension, TypedBlockExtension,
+    TypedBlockRenderContext, TypedInlineExtension, TypedInlineRenderContext,
 };
 pub use shaper::{
     FontResolver, GpuiGlyphBackend, GpuiShaper, clear_font_resolution_cache, resolve_font_family,

@@ -1,0 +1,12 @@
+{
+  "version": 2,
+  "skills": {
+    "repin": {
+      "source": "al-ula/repin",
+      "commit": "89088fbb7808e0c30126accb1f260f9d9a06bd8c",
+      "sourceType": "github",
+      "skillPath": "skills/repin/SKILL.md",
+      "computedHash": "29d0b297b4c14bb2433553a3e11a5bb09d3dcea970a19b2d8ff629ca53bb0e2a"
+    }
+  }
+}

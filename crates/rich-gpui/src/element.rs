@@ -22,13 +22,14 @@ use gpui_kit::{
     div, fill, outline, point, px, quad, size,
 };
 use rich_layout::{
-    BlockLayout, BlockLayoutKind, HorizontalMetrics, InlineBoxFragment, LineFragment,
+    BlockLayout, BlockLayoutKind, HorizontalMetrics, InlineBoxFragment, Insets, LineFragment,
     ParagraphLayout, Rect, TextFragment, VisibleBlock, collect_visible_leaf_paragraphs, pt_to_px,
     resolve_horizontal_metrics,
 };
 use rich_model::{
-    Affinity, BlockDecorations, BlockId, ChipKind, DecorationContext, DocumentSelection,
-    InlineDecoration, InlineObject, InlineObjectId, OverlayDecoration, RgbaColor, UnderlineKind,
+    Affinity, BlockDecorations, BlockId, ChipKind, CustomPayload, DecorationContext,
+    DocumentSelection, InlineDecoration, InlineObject, InlineObjectId, OverlayDecoration,
+    RgbaColor, SharedStr, UnderlineKind,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -82,19 +83,26 @@ enum PrepaintDecorationOverlay {
 
 struct PendingCustomBlock {
     block_id: BlockId,
-    kind: String,
-    data: serde_json::Value,
+    kind: SharedStr,
+    data: CustomPayload,
     canvas_rect: Rect,
+    chrome: Insets,
+    is_chrome: bool,
     extension: Rc<dyn NodeExtension>,
 }
 
 struct PendingCustomInline {
     block_id: BlockId,
     object_id: InlineObjectId,
-    kind: String,
-    data: serde_json::Value,
+    kind: SharedStr,
+    data: CustomPayload,
     canvas_rect: Rect,
     extension: Rc<dyn NodeExtension>,
+}
+
+enum PrepaintedCustomChrome {
+    Element(Bounds<Pixels>, AnyElement),
+    DirectPaint(Bounds<Pixels>, DirectPaintCallback),
 }
 
 struct SelectedImageOverlay {
@@ -124,6 +132,7 @@ pub struct RichPrepaintState {
     popover_element: Option<AnyElement>,
     handled_custom_blocks: HashSet<BlockId>,
     handled_custom_inlines: HashSet<(BlockId, InlineObjectId)>,
+    chrome_custom_nodes: HashMap<BlockId, PrepaintedCustomChrome>,
     hosted_custom_elements: Vec<(Bounds<Pixels>, AnyElement)>,
     direct_custom_paints: Vec<(Bounds<Pixels>, DirectPaintCallback)>,
     caret_rect: Option<Rect>,
@@ -553,10 +562,6 @@ impl Element for RichDocumentElement {
             )
         });
 
-        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
-
-        // Prepaint hosted GPUI `AnyElement` children after the document hitbox so interactive widgets
-        // receive pointer events above the document canvas.
         let origin_x: f32 = bounds.origin.x.into();
         let origin_y: f32 = bounds.origin.y.into();
         let rect_to_bounds = |canvas_rect: Rect| -> Bounds<Pixels> {
@@ -571,16 +576,59 @@ impl Element for RichDocumentElement {
 
         let mut handled_custom_blocks = HashSet::new();
         let mut handled_custom_inlines = HashSet::new();
+        let mut chrome_custom_nodes = HashMap::new();
         let mut hosted_custom_elements = Vec::new();
         let mut direct_custom_paints = Vec::new();
+        let mut foreground_custom_blocks = Vec::new();
 
+        // Prepaint Layer 1 custom chrome elements before the document hitbox so clicks inside
+        // custom text, container, and grid blocks hit the document canvas for text selection and editing.
         for custom_block in pending_custom_blocks {
+            if !custom_block.is_chrome {
+                foreground_custom_blocks.push(custom_block);
+                continue;
+            }
             let node_bounds = rect_to_bounds(custom_block.canvas_rect);
             let render_context = CustomBlockRenderContext {
                 block_id: custom_block.block_id,
                 kind: &custom_block.kind,
                 data: &custom_block.data,
                 bounds: node_bounds,
+                chrome: custom_block.chrome,
+                zoom,
+                theme: &theme,
+            };
+            if let Some(output) = custom_block.extension.render_block(render_context, window, cx) {
+                handled_custom_blocks.insert(custom_block.block_id);
+                let prepainted = match output {
+                    CustomRenderOutput::Element(mut element) => {
+                        let available = size(
+                            AvailableSpace::Definite(node_bounds.size.width),
+                            AvailableSpace::Definite(node_bounds.size.height),
+                        );
+                        element.prepaint_as_root(node_bounds.origin, available, window, cx);
+                        PrepaintedCustomChrome::Element(node_bounds, element)
+                    }
+                    CustomRenderOutput::DirectPaint(callback) => {
+                        PrepaintedCustomChrome::DirectPaint(node_bounds, callback)
+                    }
+                };
+                chrome_custom_nodes.insert(custom_block.block_id, prepainted);
+            }
+        }
+
+        let hitbox = window.insert_hitbox(bounds, HitboxBehavior::Normal);
+
+        // Prepaint hosted GPUI `AnyElement` leaf and inline children after the document hitbox so
+        // interactive widgets receive pointer events above the document canvas.
+        for custom_block in foreground_custom_blocks {
+            let node_bounds = rect_to_bounds(custom_block.canvas_rect);
+            let render_context = CustomBlockRenderContext {
+                block_id: custom_block.block_id,
+                kind: &custom_block.kind,
+                data: &custom_block.data,
+                bounds: node_bounds,
+                chrome: custom_block.chrome,
                 zoom,
                 theme: &theme,
             };
@@ -679,6 +727,7 @@ impl Element for RichDocumentElement {
             popover_element,
             handled_custom_blocks,
             handled_custom_inlines,
+            chrome_custom_nodes,
             hosted_custom_elements,
             direct_custom_paints,
             caret_rect,
@@ -781,7 +830,7 @@ impl Element for RichDocumentElement {
                 window.paint_quad(fill(bounds, theme.surface_background));
             }
 
-            // Layer 1: Block chrome (tables, blockquotes, code frames, rules, list markers, chevrons).
+            // Layer 1: Block chrome (tables, blockquotes, code frames, rules, list markers, chevrons, custom chrome).
             for visible in &prepaint.visible_blocks {
                 paint_block_chrome(
                     &visible.layout,
@@ -790,6 +839,8 @@ impl Element for RichDocumentElement {
                     prepaint.zoom,
                     prepaint.show_heading_chevrons,
                     prepaint.copied_code_block,
+                    bounds,
+                    &mut prepaint.chrome_custom_nodes,
                     theme,
                     &canvas_to_window,
                     window,
@@ -963,6 +1014,108 @@ impl Element for RichDocumentElement {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn paint_custom_chrome_or_fallback(
+    block_id: BlockId,
+    bounds: Rect,
+    block_x: f32,
+    block_y: f32,
+    zoom: f32,
+    viewport_bounds: Bounds<Pixels>,
+    chrome_custom_nodes: &mut HashMap<BlockId, PrepaintedCustomChrome>,
+    theme: &RichTheme,
+    to_window: &impl Fn(f32, f32) -> Point<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    if let Some(custom_chrome) = chrome_custom_nodes.remove(&block_id) {
+        match custom_chrome {
+            PrepaintedCustomChrome::DirectPaint(node_bounds, paint_callback) => {
+                paint_callback(node_bounds, theme, window, cx);
+            }
+            PrepaintedCustomChrome::Element(node_bounds, mut element) => {
+                let clipped_mask = viewport_bounds.intersect(&node_bounds);
+                window.with_content_mask(
+                    Some(ContentMask {
+                        bounds: clipped_mask,
+                    }),
+                    |window| {
+                        element.paint(window, cx);
+                    },
+                );
+            }
+        }
+    } else {
+        let origin = to_window(block_x + bounds.x, block_y + bounds.y);
+        let node_bounds = Bounds::new(origin, size(px(bounds.width), px(bounds.height)));
+        window.paint_quad(quad(
+            node_bounds,
+            Corners::all(px(pt_to_px(5.0, zoom))),
+            theme.code_background,
+            Edges::all(px(1.0)),
+            theme.code_border,
+            BorderStyle::Solid,
+        ));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn paint_table_chrome(
+    table: &rich_layout::TableLayout<GpuiGlyphBackend>,
+    origin_x: f32,
+    origin_y: f32,
+    zoom: f32,
+    show_heading_chevrons: bool,
+    copied_code_block: Option<BlockId>,
+    viewport_bounds: Bounds<Pixels>,
+    chrome_custom_nodes: &mut HashMap<BlockId, PrepaintedCustomChrome>,
+    theme: &RichTheme,
+    to_window: &impl Fn(f32, f32) -> Point<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let border_color = theme.resolve_table_border(table.border_style.color);
+    let border_width = pt_to_px(table.border_style.width_pt, zoom).max(1.0);
+    for cell in &table.cells {
+        let cell_origin = to_window(origin_x + cell.rect.x, origin_y + cell.rect.y);
+        let cell_bounds = Bounds::new(cell_origin, size(px(cell.rect.width), px(cell.rect.height)));
+        let fill_color = cell
+            .background
+            .map(rgba_to_hsla)
+            .unwrap_or_else(|| {
+                if cell.is_header {
+                    theme.table_header_background
+                } else {
+                    theme.table_cell_background
+                }
+            });
+        window.paint_quad(quad(
+            cell_bounds,
+            Corners::all(px(0.0)),
+            fill_color,
+            Edges::all(px(border_width)),
+            border_color,
+            BorderStyle::Solid,
+        ));
+        for child in &cell.children {
+            paint_block_chrome(
+                &child.layout,
+                origin_x + cell.rect.x + child.x,
+                origin_y + cell.rect.y + child.y,
+                zoom,
+                show_heading_chevrons,
+                copied_code_block,
+                viewport_bounds,
+                chrome_custom_nodes,
+                theme,
+                to_window,
+                window,
+                cx,
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn paint_block_chrome(
     layout: &BlockLayout<GpuiGlyphBackend>,
     block_x: f32,
@@ -970,6 +1123,8 @@ fn paint_block_chrome(
     zoom: f32,
     show_heading_chevrons: bool,
     copied_code_block: Option<BlockId>,
+    viewport_bounds: Bounds<Pixels>,
+    chrome_custom_nodes: &mut HashMap<BlockId, PrepaintedCustomChrome>,
     theme: &RichTheme,
     to_window: &impl Fn(f32, f32) -> Point<Pixels>,
     window: &mut Window,
@@ -1076,6 +1231,8 @@ fn paint_block_chrome(
                     zoom,
                     show_heading_chevrons,
                     copied_code_block,
+                    viewport_bounds,
+                    chrome_custom_nodes,
                     theme,
                     to_window,
                     window,
@@ -1156,45 +1313,20 @@ fn paint_block_chrome(
             );
         }
         BlockLayoutKind::Table(table) => {
-            let border_color = theme.resolve_table_border(table.border_style.color);
-            let border_width = pt_to_px(table.border_style.width_pt, zoom).max(1.0);
-            for cell in &table.cells {
-                let cell_origin = to_window(block_x + cell.rect.x, block_y + cell.rect.y);
-                let cell_bounds =
-                    Bounds::new(cell_origin, size(px(cell.rect.width), px(cell.rect.height)));
-                let fill_color = cell
-                    .background
-                    .map(rgba_to_hsla)
-                    .unwrap_or_else(|| {
-                        if cell.is_header {
-                            theme.table_header_background
-                        } else {
-                            theme.table_cell_background
-                        }
-                    });
-                window.paint_quad(quad(
-                    cell_bounds,
-                    Corners::all(px(0.0)),
-                    fill_color,
-                    Edges::all(px(border_width)),
-                    border_color,
-                    BorderStyle::Solid,
-                ));
-                for child in &cell.children {
-                    paint_block_chrome(
-                        &child.layout,
-                        block_x + cell.rect.x + child.x,
-                        block_y + cell.rect.y + child.y,
-                        zoom,
-                        show_heading_chevrons,
-                        copied_code_block,
-                        theme,
-                        to_window,
-                        window,
-                        cx,
-                    );
-                }
-            }
+            paint_table_chrome(
+                table,
+                block_x,
+                block_y,
+                zoom,
+                show_heading_chevrons,
+                copied_code_block,
+                viewport_bounds,
+                chrome_custom_nodes,
+                theme,
+                to_window,
+                window,
+                cx,
+            );
         }
         BlockLayoutKind::HorizontalRule { rule_y } => {
             let line_origin = to_window(block_x, block_y + *rule_y);
@@ -1203,7 +1335,89 @@ fn paint_block_chrome(
                 theme.rule_color,
             ));
         }
-        BlockLayoutKind::Custom { .. } => {}
+        BlockLayoutKind::CustomText { bounds, .. } => {
+            paint_custom_chrome_or_fallback(
+                layout.id,
+                *bounds,
+                block_x,
+                block_y,
+                zoom,
+                viewport_bounds,
+                chrome_custom_nodes,
+                theme,
+                to_window,
+                window,
+                cx,
+            );
+        }
+        BlockLayoutKind::CustomContainer {
+            bounds, children, ..
+        } => {
+            paint_custom_chrome_or_fallback(
+                layout.id,
+                *bounds,
+                block_x,
+                block_y,
+                zoom,
+                viewport_bounds,
+                chrome_custom_nodes,
+                theme,
+                to_window,
+                window,
+                cx,
+            );
+            for child in children {
+                paint_block_chrome(
+                    &child.layout,
+                    block_x + child.x,
+                    block_y + child.y,
+                    zoom,
+                    show_heading_chevrons,
+                    copied_code_block,
+                    viewport_bounds,
+                    chrome_custom_nodes,
+                    theme,
+                    to_window,
+                    window,
+                    cx,
+                );
+            }
+        }
+        BlockLayoutKind::CustomGrid {
+            bounds,
+            content_origin,
+            table,
+            ..
+        } => {
+            paint_custom_chrome_or_fallback(
+                layout.id,
+                *bounds,
+                block_x,
+                block_y,
+                zoom,
+                viewport_bounds,
+                chrome_custom_nodes,
+                theme,
+                to_window,
+                window,
+                cx,
+            );
+            paint_table_chrome(
+                table,
+                block_x + content_origin.x,
+                block_y + content_origin.y,
+                zoom,
+                show_heading_chevrons,
+                copied_code_block,
+                viewport_bounds,
+                chrome_custom_nodes,
+                theme,
+                to_window,
+                window,
+                cx,
+            );
+        }
+        BlockLayoutKind::CustomLeaf { .. } => {}
     }
 }
 
@@ -1227,6 +1441,11 @@ fn paint_block_inline_backgrounds(
             content_origin,
             paragraph,
             ..
+        }
+        | BlockLayoutKind::CustomText {
+            content_origin,
+            paragraph,
+            ..
         } => {
             paint_paragraph_backgrounds(
                 paragraph,
@@ -1238,7 +1457,8 @@ fn paint_block_inline_backgrounds(
                 window,
             );
         }
-        BlockLayoutKind::Blockquote { children, .. } => {
+        BlockLayoutKind::Blockquote { children, .. }
+        | BlockLayoutKind::CustomContainer { children, .. } => {
             for child in children {
                 paint_block_inline_backgrounds(
                     &child.layout,
@@ -1266,7 +1486,26 @@ fn paint_block_inline_backgrounds(
                 }
             }
         }
-        BlockLayoutKind::HorizontalRule { .. } | BlockLayoutKind::Custom { .. } => {}
+        BlockLayoutKind::CustomGrid {
+            content_origin,
+            table,
+            ..
+        } => {
+            for cell in &table.cells {
+                for child in &cell.children {
+                    paint_block_inline_backgrounds(
+                        &child.layout,
+                        block_x + content_origin.x + cell.rect.x + child.x,
+                        block_y + content_origin.y + cell.rect.y + child.y,
+                        zoom,
+                        theme,
+                        to_window,
+                        window,
+                    );
+                }
+            }
+        }
+        BlockLayoutKind::HorizontalRule { .. } | BlockLayoutKind::CustomLeaf { .. } => {}
     }
 }
 
@@ -1365,6 +1604,11 @@ fn paint_block_foreground(
             content_origin,
             paragraph,
             ..
+        }
+        | BlockLayoutKind::CustomText {
+            content_origin,
+            paragraph,
+            ..
         } => {
             paint_paragraph_foreground(
                 layout.id,
@@ -1382,7 +1626,8 @@ fn paint_block_foreground(
                 cx,
             );
         }
-        BlockLayoutKind::Blockquote { children, .. } => {
+        BlockLayoutKind::Blockquote { children, .. }
+        | BlockLayoutKind::CustomContainer { children, .. } => {
             for child in children {
                 paint_block_foreground(
                     &child.layout,
@@ -1422,8 +1667,33 @@ fn paint_block_foreground(
                 }
             }
         }
+        BlockLayoutKind::CustomGrid {
+            content_origin,
+            table,
+            ..
+        } => {
+            for cell in &table.cells {
+                for child in &cell.children {
+                    paint_block_foreground(
+                        &child.layout,
+                        block_x + content_origin.x + cell.rect.x + child.x,
+                        block_y + content_origin.y + cell.rect.y + child.y,
+                        zoom,
+                        debug_overlay,
+                        theme,
+                        block_inline_decorations,
+                        image_assets,
+                        handled_custom_blocks,
+                        handled_custom_inlines,
+                        to_window,
+                        window,
+                        cx,
+                    );
+                }
+            }
+        }
         BlockLayoutKind::HorizontalRule { .. } => {}
-        BlockLayoutKind::Custom { kind, bounds, .. } => {
+        BlockLayoutKind::CustomLeaf { kind, bounds, .. } => {
             if !handled_custom_blocks.contains(&layout.id) {
                 let origin = to_window(block_x + bounds.x, block_y + bounds.y);
                 let node_bounds =
@@ -1814,15 +2084,109 @@ fn collect_pending_custom_nodes(
     out_images: &mut HashSet<String>,
 ) {
     match &layout.kind {
-        BlockLayoutKind::Custom { kind, data, bounds } => {
+        BlockLayoutKind::CustomLeaf { kind, data, bounds } => {
             if let Some(extension) = extensions.get_node(kind) {
                 out_blocks.push(PendingCustomBlock {
                     block_id: layout.id,
                     kind: kind.clone(),
                     data: data.clone(),
                     canvas_rect: bounds.translate(block_x, block_y),
+                    chrome: Insets::ZERO,
+                    is_chrome: false,
                     extension,
                 });
+            }
+        }
+        BlockLayoutKind::CustomText {
+            kind,
+            data,
+            bounds,
+            chrome,
+            content_origin,
+            paragraph,
+        } => {
+            if let Some(extension) = extensions.get_node(kind) {
+                out_blocks.push(PendingCustomBlock {
+                    block_id: layout.id,
+                    kind: kind.clone(),
+                    data: data.clone(),
+                    canvas_rect: bounds.translate(block_x, block_y),
+                    chrome: *chrome,
+                    is_chrome: true,
+                    extension,
+                });
+            }
+            collect_custom_inlines_in_paragraph(
+                layout.id,
+                paragraph,
+                block_x + content_origin.x,
+                block_y + content_origin.y,
+                extensions,
+                out_inlines,
+                out_images,
+            );
+        }
+        BlockLayoutKind::CustomContainer {
+            kind,
+            data,
+            bounds,
+            chrome,
+            children,
+        } => {
+            if let Some(extension) = extensions.get_node(kind) {
+                out_blocks.push(PendingCustomBlock {
+                    block_id: layout.id,
+                    kind: kind.clone(),
+                    data: data.clone(),
+                    canvas_rect: bounds.translate(block_x, block_y),
+                    chrome: *chrome,
+                    is_chrome: true,
+                    extension,
+                });
+            }
+            for child in children {
+                collect_pending_custom_nodes(
+                    &child.layout,
+                    block_x + child.x,
+                    block_y + child.y,
+                    extensions,
+                    out_blocks,
+                    out_inlines,
+                    out_images,
+                );
+            }
+        }
+        BlockLayoutKind::CustomGrid {
+            kind,
+            data,
+            bounds,
+            chrome,
+            content_origin,
+            table,
+        } => {
+            if let Some(extension) = extensions.get_node(kind) {
+                out_blocks.push(PendingCustomBlock {
+                    block_id: layout.id,
+                    kind: kind.clone(),
+                    data: data.clone(),
+                    canvas_rect: bounds.translate(block_x, block_y),
+                    chrome: *chrome,
+                    is_chrome: true,
+                    extension,
+                });
+            }
+            for cell in &table.cells {
+                for child in &cell.children {
+                    collect_pending_custom_nodes(
+                        &child.layout,
+                        block_x + content_origin.x + cell.rect.x + child.x,
+                        block_y + content_origin.y + cell.rect.y + child.y,
+                        extensions,
+                        out_blocks,
+                        out_inlines,
+                        out_images,
+                    );
+                }
             }
         }
         BlockLayoutKind::Paragraph(paragraph)

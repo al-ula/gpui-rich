@@ -6,10 +6,10 @@ use gpui_kit::{
     Hsla, Rgba, SharedString, TextRun, Window, px,
 };
 use rich_layout::{
-    GlyphBackend, InlineBoxMetrics, ShapedGlyph, ShapedGlyphRun, ShapedSegment, ShaperRunSpec,
-    Size, TextShaper, pt_to_px,
+    GlyphBackend, InlineBoxMetrics, Insets, ShapedGlyph, ShapedGlyphRun, ShapedSegment,
+    ShaperRunSpec, Size, TextShaper, pt_to_px,
 };
-use rich_model::{InlineObject, InlineVAlign, RgbaColor};
+use rich_model::{CustomPayload, InlineObject, InlineVAlign, RgbaColor};
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 
@@ -549,7 +549,7 @@ impl TextShaper for GpuiShaper<'_, '_> {
                     strikethrough: None,
                 };
                 let shaped = self.window.text_system().shape_line(
-                    SharedString::from(kind.clone()),
+                    SharedString::from(kind.to_string()),
                     font_size,
                     &[run],
                     None,
@@ -567,7 +567,7 @@ impl TextShaper for GpuiShaper<'_, '_> {
     fn measure_custom_block(
         &mut self,
         kind: &str,
-        data: &serde_json::Value,
+        data: &CustomPayload,
         max_width: f32,
         zoom: f32,
     ) -> Size {
@@ -578,6 +578,22 @@ impl TextShaper for GpuiShaper<'_, '_> {
             return extension.measure_block(data, max_width, zoom, self.window);
         }
         Size::new(max_width, pt_to_px(44.0, zoom))
+    }
+
+    fn measure_custom_chrome(
+        &mut self,
+        kind: &str,
+        data: &CustomPayload,
+        max_width: f32,
+        zoom: f32,
+    ) -> Insets {
+        if let Some(extension) = self
+            .extensions
+            .and_then(|registry| registry.get_node(kind))
+        {
+            return extension.measure_chrome(data, max_width, zoom, self.window);
+        }
+        Insets::xy(pt_to_px(12.0, zoom), pt_to_px(8.0, zoom))
     }
 }
 

@@ -6,28 +6,32 @@ use gpui_kit::{
     Styled, Subscription, Window, WindowBounds, WindowOptions, div, px, rgb, size,
 };
 use rich_gpui::{
-    CustomBlockRenderContext, CustomInlineRenderContext, CustomRenderOutput, MemoryAssetProvider,
-    NodeExtension, RichDocumentEvent, RichDocumentView, RichTheme, register_default_keybindings,
+    CustomRenderOutput, MemoryAssetProvider, RichDocumentEvent, RichDocumentView, RichTheme,
+    TypedBlockExtension, TypedBlockRenderContext, TypedInlineExtension, TypedInlineRenderContext,
+    register_default_keybindings,
 };
-use rich_layout::{InlineBoxMetrics, Size, pt_to_px};
+use rich_layout::{InlineBoxMetrics, Insets, pt_to_px};
 use rich_model::{
     BaselineShift, BlockDecorations, BlockKind, BlockNode, BlockStyle, BlockWidth, ChipKind,
-    ColumnSpec, DecorationContext, DecorationProvider, Document, Edges, FontWeight,
+    ColumnSpec, CustomPayload, DecorationContext, DecorationProvider, Document, Edges, FontWeight,
     HorizontalLayout, InlineContent, InlineDecoration, InlineObject, InlineStyle, InlineVAlign,
     InteractionPolicy, ListId, ListKind, MarkKind, MarkdownCodec, NumberStyle, PaperSpec,
     RgbaColor, RichCommand, SelectionValue, StyleId, TableBlock, TableBorderStyle, TableCell,
     TableRow, TextAlign, UnderlineKind,
 };
+use serde::{Deserialize, Serialize};
 
 struct RustSyntaxDecorationProvider;
 
 impl DecorationProvider for RustSyntaxDecorationProvider {
     fn decorations_for_block(&self, context: &DecorationContext<'_>) -> BlockDecorations {
-        let BlockKind::CodeBlock {
-            language: Some(language),
-            content,
-        } = &context.block.kind
-        else {
+        let Some(code) = context.block.kind.code_block_data() else {
+            return BlockDecorations::default();
+        };
+        let Some(language) = code.language.as_deref() else {
+            return BlockDecorations::default();
+        };
+        let Some(content) = context.block.kind.inline_content() else {
             return BlockDecorations::default();
         };
         if !language.eq_ignore_ascii_case("rust") {
@@ -74,51 +78,48 @@ impl DecorationProvider for RustSyntaxDecorationProvider {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct CalloutData {
+    title: String,
+}
+
 struct CalloutBlockExtension;
 
-impl NodeExtension for CalloutBlockExtension {
-    fn measure_block(
+impl TypedBlockExtension for CalloutBlockExtension {
+    type Data = CalloutData;
+
+    fn measure_chrome(
         &self,
-        _data: &serde_json::Value,
-        max_width: f32,
+        _data: &Self::Data,
+        _max_width: f32,
         zoom: f32,
         _window: &Window,
-    ) -> Size {
-        Size::new(max_width, pt_to_px(58.0, zoom))
+    ) -> Insets {
+        Insets::new(
+            pt_to_px(26.0, zoom),
+            pt_to_px(12.0, zoom),
+            pt_to_px(10.0, zoom),
+            pt_to_px(14.0, zoom),
+        )
     }
 
     fn render_block(
         &self,
-        context: CustomBlockRenderContext<'_>,
+        context: TypedBlockRenderContext<'_, Self::Data>,
         _window: &mut Window,
         _cx: &mut App,
     ) -> Option<CustomRenderOutput> {
-        let title = context
-            .data
-            .get("title")
-            .and_then(|value| value.as_str())
-            .unwrap_or("Callout")
-            .to_owned();
-        let body = context
-            .data
-            .get("body")
-            .and_then(|value| value.as_str())
-            .unwrap_or("")
-            .to_owned();
         let is_dark = context.theme.is_dark();
         let card_bg = if is_dark { rgb(0x162235) } else { rgb(0xedf5ff) };
         let card_border = if is_dark { rgb(0x388bfd) } else { rgb(0x8ab4f8) };
         let title_color = if is_dark { rgb(0x79c0ff) } else { rgb(0x0b57d0) };
-        let body_color = context.theme.text;
 
         let element = div()
             .size_full()
             .flex()
             .flex_col()
-            .justify_center()
-            .gap(px(pt_to_px(2.0, context.zoom)))
             .px(px(pt_to_px(12.0, context.zoom)))
-            .py(px(pt_to_px(8.0, context.zoom)))
+            .pt(px(pt_to_px(7.0, context.zoom)))
             .rounded(px(pt_to_px(6.0, context.zoom)))
             .bg(card_bg)
             .border_1()
@@ -128,42 +129,38 @@ impl NodeExtension for CalloutBlockExtension {
                     .text_size(px(pt_to_px(10.0, context.zoom)))
                     .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                     .text_color(title_color)
-                    .child(title),
-            )
-            .child(
-                div()
-                    .text_size(px(pt_to_px(9.5, context.zoom)))
-                    .text_color(body_color)
-                    .child(body),
+                    .child(context.data.title.clone()),
             )
             .into_any_element();
 
         Some(CustomRenderOutput::Element(element))
     }
 
-    fn plain_text_block(&self, data: &serde_json::Value) -> Option<String> {
-        let title = data.get("title").and_then(|v| v.as_str()).unwrap_or("Callout");
-        let body = data.get("body").and_then(|v| v.as_str()).unwrap_or("");
-        Some(format!("{title}: {body}"))
+    fn plain_text_block(&self, data: &Self::Data) -> Option<String> {
+        Some(data.title.clone())
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+struct StatusBadgeData {
+    label: String,
 }
 
 struct StatusBadgeExtension;
 
-impl NodeExtension for StatusBadgeExtension {
+impl TypedInlineExtension for StatusBadgeExtension {
+    type Data = StatusBadgeData;
+
     fn measure_inline(
         &self,
-        data: &serde_json::Value,
+        data: &Self::Data,
         zoom: f32,
         _window: &Window,
     ) -> InlineBoxMetrics {
-        let label = data
-            .get("label")
-            .and_then(|value| value.as_str())
-            .unwrap_or("STATUS");
         let font_px = pt_to_px(9.0, zoom);
         InlineBoxMetrics {
-            width: (label.chars().count().max(3) as f32) * font_px * 0.62 + pt_to_px(14.0, zoom),
+            width: (data.label.chars().count().max(3) as f32) * font_px * 0.62
+                + pt_to_px(14.0, zoom),
             height: pt_to_px(16.0, zoom),
             valign: InlineVAlign::Middle,
         }
@@ -171,16 +168,10 @@ impl NodeExtension for StatusBadgeExtension {
 
     fn render_inline(
         &self,
-        context: CustomInlineRenderContext<'_>,
+        context: TypedInlineRenderContext<'_, Self::Data>,
         _window: &mut Window,
         _cx: &mut App,
     ) -> Option<CustomRenderOutput> {
-        let label = context
-            .data
-            .get("label")
-            .and_then(|value| value.as_str())
-            .unwrap_or("STATUS")
-            .to_owned();
         let is_dark = context.theme.is_dark();
         let badge_bg = if is_dark { rgb(0x1b3a28) } else { rgb(0xdcfce7) };
         let badge_border = if is_dark { rgb(0x3fb950) } else { rgb(0x86efac) };
@@ -198,16 +189,14 @@ impl NodeExtension for StatusBadgeExtension {
             .text_size(px(pt_to_px(8.5, context.zoom)))
             .font_weight(gpui_kit::FontWeight::SEMIBOLD)
             .text_color(badge_text)
-            .child(label)
+            .child(context.data.label.clone())
             .into_any_element();
 
         Some(CustomRenderOutput::Element(element))
     }
 
-    fn plain_text_inline(&self, data: &serde_json::Value) -> Option<String> {
-        data.get("label")
-            .and_then(|value| value.as_str())
-            .map(|label| format!("[{label}]"))
+    fn plain_text_inline(&self, data: &Self::Data) -> Option<String> {
+        Some(format!("[{}]", data.label))
     }
 }
 
@@ -325,8 +314,8 @@ impl DocsViewerApp {
             RichDocumentView::new(document, cx)
                 .with_asset_provider(assets)
                 .with_decoration_provider(RustSyntaxDecorationProvider)
-                .with_node_extension("callout", CalloutBlockExtension)
-                .with_node_extension("status", StatusBadgeExtension)
+                .with_typed_block_extension("callout", CalloutBlockExtension)
+                .with_typed_inline_extension("status", StatusBadgeExtension)
         });
         let event_subscription = cx.subscribe(
             &document_view,
@@ -1912,29 +1901,45 @@ fn build_sample_document() -> Document {
     document.add_paragraph(bidi_sample, BlockStyle::default());
 
     let mut ext_intro = InlineContent::empty();
-    ext_intro.push_text("Custom inline extensions render hosted GPUI widgets inline ", InlineStyle::default());
-    ext_intro.push_object(
-        InlineObject::Custom {
-            kind: "status".into(),
-            data: serde_json::json!({ "label": "PHASE 3 READY" }),
-        },
+    ext_intro.push_text(
+        "Typed inline extensions render hosted GPUI widgets inline ",
         InlineStyle::default(),
     );
-    ext_intro.push_text(" alongside custom block nodes:", InlineStyle::default());
+    ext_intro.push_object(
+        InlineObject::custom(
+            "status",
+            CustomPayload::typed(StatusBadgeData {
+                label: "TYPED EXTENSIONS".into(),
+            }),
+        ),
+        InlineStyle::default(),
+    );
+    ext_intro.push_text(
+        " alongside editable custom container blocks:",
+        InlineStyle::default(),
+    );
     document.add_paragraph(ext_intro, BlockStyle::default());
 
-    document.add_custom_block(
+    let callout_body_id = document.alloc_block_id();
+    let callout_body = BlockNode::new(
+        callout_body_id,
+        BlockKind::paragraph(InlineContent::plain(
+            "This paragraph lives inside a BlockKind::Container(\"callout\") with a strongly typed CalloutData payload. Click here to select, format, or press Enter to split paragraphs inside the card.",
+        )),
+        BlockStyle::default(),
+    );
+    document.add_custom_container(
         "callout",
-        serde_json::json!({
-            "title": "Hosted GPUI Extension Block",
-            "body": "Measured via TextShaper::measure_custom_block and rendered via NodeExtension + AnyElement::prepaint_as_root."
+        CustomPayload::typed(CalloutData {
+            title: "Editable Custom Container Block".into(),
         }),
+        vec![callout_body],
     );
 
     let quote_child_id = document.alloc_block_id();
     let quote_child = BlockNode::new(
         quote_child_id,
-        BlockKind::Paragraph(InlineContent::plain(
+        BlockKind::paragraph(InlineContent::plain(
             "Click and drag across paragraphs to select text, double-click a word, or press Ctrl+C / Cmd+C to copy.",
         )),
         BlockStyle::default(),
@@ -1966,7 +1971,7 @@ fn build_sample_document() -> Document {
                 InlineStyle::default()
             },
         );
-        let para = BlockNode::new(para_id, BlockKind::Paragraph(content), BlockStyle::default());
+        let para = BlockNode::new(para_id, BlockKind::paragraph(content), BlockStyle::default());
         TableCell::simple(cell_id, vec![para])
     };
 
@@ -2027,7 +2032,7 @@ fn build_sample_document() -> Document {
         border_style: TableBorderStyle::default(),
     };
     document.push_block(
-        BlockNode::new(table_id, BlockKind::Table(table_block), BlockStyle::default())
+        BlockNode::new(table_id, BlockKind::table(table_block), BlockStyle::default())
             .with_width_mode(BlockWidth::Wide),
     );
 
