@@ -6,9 +6,10 @@ use crate::shaper::{
 use rich_model::{
     Affinity, BlockStyle, DocumentLayoutConfig, InlineContent, InlineObject, InlineObjectId,
     InlineVAlign, LineHeight, LinkTarget, OBJECT_REPLACEMENT_CHAR, ResolvedTextStyle, RgbaColor,
-    StyleSheet, TextAlign, UnderlineKind,
+    StyleSheet, TextAlign, TextDirection, UnderlineKind,
 };
 use std::ops::Range;
+use unicode_bidi::{BidiInfo, Level};
 use unicode_linebreak::linebreaks;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -40,12 +41,29 @@ pub struct TextFragment<B: GlyphBackend> {
 }
 
 impl<B: GlyphBackend> TextFragment<B> {
+    /// Returns true when this fragment has an odd UAX #9 BiDi embedding level (RTL).
+    pub const fn is_rtl(&self) -> bool {
+        self.bidi_level % 2 == 1
+    }
+
     pub fn local_x_for_byte(&self, doc_byte: usize) -> f32 {
         let clamped = doc_byte.clamp(self.doc_range.start, self.doc_range.end);
         match self.x_for_byte.binary_search_by_key(&clamped, |&(b, _)| b) {
             Ok(idx) => self.x_for_byte[idx].1,
-            Err(0) => 0.0,
-            Err(idx) if idx >= self.x_for_byte.len() => self.width,
+            Err(0) => {
+                if self.is_rtl() {
+                    self.width
+                } else {
+                    0.0
+                }
+            }
+            Err(idx) if idx >= self.x_for_byte.len() => {
+                if self.is_rtl() {
+                    0.0
+                } else {
+                    self.width
+                }
+            }
             Err(idx) => {
                 let (b0, x0) = self.x_for_byte[idx - 1];
                 let (b1, x1) = self.x_for_byte[idx];
@@ -64,20 +82,40 @@ impl<B: GlyphBackend> TextFragment<B> {
             return self.doc_range.start;
         }
         if local_x <= 0.0 {
-            return self.doc_range.start;
+            return if self.is_rtl() {
+                self.doc_range.end
+            } else {
+                self.doc_range.start
+            };
         }
         if local_x >= self.width {
-            return self.doc_range.end;
+            return if self.is_rtl() {
+                self.doc_range.start
+            } else {
+                self.doc_range.end
+            };
         }
         for pair in self.x_for_byte.windows(2) {
             let (b0, x0) = pair[0];
             let (b1, x1) = pair[1];
-            if local_x >= x0 && local_x <= x1 {
-                let mid = (x0 + x1) * 0.5;
-                return if local_x < mid { b0 } else { b1 };
+            let low = x0.min(x1);
+            let high = x0.max(x1);
+            if local_x >= low && local_x <= high {
+                let mid = (low + high) * 0.5;
+                return if x0 <= x1 {
+                    if local_x < mid { b0 } else { b1 }
+                } else if local_x < mid {
+                    b1
+                } else {
+                    b0
+                };
             }
         }
-        self.doc_range.end
+        if self.is_rtl() {
+            self.doc_range.start
+        } else {
+            self.doc_range.end
+        }
     }
 
     pub fn byte_containing_local_x(&self, local_x: f32) -> Option<usize> {
@@ -87,7 +125,9 @@ impl<B: GlyphBackend> TextFragment<B> {
         for pair in self.x_for_byte.windows(2) {
             let (b0, x0) = pair[0];
             let (_, x1) = pair[1];
-            if local_x >= x0 && local_x <= x1 {
+            let low = x0.min(x1);
+            let high = x0.max(x1);
+            if local_x >= low && local_x <= high {
                 return Some(b0);
             }
         }
@@ -169,6 +209,7 @@ pub struct VisualLine<B: GlyphBackend> {
     pub ascent: f32,
     pub descent: f32,
     pub soft_wrapped: bool,
+    pub base_direction_rtl: bool,
     pub fragments: Vec<LineFragment<B>>,
 }
 
@@ -188,15 +229,20 @@ impl<B: GlyphBackend> VisualLine<B> {
 
     pub fn x_for_offset(&self, offset: usize) -> f32 {
         if self.fragments.is_empty() {
-            return self.rect.x;
+            return if self.base_direction_rtl {
+                self.rect.right()
+            } else {
+                self.rect.x
+            };
         }
+
+        // Fragments are in visual order (which can differ from logical order in BiDi lines),
+        // so prefer an interior match before boundary matches.
+        let mut boundary_match: Option<f32> = None;
         for frag in &self.fragments {
             let range = frag.doc_range();
-            if offset < range.start {
-                return frag.x();
-            }
             if offset >= range.start && offset <= range.end {
-                return match frag {
+                let x = match frag {
                     LineFragment::Text(t) => t.x + t.local_x_for_byte(offset),
                     LineFragment::InlineBox(b) => {
                         if offset <= b.doc_range.start {
@@ -213,11 +259,41 @@ impl<B: GlyphBackend> VisualLine<B> {
                         }
                     }
                 };
+                if offset > range.start && offset < range.end {
+                    return x;
+                }
+                if boundary_match.is_none() {
+                    boundary_match = Some(x);
+                }
             }
         }
-        match self.fragments.last() {
-            Some(last) => last.x() + last.width(),
-            None => self.rect.x,
+        if let Some(x) = boundary_match {
+            return x;
+        }
+
+        // Fall back to logical start/end edges.
+        if offset <= self.doc_range.start {
+            if self.base_direction_rtl {
+                self.fragments
+                    .last()
+                    .map(|last| last.x() + last.width())
+                    .unwrap_or(self.rect.right())
+            } else {
+                self.fragments
+                    .first()
+                    .map(|first| first.x())
+                    .unwrap_or(self.rect.x)
+            }
+        } else if self.base_direction_rtl {
+            self.fragments
+                .first()
+                .map(|first| first.x())
+                .unwrap_or(self.rect.x)
+        } else {
+            self.fragments
+                .last()
+                .map(|last| last.x() + last.width())
+                .unwrap_or(self.rect.x)
         }
     }
 
@@ -306,9 +382,18 @@ impl<B: GlyphBackend> ParagraphLayout<B> {
             };
         };
         if local_point.x <= first.x() {
+            let offset = if line.base_direction_rtl {
+                line.doc_range.end
+            } else {
+                line.doc_range.start
+            };
             return HitResult {
-                offset: line.doc_range.start,
-                affinity: Affinity::Downstream,
+                offset,
+                affinity: if line.soft_wrapped && offset == line.doc_range.end {
+                    Affinity::Upstream
+                } else {
+                    Affinity::Downstream
+                },
                 inline_object: None,
                 link: None,
             };
@@ -369,9 +454,14 @@ impl<B: GlyphBackend> ParagraphLayout<B> {
             }
         }
 
+        let end_offset = if line.base_direction_rtl {
+            line.doc_range.start
+        } else {
+            line.doc_range.end
+        };
         HitResult {
-            offset: line.doc_range.end,
-            affinity: if line.soft_wrapped {
+            offset: end_offset,
+            affinity: if line.soft_wrapped && end_offset == line.doc_range.end {
                 Affinity::Upstream
             } else {
                 Affinity::Downstream
@@ -431,13 +521,63 @@ impl<B: GlyphBackend> ParagraphLayout<B> {
             }
             let s = range.start.max(line.doc_range.start);
             let e = range.end.min(line.doc_range.end);
-            let x0 = line.x_for_offset(s);
-            let mut x1 = line.x_for_offset(e);
-            if is_last && include_trailing_newline {
-                x1 += 6.0;
+
+            if line.fragments.is_empty() {
+                if is_last && include_trailing_newline {
+                    let x0 = line.x_for_offset(s);
+                    rects.push(Rect::new(x0, line.rect.y, 6.0, line.rect.height));
+                }
+                continue;
             }
-            if x1 > x0 {
-                rects.push(Rect::new(x0, line.rect.y, x1 - x0, line.rect.height));
+
+            // Compute per-fragment visual spans so mixed LTR/RTL selections produce exact
+            // disjoint rectangles when a logical range crosses BiDi boundaries.
+            let mut spans: Vec<(f32, f32)> = Vec::new();
+            for frag in &line.fragments {
+                let frag_range = frag.doc_range();
+                let fs = s.max(frag_range.start);
+                let fe = e.min(frag_range.end);
+                if fs >= fe {
+                    continue;
+                }
+                let (x_a, x_b) = match frag {
+                    LineFragment::Text(t) => {
+                        (t.x + t.local_x_for_byte(fs), t.x + t.local_x_for_byte(fe))
+                    }
+                    LineFragment::InlineBox(b) => (b.x, b.x + b.width),
+                    LineFragment::Tab(t) => (t.x, t.x + t.width),
+                };
+                let left = x_a.min(x_b);
+                let right = x_a.max(x_b);
+                if right > left {
+                    spans.push((left, right));
+                }
+            }
+
+            if is_last && include_trailing_newline {
+                let end_x = line
+                    .fragments
+                    .last()
+                    .map(|last| last.x() + last.width())
+                    .unwrap_or(line.rect.x);
+                spans.push((end_x, end_x + 6.0));
+            }
+
+            spans.sort_by(|a, b| a.0.total_cmp(&b.0));
+            let mut merged: Vec<(f32, f32)> = Vec::with_capacity(spans.len());
+            for (left, right) in spans {
+                if let Some(last) = merged.last_mut()
+                    && left <= last.1 + 0.5
+                {
+                    last.1 = last.1.max(right);
+                } else {
+                    merged.push((left, right));
+                }
+            }
+            for (left, right) in merged {
+                if right > left {
+                    rects.push(Rect::new(left, line.rect.y, right - left, line.rect.height));
+                }
             }
         }
         rects
@@ -505,10 +645,70 @@ impl<B: GlyphBackend> ShapedItem<B> {
 struct PendingRun {
     doc_range: Range<usize>,
     resolved: ResolvedTextStyle,
+    bidi_level: u8,
 }
 
 fn quantize_tenth(v: f32) -> i32 {
     (v * 10.0).round() as i32
+}
+
+struct ParagraphBidi {
+    /// Per-UTF-8-byte UAX #9 embedding level (empty when fast-pathed to all-LTR).
+    byte_levels: Vec<u8>,
+    /// True when the paragraph base embedding level is odd (RTL).
+    base_rtl: bool,
+    /// True when any byte in the paragraph has an odd BiDi level or base is RTL.
+    has_rtl: bool,
+}
+
+impl ParagraphBidi {
+    fn analyze(text: &str, direction: TextDirection, is_ascii: bool) -> Self {
+        if is_ascii && direction != TextDirection::Rtl {
+            return Self {
+                byte_levels: Vec::new(),
+                base_rtl: false,
+                has_rtl: false,
+            };
+        }
+        let default_level = match direction {
+            TextDirection::Auto => None,
+            TextDirection::Ltr => Some(Level::ltr()),
+            TextDirection::Rtl => Some(Level::rtl()),
+        };
+        let info = BidiInfo::new(text, default_level);
+        let base_rtl = info
+            .paragraphs
+            .first()
+            .map(|para| para.level.is_rtl())
+            .unwrap_or(direction == TextDirection::Rtl);
+        let mut has_rtl = base_rtl;
+        let byte_levels: Vec<u8> = info
+            .levels
+            .iter()
+            .map(|level| {
+                let num = level.number();
+                if num % 2 == 1 {
+                    has_rtl = true;
+                }
+                num
+            })
+            .collect();
+        Self {
+            byte_levels,
+            base_rtl,
+            has_rtl,
+        }
+    }
+
+    #[inline]
+    fn level_at(&self, byte_index: usize) -> u8 {
+        self.byte_levels.get(byte_index).copied().unwrap_or(0)
+    }
+
+    #[inline]
+    fn base_level(&self) -> u8 {
+        if self.base_rtl { 1 } else { 0 }
+    }
 }
 
 pub fn layout_paragraph<S: TextShaper>(
@@ -553,13 +753,17 @@ pub fn layout_paragraph<S: TextShaper>(
                 ascent: default_ascent,
                 descent: default_descent,
                 soft_wrapped: false,
+                base_direction_rtl: block_style.direction == TextDirection::Rtl,
                 fragments: Vec::new(),
             }],
         };
     }
 
+    // 0. Analyze UAX #9 BiDi levels (fast-pathed to zero allocations for ASCII LTR).
+    let bidi = ParagraphBidi::analyze(&content.text, block_style.direction, content.is_ascii);
+
     // 1. Itemize into ShapedItems (batched by uniform font_size + baseline_shift + bidi_level).
-    let items = itemize_and_shape(content, &base_text, zoom, shaper);
+    let items = itemize_and_shape(content, &base_text, &bidi, zoom, shaper);
 
     // 2. Collect UAX #14 break points plus forced breaks around tabs, hard breaks, and U+FFFC.
     let mut break_points: Vec<usize> = linebreaks(&content.text)
@@ -764,10 +968,21 @@ pub fn layout_paragraph<S: TextShaper>(
         let half_leading = ((lh - natural) * 0.5).max(0.0);
         let baseline_y = y + half_leading + max_ascent;
 
-        // Visible width excludes trailing ASCII spaces on soft-wrapped lines.
+        // Visible width excludes trailing ASCII spaces on soft-wrapped lines (computed in logical order).
         let visible_width = compute_visible_line_width(&fragments, &content.text, soft_wrapped);
 
-        let x_offset = match block_style.align {
+        // Apply UAX #9 L1 + L2 visual reordering when the paragraph contains RTL runs or RTL base direction.
+        if bidi.has_rtl && fragments.len() > 1 {
+            reorder_visual_line_fragments(&mut fragments, &content.text, &bidi);
+        }
+
+        let effective_align = if bidi.base_rtl && block_style.align == TextAlign::Left {
+            TextAlign::Right
+        } else {
+            block_style.align
+        };
+
+        let x_offset = match effective_align {
             TextAlign::Left => start_x,
             TextAlign::Center => start_x + ((avail - visible_width) * 0.5).max(0.0),
             TextAlign::Right => start_x + (avail - visible_width).max(0.0),
@@ -791,6 +1006,7 @@ pub fn layout_paragraph<S: TextShaper>(
             ascent: max_ascent,
             descent: max_descent,
             soft_wrapped,
+            base_direction_rtl: bidi.base_rtl,
             fragments,
         });
         y += lh;
@@ -837,6 +1053,7 @@ fn next_tab_stop(
 fn itemize_and_shape<S: TextShaper>(
     content: &InlineContent,
     base_text: &ResolvedTextStyle,
+    bidi: &ParagraphBidi,
     zoom: f32,
     shaper: &mut S,
 ) -> Vec<ShapedItem<S::Backend>> {
@@ -852,12 +1069,16 @@ fn itemize_and_shape<S: TextShaper>(
         let segment_start = first_run.doc_range.start;
         let segment_end = last_run.doc_range.end;
         let first = &first_run.resolved;
+        let bidi_level = first_run.bidi_level;
         let font_size_px = pt_to_px(first.font_size_pt, zoom).max(1.0);
         let baseline_shift_px = pt_to_px(first.baseline_shift_pt, zoom);
 
         let run_specs: Vec<ShaperRunSpec> = pending
             .iter()
-            .map(|run| ShaperRunSpec::from_resolved(run.doc_range.len(), &run.resolved))
+            .map(|run| {
+                ShaperRunSpec::from_resolved(run.doc_range.len(), &run.resolved)
+                    .with_bidi_level(run.bidi_level)
+            })
             .collect();
         let decorations: Vec<DecorationSpan> = pending
             .iter()
@@ -884,7 +1105,7 @@ fn itemize_and_shape<S: TextShaper>(
             doc_range: segment_start..segment_end,
             font_size_px,
             baseline_shift_px,
-            bidi_level: 0,
+            bidi_level,
             segment,
             decorations,
         });
@@ -894,6 +1115,7 @@ fn itemize_and_shape<S: TextShaper>(
     for span in &content.spans {
         let resolved = span.style.resolve(base_text);
         let mut cursor = span.range.start;
+        let mut cursor_level = bidi.level_at(cursor);
 
         for (rel_idx, ch) in content.text[span.range.clone()].char_indices() {
             let abs_idx = span.range.start + rel_idx;
@@ -904,6 +1126,7 @@ fn itemize_and_shape<S: TextShaper>(
                         &mut pending_text,
                         cursor..abs_idx,
                         &resolved,
+                        cursor_level,
                         zoom,
                         &mut items,
                         &flush_pending,
@@ -929,6 +1152,25 @@ fn itemize_and_shape<S: TextShaper>(
                     });
                 }
                 cursor = abs_idx + ch_len;
+                cursor_level = bidi.level_at(cursor);
+            } else {
+                let char_level = bidi.level_at(abs_idx);
+                if abs_idx > cursor && char_level != cursor_level {
+                    push_text_run(
+                        &mut pending_text,
+                        cursor..abs_idx,
+                        &resolved,
+                        cursor_level,
+                        zoom,
+                        &mut items,
+                        &flush_pending,
+                        shaper,
+                    );
+                    cursor = abs_idx;
+                    cursor_level = char_level;
+                } else if abs_idx == cursor {
+                    cursor_level = char_level;
+                }
             }
         }
 
@@ -937,6 +1179,7 @@ fn itemize_and_shape<S: TextShaper>(
                 &mut pending_text,
                 cursor..span.range.end,
                 &resolved,
+                cursor_level,
                 zoom,
                 &mut items,
                 &flush_pending,
@@ -949,10 +1192,12 @@ fn itemize_and_shape<S: TextShaper>(
     items
 }
 
+#[allow(clippy::too_many_arguments)]
 fn push_text_run<S: TextShaper, FFlush>(
     pending: &mut Vec<PendingRun>,
     doc_range: Range<usize>,
     resolved: &ResolvedTextStyle,
+    bidi_level: u8,
     zoom: f32,
     items: &mut Vec<ShapedItem<S::Backend>>,
     flush: &FFlush,
@@ -965,14 +1210,16 @@ fn push_text_run<S: TextShaper, FFlush>(
             == quantize_tenth(pt_to_px(resolved.font_size_pt, zoom));
         let same_shift = quantize_tenth(pt_to_px(prev.resolved.baseline_shift_pt, zoom))
             == quantize_tenth(pt_to_px(resolved.baseline_shift_pt, zoom));
+        let same_bidi = prev.bidi_level == bidi_level;
         let contiguous = prev.doc_range.end == doc_range.start;
-        if !(same_size && same_shift && contiguous) {
+        if !(same_size && same_shift && same_bidi && contiguous) {
             flush(pending, items, shaper);
         }
     }
     pending.push(PendingRun {
         doc_range,
         resolved: resolved.clone(),
+        bidi_level,
     });
 }
 
@@ -1002,9 +1249,11 @@ fn slice_items_range<B: GlyphBackend>(
             } => {
                 let local_s = s - doc_range.start;
                 let local_e = e - doc_range.start;
-                let x0 = segment.x_at_byte(local_s);
-                let x1 = segment.x_at_byte(local_e);
-                let width = (x1 - x0).max(0.0);
+                let x_s = segment.x_at_byte(local_s);
+                let x_e = segment.x_at_byte(local_e);
+                let left_x = x_s.min(x_e);
+                let right_x = x_s.max(x_e);
+                let width = (right_x - left_x).max(0.0);
 
                 let mut runs = Vec::new();
                 for run in &segment.runs {
@@ -1013,7 +1262,7 @@ fn slice_items_range<B: GlyphBackend>(
                         if g.byte_index >= local_s && g.byte_index < local_e {
                             glyphs.push(ShapedGlyph {
                                 glyph_id: g.glyph_id,
-                                x: g.x - x0,
+                                x: g.x - left_x,
                                 y: g.y,
                                 byte_index: doc_range.start + g.byte_index,
                                 is_emoji: g.is_emoji,
@@ -1030,13 +1279,13 @@ fn slice_items_range<B: GlyphBackend>(
                 }
 
                 let mut x_for_byte = Vec::new();
-                x_for_byte.push((s, 0.0));
+                x_for_byte.push((s, (x_s - left_x).clamp(0.0, width)));
                 for &(lb, lx) in &segment.x_for_byte {
                     if lb > local_s && lb < local_e {
-                        x_for_byte.push((doc_range.start + lb, (lx - x0).max(0.0)));
+                        x_for_byte.push((doc_range.start + lb, (lx - left_x).clamp(0.0, width)));
                     }
                 }
-                x_for_byte.push((e, width));
+                x_for_byte.push((e, (x_e - left_x).clamp(0.0, width)));
 
                 let sliced_decs = decorations
                     .iter()
@@ -1121,22 +1370,50 @@ fn append_positioned_fragments<B: GlyphBackend>(
             && let Some(LineFragment::Text(prev)) = line_frags.last_mut()
             && let LineFragment::Text(next) = frag
         {
-            let dx = prev.width;
-            for mut run in next.runs {
-                for g in &mut run.glyphs {
-                    g.x += dx;
+            if prev.is_rtl() {
+                // Inside an RTL fragment, higher logical offsets sit visually to the left.
+                let dx = next.width;
+                for run in &mut prev.runs {
+                    for g in &mut run.glyphs {
+                        g.x += dx;
+                    }
                 }
-                if let Some(last_run) = prev.runs.last_mut()
-                    && last_run.font == run.font
-                    && last_run.color == run.color
-                {
-                    last_run.glyphs.extend(run.glyphs);
-                } else {
-                    prev.runs.push(run);
+                for (_, lx) in &mut prev.x_for_byte {
+                    *lx += dx;
                 }
-            }
-            for &(b, lx) in next.x_for_byte.iter().skip(1) {
-                prev.x_for_byte.push((b, lx + dx));
+                let mut combined_runs = next.runs;
+                for run in prev.runs.drain(..) {
+                    if let Some(last_run) = combined_runs.last_mut()
+                        && last_run.font == run.font
+                        && last_run.color == run.color
+                    {
+                        last_run.glyphs.extend(run.glyphs);
+                    } else {
+                        combined_runs.push(run);
+                    }
+                }
+                prev.runs = combined_runs;
+                for &(b, lx) in next.x_for_byte.iter().skip(1) {
+                    prev.x_for_byte.push((b, lx));
+                }
+            } else {
+                let dx = prev.width;
+                for mut run in next.runs {
+                    for g in &mut run.glyphs {
+                        g.x += dx;
+                    }
+                    if let Some(last_run) = prev.runs.last_mut()
+                        && last_run.font == run.font
+                        && last_run.color == run.color
+                    {
+                        last_run.glyphs.extend(run.glyphs);
+                    } else {
+                        prev.runs.push(run);
+                    }
+                }
+                for &(b, lx) in next.x_for_byte.iter().skip(1) {
+                    prev.x_for_byte.push((b, lx + dx));
+                }
             }
             for dec in next.decorations {
                 if let Some(last_dec) = prev.decorations.last_mut()
@@ -1160,6 +1437,72 @@ fn append_positioned_fragments<B: GlyphBackend>(
             *cur_x += w;
             line_frags.push(frag);
         }
+    }
+}
+
+/// Applies UAX #9 Rule L1 (trailing whitespace reset) and Rule L2 (level-based reversal)
+/// to convert logical line fragments into visual left-to-right order.
+fn reorder_visual_line_fragments<B: GlyphBackend>(
+    fragments: &mut [LineFragment<B>],
+    full_text: &str,
+    bidi: &ParagraphBidi,
+) {
+    let base_level = bidi.base_level();
+    let mut levels: Vec<u8> = fragments
+        .iter()
+        .map(|frag| match frag {
+            LineFragment::Text(t) => t.bidi_level,
+            LineFragment::InlineBox(b) => bidi.level_at(b.doc_range.start),
+            LineFragment::Tab(_) => base_level,
+        })
+        .collect();
+
+    // UAX #9 L1: reset trailing whitespace-only fragments to the paragraph base level.
+    for (frag, level) in fragments.iter().zip(levels.iter_mut()).rev() {
+        let is_whitespace_only = match frag {
+            LineFragment::Text(t) => full_text
+                .get(t.doc_range.clone())
+                .is_some_and(|slice| slice.chars().all(char::is_whitespace)),
+            LineFragment::Tab(_) => true,
+            LineFragment::InlineBox(_) => false,
+        };
+        if is_whitespace_only {
+            *level = base_level;
+        } else {
+            break;
+        }
+    }
+
+    let max_level = levels.iter().copied().max().unwrap_or(0);
+    let min_odd_level = levels
+        .iter()
+        .copied()
+        .filter(|&level| level % 2 == 1)
+        .min()
+        .unwrap_or(max_level.saturating_add(1));
+
+    if max_level >= min_odd_level {
+        for target_level in (min_odd_level..=max_level).rev() {
+            let mut idx = 0usize;
+            while idx < fragments.len() {
+                if levels[idx] >= target_level {
+                    let start = idx;
+                    while idx < fragments.len() && levels[idx] >= target_level {
+                        idx += 1;
+                    }
+                    fragments[start..idx].reverse();
+                    levels[start..idx].reverse();
+                } else {
+                    idx += 1;
+                }
+            }
+        }
+    }
+
+    let mut visual_x = 0.0f32;
+    for frag in fragments.iter_mut() {
+        frag.set_x(visual_x);
+        visual_x += frag.width();
     }
 }
 
@@ -1202,13 +1545,14 @@ fn apply_justification<B: GlyphBackend>(
     full_text: &str,
     extra_width: f32,
 ) {
-    let Some(last_fragment) = fragments.last() else {
-        return;
-    };
-    if extra_width <= 0.1 {
+    if fragments.is_empty() || extra_width <= 0.1 {
         return;
     }
-    let line_end = last_fragment.doc_range().end;
+    let line_end = fragments
+        .iter()
+        .map(|frag| frag.doc_range().end)
+        .max()
+        .unwrap_or(0);
     let trimmed_end = full_text
         .get(..line_end)
         .map(|slice| slice.trim_end_matches(' ').len())
@@ -1232,26 +1576,26 @@ fn apply_justification<B: GlyphBackend>(
     let per_space = extra_width / (space_positions.len() as f32);
 
     let mut cumulative_shift = 0.0f32;
-    let mut space_cursor = 0usize;
 
     for frag in fragments.iter_mut() {
         match frag {
             LineFragment::Text(t) => {
                 t.x += cumulative_shift;
-                let mut local_spaces = Vec::new();
-                while space_cursor < space_positions.len()
-                    && space_positions[space_cursor] < t.doc_range.end
-                {
-                    if space_positions[space_cursor] >= t.doc_range.start {
-                        local_spaces.push(space_positions[space_cursor]);
-                    }
-                    space_cursor += 1;
-                }
+                let local_spaces: Vec<usize> = space_positions
+                    .iter()
+                    .copied()
+                    .filter(|&sp| sp >= t.doc_range.start && sp < t.doc_range.end)
+                    .collect();
                 if local_spaces.is_empty() {
                     continue;
                 }
+                let is_rtl = t.is_rtl();
                 let shift_for_byte = |b: usize| -> f32 {
-                    let count = local_spaces.partition_point(|&sp| sp < b);
+                    let count = if is_rtl {
+                        local_spaces.iter().filter(|&&sp| sp >= b).count()
+                    } else {
+                        local_spaces.iter().filter(|&&sp| sp < b).count()
+                    };
                     count as f32 * per_space
                 };
                 for run in &mut t.runs {

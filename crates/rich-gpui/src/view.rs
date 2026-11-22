@@ -1,6 +1,7 @@
 //! Interactive GPUI view hosting [`RichDocumentElement`] with command-driven actions,
 //! policy gating, theming, host events, keyboard navigation, IME input, and core editing.
 
+use crate::asset::{AssetProvider, LoadedAsset, decode_image_asset};
 use crate::element::RichDocumentElement;
 use crate::extension::{CustomCommandResult, ExtensionRegistry, NodeExtension};
 use crate::shaper::{FontResolver, GpuiGlyphBackend, GpuiShaper};
@@ -11,17 +12,23 @@ use gpui_kit::{
     MouseUpEvent, ParentElement, Pixels, Point as GpuiPoint, Render, ScrollDelta, ScrollEvent,
     Styled, Task, UTF16Selection, Window, actions, div, point, px, size,
 };
-use rich_layout::{FlowLayout, Point, ShaperRunSpec, resolve_horizontal_metrics};
-use rich_model::{
-    Affinity, BlockId, BlockKind, BlockNode, BlockStyle, ChangeSet, ClipboardBlock,
-    ClipboardFragment, CommandDecision, CommandMiddleware, CommandOutcome, CommandSource,
-    DecorationProvider, DocPos, Document, DocumentSelection, Edges, History, HistoryMergeGroup,
-    HorizontalLayout, InlineContent, InlineObject, InlineStyle, InteractionPolicy, LinkTarget,
-    ListKind, MarkKind, MoveDirection, MoveUnit, NamedStyle, NumberStyle,
-    OBJECT_REPLACEMENT_UTF8_LEN, PathSegment, ResolvedTextStyle, RgbaColor, RichCommand,
-    SelectionValue, SharedStr, Step, StyleId, TextAlign, Transaction,
+use rich_layout::{
+    FlowLayout, Point, Rect, ShaperRunSpec, TableColumnDividerHit, pt_to_px,
+    resolve_horizontal_metrics,
 };
+use rich_model::{
+    Affinity, BlockId, BlockKind, BlockNode, BlockStyle, ChangeSet, ChipKind, ClipboardBlock,
+    ClipboardFragment, CodecError, ColumnSpec, CommandDecision, CommandMiddleware, CommandOutcome,
+    CommandSource, CrdtSyncBridge, DecorationProvider, DocPos, Document, DocumentCodec,
+    DocumentSelection, Edges, History, HistoryMergeGroup, HorizontalLayout, InlineContent,
+    InlineObject, InlineObjectId, InlineStyle, InteractionPolicy, LinkTarget, ListKind, MarkKind,
+    MoveDirection, MoveUnit, NamedStyle, NumberStyle, OBJECT_REPLACEMENT_UTF8_LEN, PathSegment,
+    ResolvedTextStyle, RgbaColor, RichCommand, SelectionValue, SharedStr, Step, StyleId,
+    SyncDelta, TextAlign, Transaction,
+};
+use std::collections::HashMap;
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::Duration;
 use unicode_segmentation::UnicodeSegmentation;
 
@@ -97,6 +104,14 @@ actions!(
         ClearFormatting,
         IncreaseFontSize,
         DecreaseFontSize,
+        InsertTableRowAbove,
+        InsertTableRowBelow,
+        DeleteTableRow,
+        InsertTableColumnBefore,
+        InsertTableColumnAfter,
+        DeleteTableColumn,
+        MergeTableCells,
+        SplitTableCell,
     ]
 );
 
@@ -240,11 +255,79 @@ pub struct ImePreedit {
     pub selected_range: Range<usize>,
 }
 
+/// Identifies a selected inline image displaying drag-resize handles.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct SelectedInlineImage {
+    pub block_id: BlockId,
+    pub object_id: InlineObjectId,
+}
+
+/// Corner handle of a selected inline image.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ImageResizeCorner {
+    TopLeft,
+    TopRight,
+    BottomLeft,
+    BottomRight,
+}
+
+pub(crate) struct ImageResizeDrag {
+    pub block_id: BlockId,
+    pub object_id: InlineObjectId,
+    pub corner: ImageResizeCorner,
+    pub start_canvas_point: Point,
+    pub initial_width_pt: f32,
+    pub initial_height_pt: f32,
+    pub current_width_pt: f32,
+    pub current_height_pt: f32,
+}
+
+/// Active floating popover anchored to a clicked [`rich_model::InlineObject::SmartChip`].
+#[derive(Clone, Debug, PartialEq)]
+pub struct ActiveSmartChipPopover {
+    pub block_id: BlockId,
+    pub object_id: InlineObjectId,
+    pub kind: ChipKind,
+    pub label: String,
+    pub accent: Option<RgbaColor>,
+}
+
+pub(crate) struct TableColumnDrag {
+    pub table_id: BlockId,
+    pub column_index: usize,
+    pub start_canvas_x: f32,
+    pub initial_divider_x: f32,
+    pub current_divider_x: f32,
+    pub table_y: f32,
+    pub table_height: f32,
+    pub initial_widths_px: Vec<f32>,
+}
+
+/// Describes the active table cell/selection context for host toolbars.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ActiveTableContext {
+    pub table_id: BlockId,
+    pub row: usize,
+    pub visual_col: usize,
+    pub cell_index: usize,
+    pub can_merge: bool,
+    pub can_split: bool,
+}
+
 /// Host-observable events emitted by [`RichDocumentView`] via GPUI [`EventEmitter`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum RichDocumentEvent {
     /// A hyperlink was activated by user click or programmatic [`RichCommand::OpenLink`].
     LinkActivated { href: String },
+    /// A smart chip was clicked by the user.
+    SmartChipActivated {
+        block_id: BlockId,
+        object_id: InlineObjectId,
+        kind: ChipKind,
+        label: String,
+    },
+    /// A code block's contents were copied via its built-in Copy button or [`RichCommand::CopyCodeBlock`].
+    CodeBlockCopied { block_id: BlockId },
     /// The active selection or caret changed.
     SelectionChanged {
         selection: Option<DocumentSelection>,
@@ -282,6 +365,17 @@ pub struct RichDocumentView {
     pub(crate) hovered_pointer: bool,
     pub(crate) caret_visible: bool,
     pub(crate) last_ime_anchor: Option<Option<(i32, i32, i32, i32)>>,
+    pub(crate) copied_code_block: Option<BlockId>,
+    pub(crate) selected_image: Option<SelectedInlineImage>,
+    pub(crate) image_resize_drag: Option<ImageResizeDrag>,
+    pub(crate) hovered_image_handle: Option<ImageResizeCorner>,
+    pub(crate) active_chip_popover: Option<ActiveSmartChipPopover>,
+    pub(crate) hovered_column_divider: Option<TableColumnDividerHit>,
+    pub(crate) table_column_drag: Option<TableColumnDrag>,
+    asset_provider: Option<Arc<dyn AssetProvider>>,
+    asset_cache: HashMap<String, LoadedAsset>,
+    asset_tasks: HashMap<String, Task<()>>,
+    _copy_feedback_task: Task<()>,
     was_focused: bool,
     blink_epoch: usize,
     _blink_task: Task<()>,
@@ -293,6 +387,7 @@ pub struct RichDocumentView {
     drag_origin: Option<Point>,
     drag_anchor_pos: Option<DocPos>,
     pending_link: Option<String>,
+    pending_chip: Option<ActiveSmartChipPopover>,
 }
 
 impl EventEmitter<RichDocumentEvent> for RichDocumentView {}
@@ -323,6 +418,17 @@ impl RichDocumentView {
             hovered_pointer: false,
             caret_visible: true,
             last_ime_anchor: None,
+            copied_code_block: None,
+            selected_image: None,
+            image_resize_drag: None,
+            hovered_image_handle: None,
+            active_chip_popover: None,
+            hovered_column_divider: None,
+            table_column_drag: None,
+            asset_provider: None,
+            asset_cache: HashMap::new(),
+            asset_tasks: HashMap::new(),
+            _copy_feedback_task: Task::ready(()),
             was_focused: false,
             blink_epoch: 0,
             _blink_task: Task::ready(()),
@@ -334,6 +440,7 @@ impl RichDocumentView {
             drag_origin: None,
             drag_anchor_pos: None,
             pending_link: None,
+            pending_chip: None,
         }
     }
 
@@ -348,6 +455,176 @@ impl RichDocumentView {
         self.theme = theme;
         self.follow_app_theme = false;
         self
+    }
+
+    /// Builder method configuring an asynchronous [`AssetProvider`] for inline images.
+    pub fn with_asset_provider(mut self, provider: impl AssetProvider) -> Self {
+        self.asset_provider = Some(Arc::new(provider));
+        self
+    }
+
+    /// Replaces or clears the [`AssetProvider`], clearing cached decoded images.
+    pub fn set_asset_provider(
+        &mut self,
+        provider: Option<Arc<dyn AssetProvider>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.asset_provider = provider;
+        self.asset_cache.clear();
+        self.asset_tasks.clear();
+        cx.notify();
+    }
+
+    /// Evicts `asset_id` from the image cache so the next paint reloads it.
+    pub fn invalidate_asset(&mut self, asset_id: &str, cx: &mut Context<Self>) {
+        self.asset_cache.remove(asset_id);
+        self.asset_tasks.remove(asset_id);
+        cx.notify();
+    }
+
+    /// Clears all cached decoded images.
+    pub fn clear_asset_cache(&mut self, cx: &mut Context<Self>) {
+        self.asset_cache.clear();
+        self.asset_tasks.clear();
+        cx.notify();
+    }
+
+    /// Returns the cached [`LoadedAsset`] state for `asset_id`, kicking off an async background
+    /// fetch + decode task when an [`AssetProvider`] is configured and `asset_id` is uncached.
+    pub(crate) fn resolve_or_request_image(
+        &mut self,
+        asset_id: &str,
+        cx: &mut Context<Self>,
+    ) -> Option<LoadedAsset> {
+        if let Some(existing) = self.asset_cache.get(asset_id) {
+            return Some(existing.clone());
+        }
+        let provider = self.asset_provider.as_ref()?.clone();
+        let key = asset_id.to_owned();
+        self.asset_cache.insert(key.clone(), LoadedAsset::Loading);
+        let svg_renderer = cx.svg_renderer();
+        let load_future = provider.load_image(asset_id);
+        let key_for_task = key.clone();
+        let task = cx.spawn(async move |weak_view, cx| {
+            let decoded_result = cx
+                .background_executor()
+                .spawn(async move {
+                    let raw = load_future.await?;
+                    decode_image_asset(raw, svg_renderer)
+                })
+                .await;
+            if let Err(error) = weak_view.update(cx, |view, cx| {
+                view.asset_tasks.remove(&key_for_task);
+                match decoded_result {
+                    Ok(image) => {
+                        view.asset_cache
+                            .insert(key_for_task, LoadedAsset::Ready(image));
+                    }
+                    Err(error) => {
+                        view.asset_cache
+                            .insert(key_for_task, LoadedAsset::Failed(error));
+                    }
+                }
+                cx.notify();
+            }) {
+                // View was dropped before the async image load completed.
+                let _ = error;
+            }
+        });
+        self.asset_tasks.insert(key, task);
+        Some(LoadedAsset::Loading)
+    }
+
+    /// Dismisses any open smart chip popover.
+    pub fn dismiss_chip_popover(&mut self, cx: &mut Context<Self>) {
+        if self.active_chip_popover.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// Encodes the current [`Document`] using a pluggable [`DocumentCodec`].
+    pub fn export_document(&self, codec: &dyn DocumentCodec) -> Result<String, CodecError> {
+        codec.encode(&self.document)
+    }
+
+    /// Replaces the displayed [`Document`], resetting selection, undo history, and layout cache.
+    pub fn replace_document(&mut self, document: Document, cx: &mut Context<Self>) {
+        self.document = document;
+        self.history = History::default();
+        self.flow.cache.clear();
+        self.scroll_x = 0.0;
+        self.scroll_y = 0.0;
+        self.ime_preedit = None;
+        self.selected_image = None;
+        self.image_resize_drag = None;
+        self.active_chip_popover = None;
+        self.table_column_drag = None;
+        self.update_selection(None, cx);
+        self.resync_layout_with_anchor(None);
+        cx.notify();
+    }
+
+    /// Applies an incoming CRDT [`SyncDelta`] through `bridge` without recording into local undo
+    /// history or re-broadcasting to remote peers. Returns true when the document changed.
+    pub fn apply_remote_sync_delta(
+        &mut self,
+        bridge: &mut CrdtSyncBridge,
+        delta: &SyncDelta,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(transaction) = bridge.apply_remote_delta(delta, &self.document) else {
+            return false;
+        };
+        bridge.set_applying_remote(true);
+        let change_set = self.apply_transaction(transaction, false, cx);
+        bridge.set_applying_remote(false);
+        !change_set.dirty_blocks.is_empty() || change_set.structure_changed
+    }
+
+    /// Returns metadata describing the active table cell or selection, if any.
+    pub fn active_table_context(&self) -> Option<ActiveTableContext> {
+        match self.selection.as_ref()? {
+            DocumentSelection::TableCells {
+                table_id,
+                anchor_cell,
+                focus_cell,
+            } => {
+                let BlockKind::Table(table) = &self.document.find_block(*table_id)?.kind else {
+                    return None;
+                };
+                let (_, placements, occupancy) = table.resolve_grid();
+                let r_min = anchor_cell.0.min(focus_cell.0);
+                let c_min = anchor_cell.1.min(focus_cell.1);
+                let placement_idx = occupancy
+                    .get(r_min)
+                    .and_then(|row| row.get(c_min))
+                    .and_then(|slot| *slot)?;
+                let placement = placements.get(placement_idx)?;
+                Some(ActiveTableContext {
+                    table_id: *table_id,
+                    row: placement.row_index,
+                    visual_col: placement.visual_col,
+                    cell_index: placement.cell_index,
+                    can_merge: anchor_cell != focus_cell,
+                    can_split: placement.colspan > 1 || placement.rowspan > 1,
+                })
+            }
+            DocumentSelection::Text { focus, .. } => {
+                let (table_id, row, cell_index) = table_cell_of(focus)?;
+                let BlockKind::Table(table) = &self.document.find_block(table_id)?.kind else {
+                    return None;
+                };
+                let placement = table.placement_for_stored_cell(row, cell_index)?;
+                Some(ActiveTableContext {
+                    table_id,
+                    row: placement.row_index,
+                    visual_col: placement.visual_col,
+                    cell_index: placement.cell_index,
+                    can_merge: false,
+                    can_split: placement.colspan > 1 || placement.rowspan > 1,
+                })
+            }
+        }
     }
 
     /// Builder method configuring a render-time [`FontResolver`] for mapping `(font_family, weight, italic)`
@@ -505,6 +782,11 @@ impl RichDocumentView {
         self.policy = policy;
         if !policy.editable {
             self.ime_preedit = None;
+            self.selected_image = None;
+            self.image_resize_drag = None;
+            self.hovered_image_handle = None;
+            self.table_column_drag = None;
+            self.hovered_column_divider = None;
         }
         if !policy.selectable {
             self.dragging = false;
@@ -822,7 +1104,11 @@ impl RichDocumentView {
             RichCommand::ClearSelection => {
                 self.ime_preedit = None;
                 self.history.break_coalescing();
-                if self.update_selection(None, cx) {
+                let dismissed = self.active_chip_popover.take().is_some()
+                    || self.selected_image.take().is_some();
+                let cleared = self.update_selection(None, cx);
+                if dismissed || cleared {
+                    cx.notify();
                     CommandOutcome::Executed
                 } else {
                     CommandOutcome::NoOp
@@ -899,6 +1185,7 @@ impl RichDocumentView {
                 ));
                 CommandOutcome::Executed
             }
+            RichCommand::CopyCodeBlock(block_id) => self.execute_copy_code_block(*block_id, cx),
             RichCommand::OpenLink(href) => {
                 if href.is_empty() {
                     return CommandOutcome::NoOp;
@@ -960,6 +1247,15 @@ impl RichDocumentView {
             RichCommand::InsertInlineObject(object) => {
                 self.execute_insert_inline_object(object.clone(), cx)
             }
+            RichCommand::ToggleChecklistItem(block_id) => {
+                self.execute_toggle_checklist_item(*block_id, cx)
+            }
+            RichCommand::ResizeInlineImage {
+                block_id,
+                object_id,
+                width_pt,
+                height_pt,
+            } => self.execute_resize_inline_image(*block_id, *object_id, *width_pt, *height_pt, cx),
             RichCommand::Delete { direction, unit } => self.execute_delete(*direction, *unit, cx),
             RichCommand::SplitBlock => self.execute_split_block(cx),
             RichCommand::InsertSoftBreak => self.execute_insert_soft_break(cx),
@@ -979,6 +1275,20 @@ impl RichDocumentView {
             RichCommand::SetTextAlign(align) => self.execute_set_text_align(*align, cx),
             RichCommand::PasteHtml { html, plain_text } => {
                 self.execute_paste_html(html, plain_text.as_deref(), cx)
+            }
+            RichCommand::SetTableColumns { table_id, columns } => {
+                self.execute_set_table_columns(*table_id, columns.clone(), cx)
+            }
+            RichCommand::InsertTableRow { after } => self.execute_insert_table_row(*after, cx),
+            RichCommand::DeleteTableRow => self.execute_delete_table_row(cx),
+            RichCommand::InsertTableColumn { after } => {
+                self.execute_insert_table_column(*after, cx)
+            }
+            RichCommand::DeleteTableColumn => self.execute_delete_table_column(cx),
+            RichCommand::MergeTableCells => self.execute_merge_table_cells(cx),
+            RichCommand::SplitTableCell => self.execute_split_table_cell(cx),
+            RichCommand::NavigateTableCell { forward } => {
+                self.execute_navigate_table_cell(*forward, cx)
             }
             RichCommand::Custom { id, payload, .. } => self.execute_custom_command(id, payload, cx),
         }
@@ -1606,6 +1916,9 @@ impl RichDocumentView {
     fn execute_indent(&mut self, cx: &mut Context<Self>) -> CommandOutcome {
         self.ime_preedit = None;
         self.history.break_coalescing();
+        if self.active_table_context().is_some() {
+            return self.execute_navigate_table_cell(true, cx);
+        }
         let Some((_, focus, _)) = self.active_text_selection() else {
             return CommandOutcome::NoOp;
         };
@@ -1660,6 +1973,9 @@ impl RichDocumentView {
     fn execute_outdent(&mut self, cx: &mut Context<Self>) -> CommandOutcome {
         self.ime_preedit = None;
         self.history.break_coalescing();
+        if self.active_table_context().is_some() {
+            return self.execute_navigate_table_cell(false, cx);
+        }
         let Some((_, focus, _)) = self.active_text_selection() else {
             return CommandOutcome::NoOp;
         };
@@ -2549,6 +2865,320 @@ impl RichDocumentView {
         }
     }
 
+    fn execute_copy_code_block(
+        &mut self,
+        block_id: BlockId,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        let Some(BlockKind::CodeBlock { content, .. }) =
+            self.document.find_block(block_id).map(|block| &block.kind)
+        else {
+            return CommandOutcome::NoOp;
+        };
+        cx.write_to_clipboard(ClipboardItem::new_string(content.text.clone()));
+        self.copied_code_block = Some(block_id);
+        cx.emit(RichDocumentEvent::CodeBlockCopied { block_id });
+        cx.notify();
+
+        self._copy_feedback_task = cx.spawn(async move |weak_view, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(1500))
+                .await;
+            if weak_view
+                .update(cx, |view, cx| {
+                    if view.copied_code_block == Some(block_id) {
+                        view.copied_code_block = None;
+                        cx.notify();
+                    }
+                })
+                .is_err()
+            {
+                // View dropped before feedback timer elapsed.
+            }
+        });
+        CommandOutcome::Executed
+    }
+
+    fn execute_toggle_checklist_item(
+        &mut self,
+        block_id: BlockId,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        let Some(BlockKind::ListItem {
+            checked: Some(_), ..
+        }) = self.document.find_block(block_id).map(|block| &block.kind)
+        else {
+            return CommandOutcome::NoOp;
+        };
+        let selection_before = self.selection.clone();
+        let transaction = Transaction::new(vec![Step::ToggleChecklist { block_id }])
+            .with_selections(selection_before.clone(), selection_before);
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+        CommandOutcome::Executed
+    }
+
+    fn execute_resize_inline_image(
+        &mut self,
+        block_id: BlockId,
+        object_id: InlineObjectId,
+        width_pt: f32,
+        height_pt: f32,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        let Some(existing) = self
+            .document
+            .find_block(block_id)
+            .and_then(|block| block.kind.inline_content())
+            .and_then(|inline| inline.object_by_id(object_id))
+            .map(|entry| entry.object.clone())
+        else {
+            return CommandOutcome::NoOp;
+        };
+        let InlineObject::Image {
+            asset_id,
+            alt,
+            valign,
+            width_pt: prev_w,
+            height_pt: prev_h,
+        } = existing
+        else {
+            return CommandOutcome::NoOp;
+        };
+        let next_w = width_pt.clamp(24.0, 2000.0);
+        let next_h = height_pt.clamp(24.0, 2000.0);
+        if (next_w - prev_w).abs() < 0.25 && (next_h - prev_h).abs() < 0.25 {
+            return CommandOutcome::NoOp;
+        }
+        let selection_before = self.selection.clone();
+        let transaction = Transaction::new(vec![Step::UpdateInlineObject {
+            block_id,
+            object_id,
+            object: InlineObject::Image {
+                asset_id,
+                alt,
+                width_pt: next_w,
+                height_pt: next_h,
+                valign,
+            },
+        }])
+        .with_selections(selection_before.clone(), selection_before);
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+        CommandOutcome::Executed
+    }
+
+    fn execute_set_table_columns(
+        &mut self,
+        table_id: BlockId,
+        columns: Vec<ColumnSpec>,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        let Some(transaction) = self.document.build_set_table_columns_transaction(
+            table_id,
+            columns,
+            self.selection.clone(),
+        ) else {
+            return CommandOutcome::NoOp;
+        };
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+        CommandOutcome::Executed
+    }
+
+    fn execute_insert_table_row(&mut self, after: bool, cx: &mut Context<Self>) -> CommandOutcome {
+        self.ime_preedit = None;
+        self.history.break_coalescing();
+        let Some(context) = self.active_table_context() else {
+            return CommandOutcome::NoOp;
+        };
+        let target_row = match self.selection.as_ref() {
+            Some(DocumentSelection::TableCells {
+                anchor_cell,
+                focus_cell,
+                ..
+            }) => {
+                if after {
+                    anchor_cell.0.max(focus_cell.0)
+                } else {
+                    anchor_cell.0.min(focus_cell.0)
+                }
+            }
+            _ => context.row,
+        };
+        let Some(transaction) = self.document.build_insert_table_row_transaction(
+            context.table_id,
+            target_row,
+            after,
+            self.selection.clone(),
+        ) else {
+            return CommandOutcome::NoOp;
+        };
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+        CommandOutcome::Executed
+    }
+
+    fn execute_delete_table_row(&mut self, cx: &mut Context<Self>) -> CommandOutcome {
+        self.ime_preedit = None;
+        self.history.break_coalescing();
+        let Some(context) = self.active_table_context() else {
+            return CommandOutcome::NoOp;
+        };
+        let row_range = match self.selection.as_ref() {
+            Some(DocumentSelection::TableCells {
+                anchor_cell,
+                focus_cell,
+                ..
+            }) => {
+                let start = anchor_cell.0.min(focus_cell.0);
+                let end = anchor_cell.0.max(focus_cell.0) + 1;
+                start..end
+            }
+            _ => context.row..(context.row + 1),
+        };
+        let Some(transaction) = self.document.build_delete_table_row_transaction(
+            context.table_id,
+            row_range,
+            self.selection.clone(),
+        ) else {
+            return CommandOutcome::NoOp;
+        };
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+        CommandOutcome::Executed
+    }
+
+    fn execute_insert_table_column(
+        &mut self,
+        after: bool,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        self.ime_preedit = None;
+        self.history.break_coalescing();
+        let Some(context) = self.active_table_context() else {
+            return CommandOutcome::NoOp;
+        };
+        let target_col = match self.selection.as_ref() {
+            Some(DocumentSelection::TableCells {
+                anchor_cell,
+                focus_cell,
+                ..
+            }) => {
+                if after {
+                    anchor_cell.1.max(focus_cell.1)
+                } else {
+                    anchor_cell.1.min(focus_cell.1)
+                }
+            }
+            _ => context.visual_col,
+        };
+        let Some(transaction) = self.document.build_insert_table_column_transaction(
+            context.table_id,
+            target_col,
+            after,
+            self.selection.clone(),
+        ) else {
+            return CommandOutcome::NoOp;
+        };
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+        CommandOutcome::Executed
+    }
+
+    fn execute_delete_table_column(&mut self, cx: &mut Context<Self>) -> CommandOutcome {
+        self.ime_preedit = None;
+        self.history.break_coalescing();
+        let Some(context) = self.active_table_context() else {
+            return CommandOutcome::NoOp;
+        };
+        let col_range = match self.selection.as_ref() {
+            Some(DocumentSelection::TableCells {
+                anchor_cell,
+                focus_cell,
+                ..
+            }) => {
+                let start = anchor_cell.1.min(focus_cell.1);
+                let end = anchor_cell.1.max(focus_cell.1) + 1;
+                start..end
+            }
+            _ => context.visual_col..(context.visual_col + 1),
+        };
+        let Some(transaction) = self.document.build_delete_table_column_transaction(
+            context.table_id,
+            col_range,
+            self.selection.clone(),
+        ) else {
+            return CommandOutcome::NoOp;
+        };
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+        CommandOutcome::Executed
+    }
+
+    fn execute_merge_table_cells(&mut self, cx: &mut Context<Self>) -> CommandOutcome {
+        self.ime_preedit = None;
+        self.history.break_coalescing();
+        let Some(DocumentSelection::TableCells {
+            table_id,
+            anchor_cell,
+            focus_cell,
+        }) = self.selection.clone()
+        else {
+            return CommandOutcome::NoOp;
+        };
+        let Some(transaction) = self.document.build_merge_table_cells_transaction(
+            table_id,
+            anchor_cell,
+            focus_cell,
+            self.selection.clone(),
+        ) else {
+            return CommandOutcome::NoOp;
+        };
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+        CommandOutcome::Executed
+    }
+
+    fn execute_split_table_cell(&mut self, cx: &mut Context<Self>) -> CommandOutcome {
+        self.ime_preedit = None;
+        self.history.break_coalescing();
+        let Some(context) = self.active_table_context() else {
+            return CommandOutcome::NoOp;
+        };
+        let Some(transaction) = self.document.build_split_table_cell_transaction(
+            context.table_id,
+            context.row,
+            context.cell_index,
+            self.selection.clone(),
+        ) else {
+            return CommandOutcome::NoOp;
+        };
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+        CommandOutcome::Executed
+    }
+
+    fn execute_navigate_table_cell(
+        &mut self,
+        forward: bool,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        self.ime_preedit = None;
+        self.history.break_coalescing();
+        let Some(context) = self.active_table_context() else {
+            return CommandOutcome::NoOp;
+        };
+        match self
+            .document
+            .next_table_cell_pos(context.table_id, context.row, context.cell_index, forward)
+        {
+            Some(rich_model::TableCellStep::MoveTo(pos)) => {
+                let next_selection = DocumentSelection::caret(pos, Affinity::Downstream);
+                self.update_selection(Some(next_selection), cx);
+                self.reset_caret_blink(cx);
+                self.ensure_caret_visible();
+                CommandOutcome::Executed
+            }
+            Some(rich_model::TableCellStep::AtBoundary) if forward && self.policy.editable => {
+                // Tab past the final cell appends a new row below and focuses its first cell.
+                self.execute_insert_table_row(true, cx)
+            }
+            _ => CommandOutcome::NoOp,
+        }
+    }
+
     fn set_collapsed_stored_marks(&mut self, marks: InlineStyle, cx: &mut Context<Self>) {
         if let Some(DocumentSelection::Text {
             anchor,
@@ -3061,11 +3691,17 @@ impl RichDocumentView {
         let BlockKind::Table(table) = &self.document.find_block(table_id)?.kind else {
             return None;
         };
+        let (_, placements, occupancy) = table.resolve_grid();
+        let placement_idx = occupancy
+            .get(cell_coords.0)
+            .and_then(|row| row.get(cell_coords.1))
+            .and_then(|slot| *slot)?;
+        let placement = placements.get(placement_idx)?;
         let first_block = table
             .rows
-            .get(cell_coords.0)?
+            .get(placement.row_index)?
             .cells
-            .get(cell_coords.1)?
+            .get(placement.cell_index)?
             .blocks
             .first()?;
         self.document.doc_pos_for_block(first_block.id, 0)
@@ -3303,6 +3939,70 @@ impl RichDocumentView {
         self.history.break_coalescing();
         let canvas_point = self.window_point_to_canvas(event.position);
         let viewport_width: f32 = self.last_viewport_bounds.size.width.into();
+
+        // 1. Check corner drag-resize handles on the currently selected inline image.
+        if self.policy.editable
+            && let Some(selected_img) = self.selected_image
+            && let Some(image_rect) = self.flow.inline_object_rect_cached(
+                selected_img.block_id,
+                selected_img.object_id,
+                &self.document,
+                viewport_width,
+                self.zoom,
+            )
+            && let Some(corner) = hit_test_image_resize_handle(image_rect, canvas_point)
+            && let Some(InlineObject::Image {
+                width_pt,
+                height_pt,
+                ..
+            }) = self
+                .document
+                .find_block(selected_img.block_id)
+                .and_then(|block| block.kind.inline_content())
+                .and_then(|inline| inline.object_by_id(selected_img.object_id))
+                .map(|entry| &entry.object)
+        {
+            self.active_chip_popover = None;
+            self.image_resize_drag = Some(ImageResizeDrag {
+                block_id: selected_img.block_id,
+                object_id: selected_img.object_id,
+                corner,
+                start_canvas_point: canvas_point,
+                initial_width_pt: *width_pt,
+                initial_height_pt: *height_pt,
+                current_width_pt: *width_pt,
+                current_height_pt: *height_pt,
+            });
+            cx.notify();
+            return;
+        }
+
+        // 2. Check interactive table column divider dragging.
+        if self.policy.editable
+            && let Some(divider) = self.flow.hit_test_table_column_border(
+                canvas_point,
+                &self.document,
+                viewport_width,
+                self.zoom,
+                5.0,
+            )
+        {
+            self.active_chip_popover = None;
+            self.selected_image = None;
+            self.table_column_drag = Some(TableColumnDrag {
+                table_id: divider.table_id,
+                column_index: divider.column_index,
+                start_canvas_x: canvas_point.x,
+                initial_divider_x: divider.divider_x,
+                current_divider_x: divider.divider_x,
+                table_y: divider.table_y,
+                table_height: divider.table_height,
+                initial_widths_px: divider.column_widths_px,
+            });
+            cx.notify();
+            return;
+        }
+
         let mut shaper = GpuiShaper::with_extensions(window, &self.extensions)
             .with_optional_font_resolver(self.font_resolver.as_deref());
         let Some(hit) = self.flow.hit_test_canvas(
@@ -3312,18 +4012,87 @@ impl RichDocumentView {
             self.zoom,
             &mut shaper,
         ) else {
+            self.selected_image = None;
+            self.active_chip_popover = None;
+            cx.notify();
             return;
         };
 
         if self.policy.collapsible_headings
             && let Some(heading_id) = hit.toggled_heading
         {
+            self.active_chip_popover = None;
+            self.selected_image = None;
             self.dispatch_command(RichCommand::ToggleHeadingCollapsed(heading_id), cx);
             return;
         }
 
+        if self.policy.editable
+            && let Some(checklist_id) = hit.toggled_checklist
+        {
+            self.active_chip_popover = None;
+            self.selected_image = None;
+            self.dispatch_command(RichCommand::ToggleChecklistItem(checklist_id), cx);
+            return;
+        }
+
+        if self.policy.selectable
+            && let Some(code_block_id) = hit.code_block_copy
+        {
+            self.active_chip_popover = None;
+            self.selected_image = None;
+            self.dispatch_command(RichCommand::CopyCodeBlock(code_block_id), cx);
+            return;
+        }
+
+        // Inspect clicked inline atomic objects (images for resize handles, smart chips for popovers).
+        let clicked_object = hit.hit.inline_object.and_then(|object_id| {
+            let block_id = hit.pos.leaf_block_id()?;
+            let entry = self
+                .document
+                .find_block(block_id)?
+                .kind
+                .inline_content()?
+                .object_by_id(object_id)?;
+            Some((block_id, object_id, entry.object.clone()))
+        });
+
+        self.pending_chip = None;
+        match clicked_object {
+            Some((block_id, object_id, InlineObject::Image { .. })) if self.policy.editable => {
+                self.selected_image = Some(SelectedInlineImage {
+                    block_id,
+                    object_id,
+                });
+                self.active_chip_popover = None;
+            }
+            Some((
+                block_id,
+                object_id,
+                InlineObject::SmartChip {
+                    kind,
+                    label,
+                    accent,
+                },
+            )) => {
+                self.selected_image = None;
+                self.pending_chip = Some(ActiveSmartChipPopover {
+                    block_id,
+                    object_id,
+                    kind,
+                    label,
+                    accent,
+                });
+            }
+            _ => {
+                self.selected_image = None;
+                self.active_chip_popover = None;
+            }
+        }
+
         if self.policy.selectable && event.click_count >= 2 {
             self.pending_link = None;
+            self.pending_chip = None;
             self.drag_origin = None;
             self.drag_moved = false;
             self.dragging = false;
@@ -3345,6 +4114,7 @@ impl RichDocumentView {
         if !self.policy.selectable {
             self.drag_anchor_pos = None;
             self.dragging = false;
+            cx.notify();
             return;
         }
 
@@ -3352,13 +4122,14 @@ impl RichDocumentView {
             && let Some(DocumentSelection::Text { anchor, .. }) = self.selection.clone()
         {
             self.drag_anchor_pos = Some(anchor.clone());
-            selection_from_drag_positions(anchor, hit.pos, hit.affinity)
+            selection_from_drag_positions(&self.document, anchor, hit.pos, hit.affinity)
         } else {
             self.drag_anchor_pos = Some(hit.pos.clone());
             DocumentSelection::caret(hit.pos, hit.affinity)
         };
         self.dragging = true;
         self.dispatch_command(RichCommand::SetSelection(Some(next_selection)), cx);
+        cx.notify();
     }
 
     fn handle_mouse_move(
@@ -3372,6 +4143,66 @@ impl RichDocumentView {
         if viewport_width <= 1.0 {
             return;
         }
+
+        // Active image corner resize drag.
+        if event.dragging()
+            && let Some(drag) = self.image_resize_drag.as_mut()
+        {
+            let px_per_pt = pt_to_px(1.0, self.zoom).max(0.1);
+            let dx_pt = (canvas_point.x - drag.start_canvas_point.x) / px_per_pt;
+            let dy_pt = (canvas_point.y - drag.start_canvas_point.y) / px_per_pt;
+            let raw_w = match drag.corner {
+                ImageResizeCorner::TopLeft | ImageResizeCorner::BottomLeft => {
+                    drag.initial_width_pt - dx_pt
+                }
+                ImageResizeCorner::TopRight | ImageResizeCorner::BottomRight => {
+                    drag.initial_width_pt + dx_pt
+                }
+            };
+            let raw_h = match drag.corner {
+                ImageResizeCorner::TopLeft | ImageResizeCorner::TopRight => {
+                    drag.initial_height_pt - dy_pt
+                }
+                ImageResizeCorner::BottomLeft | ImageResizeCorner::BottomRight => {
+                    drag.initial_height_pt + dy_pt
+                }
+            };
+            let horizontal =
+                resolve_horizontal_metrics(viewport_width, &self.document.config, self.zoom);
+            let max_width_pt = (horizontal.column_width / px_per_pt).max(60.0);
+            let clamped_w = raw_w.clamp(24.0, max_width_pt);
+            let (next_w, next_h) = if event.modifiers.shift {
+                (clamped_w, raw_h.clamp(24.0, 1200.0))
+            } else {
+                let aspect = drag.initial_width_pt / drag.initial_height_pt.max(1.0);
+                let locked_h = (clamped_w / aspect.max(0.05)).clamp(24.0, 1200.0);
+                (locked_h * aspect, locked_h)
+            };
+            drag.current_width_pt = next_w.clamp(24.0, max_width_pt);
+            drag.current_height_pt = next_h.clamp(24.0, 1200.0);
+            cx.notify();
+            return;
+        }
+
+        // Active table column border drag.
+        if event.dragging()
+            && let Some(drag) = self.table_column_drag.as_mut()
+        {
+            let col = drag.column_index;
+            if let (Some(&left_w), Some(&right_w)) = (
+                drag.initial_widths_px.get(col),
+                drag.initial_widths_px.get(col + 1),
+            ) {
+                let min_col_px = pt_to_px(28.0, self.zoom);
+                let min_delta = -(left_w - min_col_px).max(0.0);
+                let max_delta = (right_w - min_col_px).max(0.0);
+                let delta = (canvas_point.x - drag.start_canvas_x).clamp(min_delta, max_delta);
+                drag.current_divider_x = drag.initial_divider_x + delta;
+                cx.notify();
+            }
+            return;
+        }
+
         let mut shaper = GpuiShaper::with_extensions(window, &self.extensions)
             .with_optional_font_resolver(self.font_resolver.as_deref());
         let hit = self.flow.hit_test_canvas(
@@ -3393,11 +4224,59 @@ impl RichDocumentView {
         }
 
         if !self.dragging || !event.dragging() || !self.policy.selectable {
+            let next_image_handle = if self.policy.editable
+                && let Some(selected_img) = self.selected_image
+                && let Some(image_rect) = self.flow.inline_object_rect_cached(
+                    selected_img.block_id,
+                    selected_img.object_id,
+                    &self.document,
+                    viewport_width,
+                    self.zoom,
+                ) {
+                hit_test_image_resize_handle(image_rect, canvas_point)
+            } else {
+                None
+            };
+
+            let next_divider = if self.policy.editable && next_image_handle.is_none() {
+                self.flow.hit_test_table_column_border(
+                    canvas_point,
+                    &self.document,
+                    viewport_width,
+                    self.zoom,
+                    5.0,
+                )
+            } else {
+                None
+            };
+
+            let hovered_chip = hit.as_ref().is_some_and(|result| {
+                let Some(object_id) = result.hit.inline_object else {
+                    return false;
+                };
+                let Some(block_id) = result.pos.leaf_block_id() else {
+                    return false;
+                };
+                self.document
+                    .find_block(block_id)
+                    .and_then(|block| block.kind.inline_content())
+                    .and_then(|inline| inline.object_by_id(object_id))
+                    .is_some_and(|entry| matches!(entry.object, InlineObject::SmartChip { .. }))
+            });
+
             let pointer = hit.as_ref().is_some_and(|result| {
                 (self.policy.collapsible_headings && result.toggled_heading.is_some())
+                    || (self.policy.editable && result.toggled_checklist.is_some())
+                    || (self.policy.selectable && result.code_block_copy.is_some())
                     || (self.policy.clickable_links && result.hit.link.is_some())
-            });
-            if pointer != self.hovered_pointer {
+            }) || hovered_chip;
+
+            let hover_changed = next_image_handle != self.hovered_image_handle
+                || next_divider != self.hovered_column_divider
+                || pointer != self.hovered_pointer;
+            if hover_changed {
+                self.hovered_image_handle = next_image_handle;
+                self.hovered_column_divider = next_divider;
                 self.hovered_pointer = pointer;
                 cx.notify();
             }
@@ -3409,7 +4288,8 @@ impl RichDocumentView {
         };
 
         if let Some(anchor) = self.drag_anchor_pos.clone() {
-            let next_selection = selection_from_drag_positions(anchor, hit.pos, hit.affinity);
+            let next_selection =
+                selection_from_drag_positions(&self.document, anchor, hit.pos, hit.affinity);
             self.dispatch_command(RichCommand::SetSelection(Some(next_selection)), cx);
         }
     }
@@ -3420,9 +4300,69 @@ impl RichDocumentView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if let Some(drag) = self.image_resize_drag.take() {
+            self.dispatch_command(
+                RichCommand::ResizeInlineImage {
+                    block_id: drag.block_id,
+                    object_id: drag.object_id,
+                    width_pt: drag.current_width_pt,
+                    height_pt: drag.current_height_pt,
+                },
+                cx,
+            );
+            cx.notify();
+            return;
+        }
+
+        if let Some(drag) = self.table_column_drag.take() {
+            let delta = drag.current_divider_x - drag.initial_divider_x;
+            if delta.abs() >= 1.0 && drag.column_index + 1 < drag.initial_widths_px.len() {
+                let mut next_widths = drag.initial_widths_px;
+                next_widths[drag.column_index] += delta;
+                next_widths[drag.column_index + 1] -= delta;
+                let total: f32 = next_widths.iter().sum::<f32>().max(1.0);
+                let col_count = next_widths.len() as f32;
+                let columns: Vec<ColumnSpec> = next_widths
+                    .into_iter()
+                    .map(|width| ColumnSpec::Ratio(((width / total) * col_count).max(0.05)))
+                    .collect();
+                self.dispatch_command(
+                    RichCommand::SetTableColumns {
+                        table_id: drag.table_id,
+                        columns,
+                    },
+                    cx,
+                );
+            }
+            cx.notify();
+            return;
+        }
+
         self.dragging = false;
         self.drag_origin = None;
         self.drag_anchor_pos = None;
+        if !self.drag_moved
+            && let Some(chip) = self.pending_chip.take()
+        {
+            let same_open = self.active_chip_popover.as_ref().is_some_and(|open| {
+                open.block_id == chip.block_id && open.object_id == chip.object_id
+            });
+            if same_open {
+                self.active_chip_popover = None;
+            } else {
+                cx.emit(RichDocumentEvent::SmartChipActivated {
+                    block_id: chip.block_id,
+                    object_id: chip.object_id,
+                    kind: chip.kind,
+                    label: chip.label.clone(),
+                });
+                self.active_chip_popover = Some(chip);
+            }
+            cx.notify();
+        } else {
+            self.pending_chip = None;
+        }
+
         if !self.drag_moved
             && let Some(href) = self.pending_link.take()
         {
@@ -3937,22 +4877,100 @@ fn table_cell_of(pos: &DocPos) -> Option<(BlockId, usize, usize)> {
     })
 }
 
-/// Promotes drags across distinct cells of the same table into rectangular `TableCells` selection,
-/// while keeping single-cell drags and cross-block prose drags as `Text` selections.
+/// Returns the 4 corner resize handle rectangles (centered on each corner) for an inline image.
+pub(crate) fn image_resize_handle_rects(image_rect: Rect) -> [(ImageResizeCorner, Rect); 4] {
+    let handle_size = 9.0;
+    let half = handle_size * 0.5;
+    [
+        (
+            ImageResizeCorner::TopLeft,
+            Rect::new(
+                image_rect.x - half,
+                image_rect.y - half,
+                handle_size,
+                handle_size,
+            ),
+        ),
+        (
+            ImageResizeCorner::TopRight,
+            Rect::new(
+                image_rect.right() - half,
+                image_rect.y - half,
+                handle_size,
+                handle_size,
+            ),
+        ),
+        (
+            ImageResizeCorner::BottomLeft,
+            Rect::new(
+                image_rect.x - half,
+                image_rect.bottom() - half,
+                handle_size,
+                handle_size,
+            ),
+        ),
+        (
+            ImageResizeCorner::BottomRight,
+            Rect::new(
+                image_rect.right() - half,
+                image_rect.bottom() - half,
+                handle_size,
+                handle_size,
+            ),
+        ),
+    ]
+}
+
+fn hit_test_image_resize_handle(image_rect: Rect, point: Point) -> Option<ImageResizeCorner> {
+    for (corner, rect) in image_resize_handle_rects(image_rect) {
+        let hit_rect = Rect::new(
+            rect.x - 3.0,
+            rect.y - 3.0,
+            rect.width + 6.0,
+            rect.height + 6.0,
+        );
+        if hit_rect.contains(point) {
+            return Some(corner);
+        }
+    }
+    None
+}
+
+/// Promotes drags across distinct cells of the same table into rectangular `TableCells` selection
+/// (using visual grid coordinates so spanned cells align cleanly), while keeping single-cell drags
+/// and cross-block prose drags as `Text` selections.
 fn selection_from_drag_positions(
+    document: &Document,
     anchor: DocPos,
     focus: DocPos,
     affinity: Affinity,
 ) -> DocumentSelection {
-    if let (Some((anchor_table, anchor_row, anchor_col)), Some((focus_table, focus_row, focus_col))) =
+    if let (Some((anchor_table, anchor_row, anchor_cell_idx)), Some((focus_table, focus_row, focus_cell_idx))) =
         (table_cell_of(&anchor), table_cell_of(&focus))
         && anchor_table == focus_table
-        && (anchor_row, anchor_col) != (focus_row, focus_col)
+        && (anchor_row, anchor_cell_idx) != (focus_row, focus_cell_idx)
     {
+        let (anchor_visual, focus_visual) = match document
+            .find_block(anchor_table)
+            .map(|block| &block.kind)
+        {
+            Some(BlockKind::Table(table)) => {
+                let a_col = table
+                    .placement_for_stored_cell(anchor_row, anchor_cell_idx)
+                    .map(|p| p.visual_col)
+                    .unwrap_or(anchor_cell_idx);
+                let f_col = table
+                    .placement_for_stored_cell(focus_row, focus_cell_idx)
+                    .map(|p| p.visual_col)
+                    .unwrap_or(focus_cell_idx);
+                ((anchor_row, a_col), (focus_row, f_col))
+            }
+            _ => ((anchor_row, anchor_cell_idx), (focus_row, focus_cell_idx)),
+        };
         return DocumentSelection::TableCells {
             table_id: anchor_table,
-            anchor_cell: (anchor_row, anchor_col),
-            focus_cell: (focus_row, focus_col),
+            anchor_cell: anchor_visual,
+            focus_cell: focus_visual,
         };
     }
 
@@ -4382,6 +5400,30 @@ impl Render for RichDocumentView {
             }))
             .on_action(cx.listener(|this, _: &DecreaseFontSize, _window, cx| {
                 this.dispatch_command(RichCommand::AdjustFontSize(-1.0), cx);
+            }))
+            .on_action(cx.listener(|this, _: &InsertTableRowAbove, _window, cx| {
+                this.dispatch_command(RichCommand::InsertTableRow { after: false }, cx);
+            }))
+            .on_action(cx.listener(|this, _: &InsertTableRowBelow, _window, cx| {
+                this.dispatch_command(RichCommand::InsertTableRow { after: true }, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DeleteTableRow, _window, cx| {
+                this.dispatch_command(RichCommand::DeleteTableRow, cx);
+            }))
+            .on_action(cx.listener(|this, _: &InsertTableColumnBefore, _window, cx| {
+                this.dispatch_command(RichCommand::InsertTableColumn { after: false }, cx);
+            }))
+            .on_action(cx.listener(|this, _: &InsertTableColumnAfter, _window, cx| {
+                this.dispatch_command(RichCommand::InsertTableColumn { after: true }, cx);
+            }))
+            .on_action(cx.listener(|this, _: &DeleteTableColumn, _window, cx| {
+                this.dispatch_command(RichCommand::DeleteTableColumn, cx);
+            }))
+            .on_action(cx.listener(|this, _: &MergeTableCells, _window, cx| {
+                this.dispatch_command(RichCommand::MergeTableCells, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SplitTableCell, _window, cx| {
+                this.dispatch_command(RichCommand::SplitTableCell, cx);
             }))
             .on_scroll(cx.listener(Self::handle_scroll_wheel))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))

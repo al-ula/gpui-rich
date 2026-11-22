@@ -1,22 +1,22 @@
 //! Demo GPUI application showcasing the non-paginated `gpui-rich` renderer.
 
 use gpui_kit::{
-    App, AppContext, Bounds, Context, Entity, InteractiveElement, IntoElement, MouseButton,
-    ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Subscription, Window,
-    WindowBounds, WindowOptions, div, px, rgb, size,
+    App, AppContext, Bounds, ClipboardItem, Context, Entity, ImageFormat, InteractiveElement,
+    IntoElement, MouseButton, ParentElement, Render, SharedString, StatefulInteractiveElement,
+    Styled, Subscription, Window, WindowBounds, WindowOptions, div, px, rgb, size,
 };
 use rich_gpui::{
-    CustomBlockRenderContext, CustomInlineRenderContext, CustomRenderOutput, NodeExtension,
-    RichDocumentEvent, RichDocumentView, RichTheme, register_default_keybindings,
+    CustomBlockRenderContext, CustomInlineRenderContext, CustomRenderOutput, MemoryAssetProvider,
+    NodeExtension, RichDocumentEvent, RichDocumentView, RichTheme, register_default_keybindings,
 };
 use rich_layout::{InlineBoxMetrics, Size, pt_to_px};
 use rich_model::{
     BaselineShift, BlockDecorations, BlockKind, BlockNode, BlockStyle, BlockWidth, ChipKind,
     ColumnSpec, DecorationContext, DecorationProvider, Document, Edges, FontWeight,
     HorizontalLayout, InlineContent, InlineDecoration, InlineObject, InlineStyle, InlineVAlign,
-    InteractionPolicy, ListId, ListKind, MarkKind, NumberStyle, PaperSpec, RgbaColor, RichCommand,
-    SelectionValue, StyleId, TableBlock, TableBorderStyle, TableCell, TableRow, TextAlign,
-    UnderlineKind,
+    InteractionPolicy, ListId, ListKind, MarkKind, MarkdownCodec, NumberStyle, PaperSpec,
+    RgbaColor, RichCommand, SelectionValue, StyleId, TableBlock, TableBorderStyle, TableCell,
+    TableRow, TextAlign, UnderlineKind,
 };
 
 struct RustSyntaxDecorationProvider;
@@ -211,10 +211,100 @@ impl NodeExtension for StatusBadgeExtension {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum DisplayUnit {
+    Pt,
+    Px,
+    In,
+    Cm,
+    Mm,
+}
+
+impl DisplayUnit {
+    const ALL: [Self; 5] = [Self::Pt, Self::Px, Self::In, Self::Cm, Self::Mm];
+
+    const fn suffix(self) -> &'static str {
+        match self {
+            Self::Pt => "pt",
+            Self::Px => "px",
+            Self::In => "in",
+            Self::Cm => "cm",
+            Self::Mm => "mm",
+        }
+    }
+
+    const fn next(self) -> Self {
+        match self {
+            Self::Pt => Self::Px,
+            Self::Px => Self::In,
+            Self::In => Self::Cm,
+            Self::Cm => Self::Mm,
+            Self::Mm => Self::Pt,
+        }
+    }
+
+    fn from_pt(self, pt: f32) -> f32 {
+        match self {
+            Self::Pt => pt,
+            Self::Px => pt * (4.0 / 3.0),
+            Self::In => pt / 72.0,
+            Self::Cm => pt * 2.54 / 72.0,
+            Self::Mm => pt * 25.4 / 72.0,
+        }
+    }
+
+    fn to_pt(self, value: f32) -> f32 {
+        match self {
+            Self::Pt => value,
+            Self::Px => value * 0.75,
+            Self::In => value * 72.0,
+            Self::Cm => value * 72.0 / 2.54,
+            Self::Mm => value * 72.0 / 25.4,
+        }
+    }
+
+    fn format_value(self, pt: f32) -> String {
+        let converted = self.from_pt(pt);
+        match self {
+            Self::Pt | Self::Px => format!("{converted:.0}{}", self.suffix()),
+            Self::In | Self::Cm => format!("{converted:.2}{}", self.suffix()),
+            Self::Mm => format!("{converted:.1}{}", self.suffix()),
+        }
+    }
+
+    fn margin_step_pt(self) -> f32 {
+        match self {
+            Self::Pt => self.to_pt(6.0),
+            Self::Px => self.to_pt(8.0),
+            Self::In => self.to_pt(0.1),
+            Self::Cm => self.to_pt(0.25),
+            Self::Mm => self.to_pt(2.0),
+        }
+    }
+
+    const fn margin_step_label(self) -> &'static str {
+        match self {
+            Self::Pt => "6pt",
+            Self::Px => "8px",
+            Self::In => "0.1in",
+            Self::Cm => "0.25cm",
+            Self::Mm => "2mm",
+        }
+    }
+
+    fn font_size_step_pt(self) -> f32 {
+        match self {
+            Self::Px => self.to_pt(1.0),
+            _ => 1.0,
+        }
+    }
+}
+
 struct DocsViewerApp {
     document_view: Entity<RichDocumentView>,
     _event_subscription: Subscription,
     last_paper_spec: PaperSpec,
+    display_unit: DisplayUnit,
     dark_mode: bool,
     font_menu_open: bool,
     margin_menu_open: bool,
@@ -225,8 +315,15 @@ struct DocsViewerApp {
 impl DocsViewerApp {
     fn new(cx: &mut Context<Self>) -> Self {
         let document = build_sample_document();
+        let assets = MemoryAssetProvider::new();
+        assets.insert_encoded(
+            "diagram-1",
+            ImageFormat::Svg,
+            SAMPLE_DIAGRAM_SVG.as_bytes(),
+        );
         let document_view = cx.new(|cx| {
             RichDocumentView::new(document, cx)
+                .with_asset_provider(assets)
                 .with_decoration_provider(RustSyntaxDecorationProvider)
                 .with_node_extension("callout", CalloutBlockExtension)
                 .with_node_extension("status", StatusBadgeExtension)
@@ -236,6 +333,14 @@ impl DocsViewerApp {
             |this, _view, event: &RichDocumentEvent, cx| match event {
                 RichDocumentEvent::LinkActivated { href } => {
                     this.status_message = format!("Link: {href}").into();
+                    cx.notify();
+                }
+                RichDocumentEvent::SmartChipActivated { label, .. } => {
+                    this.status_message = format!("Chip: {label}").into();
+                    cx.notify();
+                }
+                RichDocumentEvent::CodeBlockCopied { .. } => {
+                    this.status_message = SharedString::from("Code block copied");
                     cx.notify();
                 }
                 RichDocumentEvent::DocumentMutated { change_set } => {
@@ -253,6 +358,7 @@ impl DocsViewerApp {
             document_view,
             _event_subscription: event_subscription,
             last_paper_spec: PaperSpec::LETTER,
+            display_unit: DisplayUnit::Pt,
             dark_mode: false,
             font_menu_open: false,
             margin_menu_open: false,
@@ -487,6 +593,7 @@ impl Render for DocsViewerApp {
                 );
         }
 
+        let unit = self.display_unit;
         toolbar = toolbar
             .child(div().w(px(1.0)).h(px(16.0)).bg(toolbar_border).mx(px(2.0)))
             .child(
@@ -504,6 +611,23 @@ impl Render for DocsViewerApp {
                             this.font_menu_open = false;
                         }
                         cx.stop_propagation();
+                        cx.notify();
+                    }),
+                ),
+            )
+            .child(
+                Self::toolbar_button(
+                    "unit-cycle",
+                    format!("Unit: {}", unit.suffix()),
+                    false,
+                    dark,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        this.display_unit = this.display_unit.next();
+                        this.status_message =
+                            format!("Unit: {}", this.display_unit.suffix()).into();
                         cx.notify();
                     }),
                 ),
@@ -685,14 +809,15 @@ impl Render for DocsViewerApp {
             active_font_selection = font_family;
 
             let size_label = match font_size_pt {
-                Some(SelectionValue::Uniform(pt)) => format!("{:.0}pt", pt),
+                Some(SelectionValue::Uniform(pt)) => unit.format_value(pt),
                 Some(SelectionValue::Mixed) => "Mixed".to_owned(),
                 None => "--".to_owned(),
             };
+            let font_step_pt = unit.font_size_step_pt();
             let uniform_heading = heading_level.and_then(SelectionValue::uniform);
             let uniform_align = text_align.and_then(SelectionValue::uniform);
 
-            let format_bar = div()
+            let mut format_bar = div()
                 .flex()
                 .flex_row()
                 .items_center()
@@ -724,9 +849,12 @@ impl Render for DocsViewerApp {
                 .child(
                     Self::toolbar_button("fmt-size-dec", "A-", false, dark).on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _event, _window, cx| {
+                        cx.listener(move |this, _event, _window, cx| {
                             this.document_view.update(cx, |view, cx| {
-                                view.dispatch_command(RichCommand::AdjustFontSize(-1.0), cx);
+                                view.dispatch_command(
+                                    RichCommand::AdjustFontSize(-font_step_pt),
+                                    cx,
+                                );
                             });
                         }),
                     ),
@@ -741,9 +869,12 @@ impl Render for DocsViewerApp {
                 .child(
                     Self::toolbar_button("fmt-size-inc", "A+", false, dark).on_mouse_down(
                         MouseButton::Left,
-                        cx.listener(|this, _event, _window, cx| {
+                        cx.listener(move |this, _event, _window, cx| {
                             this.document_view.update(cx, |view, cx| {
-                                view.dispatch_command(RichCommand::AdjustFontSize(1.0), cx);
+                                view.dispatch_command(
+                                    RichCommand::AdjustFontSize(font_step_pt),
+                                    cx,
+                                );
                             });
                         }),
                     ),
@@ -974,7 +1105,97 @@ impl Render for DocsViewerApp {
                             });
                         }),
                     ),
+                )
+                .child(
+                    Self::toolbar_button("fmt-export-md", "Copy MD", false, dark).on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _event, _window, cx| {
+                            let exported = this.document_view.read(cx).export_document(&MarkdownCodec);
+                            match exported {
+                                Ok(markdown) => {
+                                    cx.write_to_clipboard(ClipboardItem::new_string(markdown));
+                                    this.status_message = SharedString::from("Exported Markdown to clipboard");
+                                }
+                                Err(error) => {
+                                    this.status_message = format!("Export failed: {error}").into();
+                                }
+                            }
+                            cx.notify();
+                        }),
+                    ),
                 );
+            if let Some(table_ctx) = self.document_view.read(cx).active_table_context() {
+                format_bar = format_bar
+                    .child(div().w(px(1.0)).h(px(16.0)).bg(toolbar_border).mx(px(2.0)))
+                    .child(
+                        Self::toolbar_button("tbl-add-row", "+Row", false, dark).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.document_view.update(cx, |view, cx| {
+                                    view.dispatch_command(
+                                        RichCommand::InsertTableRow { after: true },
+                                        cx,
+                                    );
+                                });
+                            }),
+                        ),
+                    )
+                    .child(
+                        Self::toolbar_button("tbl-del-row", "-Row", false, dark).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.document_view.update(cx, |view, cx| {
+                                    view.dispatch_command(RichCommand::DeleteTableRow, cx);
+                                });
+                            }),
+                        ),
+                    )
+                    .child(
+                        Self::toolbar_button("tbl-add-col", "+Col", false, dark).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.document_view.update(cx, |view, cx| {
+                                    view.dispatch_command(
+                                        RichCommand::InsertTableColumn { after: true },
+                                        cx,
+                                    );
+                                });
+                            }),
+                        ),
+                    )
+                    .child(
+                        Self::toolbar_button("tbl-del-col", "-Col", false, dark).on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(|this, _event, _window, cx| {
+                                this.document_view.update(cx, |view, cx| {
+                                    view.dispatch_command(RichCommand::DeleteTableColumn, cx);
+                                });
+                            }),
+                        ),
+                    )
+                    .child(
+                        Self::toolbar_button("tbl-merge", "Merge", table_ctx.can_merge, dark)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _event, _window, cx| {
+                                    this.document_view.update(cx, |view, cx| {
+                                        view.dispatch_command(RichCommand::MergeTableCells, cx);
+                                    });
+                                }),
+                            ),
+                    )
+                    .child(
+                        Self::toolbar_button("tbl-split", "Split", table_ctx.can_split, dark)
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _event, _window, cx| {
+                                    this.document_view.update(cx, |view, cx| {
+                                        view.dispatch_command(RichCommand::SplitTableCell, cx);
+                                    });
+                                }),
+                            ),
+                    );
+            }
             root = root.child(format_bar);
         }
 
@@ -1151,11 +1372,63 @@ impl Render for DocsViewerApp {
             let selected_text = if dark { rgb(0x79c0ff) } else { rgb(0x0b57d0) };
             let step_button_bg = if dark { rgb(0x21262d) } else { rgb(0xf1f3f4) };
 
+            let mut unit_row = div()
+                .flex()
+                .flex_row()
+                .items_center()
+                .justify_between()
+                .px(px(6.0))
+                .pb(px(4.0))
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                        .text_color(muted_color)
+                        .child("Unit"),
+                );
+            let mut unit_pills = div().flex().flex_row().items_center().gap(px(3.0));
+            for (index, candidate) in DisplayUnit::ALL.into_iter().enumerate() {
+                let is_active = candidate == unit;
+                unit_pills = unit_pills.child(
+                    div()
+                        .id(("margin-unit-option", index))
+                        .px(px(6.0))
+                        .py(px(2.0))
+                        .rounded(px(4.0))
+                        .bg(if is_active {
+                            selected_bg
+                        } else {
+                            step_button_bg
+                        })
+                        .text_color(if is_active {
+                            selected_text
+                        } else {
+                            title_color
+                        })
+                        .text_size(px(11.0))
+                        .cursor_pointer()
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |this, _event, _window, cx| {
+                                this.display_unit = candidate;
+                                this.status_message =
+                                    format!("Unit: {}", candidate.suffix()).into();
+                                cx.stop_propagation();
+                                cx.notify();
+                            }),
+                        )
+                        .child(candidate.suffix()),
+                );
+            }
+            unit_row = unit_row.child(unit_pills);
+
             let mut panel_content = div()
                 .flex()
                 .flex_col()
                 .p(px(8.0))
                 .gap(px(4.0))
+                .child(unit_row)
+                .child(div().h(px(1.0)).w_full().bg(toolbar_border).my(px(2.0)))
                 .child(
                     div()
                         .text_size(px(11.0))
@@ -1166,11 +1439,31 @@ impl Render for DocsViewerApp {
                         .child("Margin Presets"),
                 );
 
-            let presets: [(&str, &str, Edges); 4] = [
-                ("Narrow", "0.5 in (36pt)", Edges::MARGINS_NARROW),
-                ("Moderate", "0.75 in (54pt)", Edges::MARGINS_MODERATE),
-                ("Normal", "1.0 in (72pt)", Edges::MARGINS_NORMAL),
-                ("Wide", "1.5 in / 1.0 in", Edges::MARGINS_WIDE),
+            let presets: [(&str, String, Edges); 4] = [
+                (
+                    "Narrow",
+                    unit.format_value(Edges::MARGINS_NARROW.left),
+                    Edges::MARGINS_NARROW,
+                ),
+                (
+                    "Moderate",
+                    unit.format_value(Edges::MARGINS_MODERATE.left),
+                    Edges::MARGINS_MODERATE,
+                ),
+                (
+                    "Normal",
+                    unit.format_value(Edges::MARGINS_NORMAL.left),
+                    Edges::MARGINS_NORMAL,
+                ),
+                (
+                    "Wide",
+                    format!(
+                        "{} / {}",
+                        unit.format_value(Edges::MARGINS_WIDE.left),
+                        unit.format_value(Edges::MARGINS_WIDE.top),
+                    ),
+                    Edges::MARGINS_WIDE,
+                ),
             ];
             for (index, (name, detail, preset_edges)) in presets.into_iter().enumerate() {
                 let is_selected = Self::edges_approx_eq(active_margins, preset_edges);
@@ -1207,6 +1500,7 @@ impl Render for DocsViewerApp {
                 );
             }
 
+            let step_pt = unit.margin_step_pt();
             panel_content = panel_content
                 .child(div().h(px(1.0)).w_full().bg(toolbar_border).my(px(4.0)))
                 .child(
@@ -1216,7 +1510,7 @@ impl Render for DocsViewerApp {
                         .text_color(muted_color)
                         .px(px(6.0))
                         .pb(px(2.0))
-                        .child("Custom Edges (6pt step)"),
+                        .child(format!("Custom Edges ({} step)", unit.margin_step_label())),
                 );
 
             let edge_rows: [(&str, f32, Edges, Edges); 4] = [
@@ -1224,13 +1518,13 @@ impl Render for DocsViewerApp {
                     "Top",
                     active_margins.top,
                     Edges::new(
-                        active_margins.top - 6.0,
+                        active_margins.top - step_pt,
                         active_margins.right,
                         active_margins.bottom,
                         active_margins.left,
                     ),
                     Edges::new(
-                        active_margins.top + 6.0,
+                        active_margins.top + step_pt,
                         active_margins.right,
                         active_margins.bottom,
                         active_margins.left,
@@ -1242,13 +1536,13 @@ impl Render for DocsViewerApp {
                     Edges::new(
                         active_margins.top,
                         active_margins.right,
-                        active_margins.bottom - 6.0,
+                        active_margins.bottom - step_pt,
                         active_margins.left,
                     ),
                     Edges::new(
                         active_margins.top,
                         active_margins.right,
-                        active_margins.bottom + 6.0,
+                        active_margins.bottom + step_pt,
                         active_margins.left,
                     ),
                 ),
@@ -1259,13 +1553,13 @@ impl Render for DocsViewerApp {
                         active_margins.top,
                         active_margins.right,
                         active_margins.bottom,
-                        active_margins.left - 6.0,
+                        active_margins.left - step_pt,
                     ),
                     Edges::new(
                         active_margins.top,
                         active_margins.right,
                         active_margins.bottom,
-                        active_margins.left + 6.0,
+                        active_margins.left + step_pt,
                     ),
                 ),
                 (
@@ -1273,13 +1567,13 @@ impl Render for DocsViewerApp {
                     active_margins.right,
                     Edges::new(
                         active_margins.top,
-                        active_margins.right - 6.0,
+                        active_margins.right - step_pt,
                         active_margins.bottom,
                         active_margins.left,
                     ),
                     Edges::new(
                         active_margins.top,
-                        active_margins.right + 6.0,
+                        active_margins.right + step_pt,
                         active_margins.bottom,
                         active_margins.left,
                     ),
@@ -1330,10 +1624,10 @@ impl Render for DocsViewerApp {
                                 )
                                 .child(
                                     div()
-                                        .w(px(44.0))
+                                        .w(px(54.0))
                                         .text_size(px(11.0))
                                         .text_color(muted_color)
-                                        .child(format!("{:.0}pt", current_pt)),
+                                        .child(unit.format_value(current_pt)),
                                 )
                                 .child(
                                     div()
@@ -1404,6 +1698,20 @@ impl Render for DocsViewerApp {
         root
     }
 }
+
+const SAMPLE_DIAGRAM_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="320" height="72" viewBox="0 0 320 72">
+  <defs>
+    <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#e8f0fe"/>
+      <stop offset="100%" stop-color="#dcfce7"/>
+    </linearGradient>
+  </defs>
+  <rect x="2" y="2" width="316" height="68" rx="10" fill="url(#bg)" stroke="#8ab4f8" stroke-width="2"/>
+  <rect x="16" y="18" width="76" height="36" rx="6" fill="#0b57d0"/>
+  <rect x="122" y="18" width="76" height="36" rx="6" fill="#166534"/>
+  <rect x="228" y="18" width="76" height="36" rx="6" fill="#6b21a8"/>
+  <path d="M94 36 L118 36 M200 36 L224 36" stroke="#1f2328" stroke-width="2.5" stroke-linecap="round"/>
+</svg>"##;
 
 fn build_sample_document() -> Document {
     let mut document = Document::new();
@@ -1584,13 +1892,31 @@ fn build_sample_document() -> Document {
         Some(true),
         InlineContent::plain("Phase 2: Rich text editing, formatting, rich HTML clipboard, decorations, and custom extensions."),
     );
+    document.add_list_item(
+        ListId(3),
+        ListKind::Checklist,
+        0,
+        Some(false),
+        InlineContent::plain("Phase 3: Click checklists in Edit mode, drag image handles, drag table column borders, click smart chips, and copy code blocks."),
+    );
+
+    let mut bidi_sample = InlineContent::empty();
+    bidi_sample.push_text(
+        "Unicode BiDi (UAX #9) splits runs and reorders mixed scripts inline: ",
+        InlineStyle::default(),
+    );
+    bidi_sample.push_text("שלום עולם", InlineStyle::bold());
+    bidi_sample.push_text(" and ", InlineStyle::default());
+    bidi_sample.push_text("مرحبا بالعالم", InlineStyle::italic());
+    bidi_sample.push_text(" alongside English prose.", InlineStyle::default());
+    document.add_paragraph(bidi_sample, BlockStyle::default());
 
     let mut ext_intro = InlineContent::empty();
     ext_intro.push_text("Custom inline extensions render hosted GPUI widgets inline ", InlineStyle::default());
     ext_intro.push_object(
         InlineObject::Custom {
             kind: "status".into(),
-            data: serde_json::json!({ "label": "PHASE 2 COMPLETE" }),
+            data: serde_json::json!({ "label": "PHASE 3 READY" }),
         },
         InlineStyle::default(),
     );

@@ -148,9 +148,9 @@ flowchart TD
   * [x] **Extensibility Seam 2**: `DecorationProvider` (`InlineDecoration` + `OverlayDecoration`) feeding Layers 2, 4, and 5 (find/comment highlights, per-glyph syntax foreground overrides, spellcheck underlines, ghost text, remote carets).
   * [x] **Extensibility Seam 3**: `BlockKind::Custom`, `InlineObject::Custom`, `RichCommand::Custom`, `NodeExtension`, and `ExtensionRegistry` (including hosted interactive GPUI `AnyElement` children and direct immediate-mode paint callbacks).
 
-### Phase 3: Advanced Google Docs Capabilities (Planned)
+### Phase 3: Advanced Google Docs Capabilities (Complete)
 
-* [ ] Interactive checklist clicking, async `AssetProvider` with image decoding (`window.paint_image`) and drag-resize handles, and built-in interactive widgets (smart chip popovers, code block copy buttons).
-* [ ] Interactive table editing (column width dragging, Tab cell navigation, row/column insert & delete, cell merge/split).
-* [ ] Full Unicode BiDi (`unicode-bidi` UAX #9 run splitting and visual fragment reordering).
-* [ ] Pluggable `DocumentCodec` (Markdown / HTML) and optional CRDT sync over `after_transaction`.
+* [x] Interactive checklist clicking (`Step::ToggleChecklist`, `RichCommand::ToggleChecklistItem`), async `AssetProvider` (`MemoryAssetProvider`, `FileAssetProvider`) with background image/SVG decoding painted via `window.paint_image`, 4-corner inline image drag-resize handles (`Step::UpdateInlineObject`, `RichCommand::ResizeInlineImage`), and built-in interactive widgets (smart chip floating popovers and code block `Copy`/`Copied` buttons).
+* [x] Interactive table editing: column divider hover/drag resizing (`hit_test_table_column_border`, `RichCommand::SetTableColumns`), Tab/Shift+Tab cell navigation (appending a new row when tabbing past the final cell), and span-aware row/column insert, delete, merge, and split transactions with full Undo/Redo (`InsertTableRow`, `DeleteTableRow`, `InsertTableColumn`, `DeleteTableColumn`, `MergeTableCells`, `SplitTableCell`).
+* [x] Full Unicode BiDi (`unicode-bidi` UAX #9 embedding level analysis, BiDi run splitting across `GpuiShaper` and `MockShaper`, L1/L2 visual fragment reordering, RTL hit-testing, and disjoint multi-run BiDi selection rectangles).
+* [x] Pluggable `DocumentCodec` (`CodecRegistry`, `MarkdownCodec`, `HtmlCodec`, `JsonCodec`) and optional CRDT sync (`CrdtSyncBridge`, `SyncDelta`, `SyncTransport`, fractional `OrderKey` LWW-Element-Set with tombstones) over `CommandMiddleware::after_transaction`.

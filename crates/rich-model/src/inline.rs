@@ -154,6 +154,21 @@ impl InlineContent {
             .map(|idx| &self.objects[idx])
     }
 
+    /// Looks up an inline object entry by its [`InlineObjectId`].
+    pub fn object_by_id(&self, id: InlineObjectId) -> Option<&InlineObjectEntry> {
+        self.objects.iter().find(|entry| entry.id == id)
+    }
+
+    /// Replaces the payload of the inline object matching `id`, returning the previous payload.
+    pub fn update_object(
+        &mut self,
+        id: InlineObjectId,
+        object: InlineObject,
+    ) -> Option<InlineObject> {
+        let entry = self.objects.iter_mut().find(|entry| entry.id == id)?;
+        Some(std::mem::replace(&mut entry.object, object))
+    }
+
     /// Returns the inline style active at `byte_offset` (or the preceding style at `len()`).
     pub fn style_at(&self, byte_offset: usize) -> InlineStyle {
         if self.spans.is_empty() {

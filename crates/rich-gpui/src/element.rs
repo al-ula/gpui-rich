@@ -1,20 +1,25 @@
 //! Custom GPUI [`Element`] implementing virtualized non-paginated 6-layer rich text painting.
 
+use crate::asset::LoadedAsset;
 use crate::extension::{
     CustomBlockRenderContext, CustomInlineRenderContext, CustomRenderOutput, DirectPaintCallback,
     ExtensionRegistry, NodeExtension,
 };
 use crate::shaper::{GpuiGlyphBackend, GpuiShaper, rgba_to_hsla};
 use crate::theme::RichTheme;
-use crate::view::{ImePreedit, RichDocumentView};
+use crate::view::{
+    ActiveSmartChipPopover, ImageResizeCorner, ImePreedit, RichDocumentView,
+    image_resize_handle_rects,
+};
 #[cfg(not(feature = "gpui-fast"))]
 use gpui_kit::IntoElement;
 use gpui_kit::{
-    AnyElement, App, AvailableSpace, BorderStyle, Bounds, BoxShadow, ContentMask, Corners,
-    CursorStyle, Edges, Element, ElementId, ElementInputHandler, Entity, FocusHandle,
-    GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, LayoutId, Length, Pixels,
-    Point, SharedString, StrikethroughStyle, Style, TextRun, UnderlineStyle, Window, fill, outline,
-    point, px, quad, size,
+    AnyElement, App, AvailableSpace, BorderStyle, Bounds, BoxShadow, ClipboardItem, ContentMask,
+    Corners, CursorStyle, Edges, Element, ElementId, ElementInputHandler, Entity, FocusHandle,
+    GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, InteractiveElement,
+    LayoutId, Length, MouseButton, ParentElement, Pixels, Point, SharedString,
+    StatefulInteractiveElement, StrikethroughStyle, Style, Styled, TextRun, UnderlineStyle, Window,
+    div, fill, outline, point, px, quad, size,
 };
 use rich_layout::{
     BlockLayout, BlockLayoutKind, HorizontalMetrics, InlineBoxFragment, LineFragment,
@@ -22,11 +27,12 @@ use rich_layout::{
     resolve_horizontal_metrics,
 };
 use rich_model::{
-    Affinity, BlockDecorations, BlockId, DecorationContext, DocumentSelection, InlineDecoration,
-    InlineObject, InlineObjectId, OverlayDecoration, RgbaColor, UnderlineKind,
+    Affinity, BlockDecorations, BlockId, ChipKind, DecorationContext, DocumentSelection,
+    InlineDecoration, InlineObject, InlineObjectId, OverlayDecoration, RgbaColor, UnderlineKind,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
+use std::sync::Arc;
 
 const OVERSCAN_PX: f32 = 300.0;
 
@@ -91,6 +97,19 @@ struct PendingCustomInline {
     extension: Rc<dyn NodeExtension>,
 }
 
+struct SelectedImageOverlay {
+    canvas_rect: Rect,
+    preview_rect: Option<Rect>,
+    preview_label: Option<String>,
+}
+
+struct ColumnDividerGuide {
+    canvas_x: f32,
+    table_y: f32,
+    table_height: f32,
+    dragging: bool,
+}
+
 /// Prepaint payload passed from `Element::prepaint` into `Element::paint`.
 pub struct RichPrepaintState {
     visible_blocks: Vec<VisibleBlock<GpuiGlyphBackend>>,
@@ -98,6 +117,11 @@ pub struct RichPrepaintState {
     decoration_highlights: Vec<(Rect, RgbaColor)>,
     block_inline_decorations: HashMap<BlockId, Vec<InlineDecoration>>,
     decoration_overlays: Vec<PrepaintDecorationOverlay>,
+    image_assets: HashMap<String, LoadedAsset>,
+    copied_code_block: Option<BlockId>,
+    selected_image_overlay: Option<SelectedImageOverlay>,
+    column_divider_guide: Option<ColumnDividerGuide>,
+    popover_element: Option<AnyElement>,
     handled_custom_blocks: HashSet<BlockId>,
     handled_custom_inlines: HashSet<(BlockId, InlineObjectId)>,
     hosted_custom_elements: Vec<(Bounds<Pixels>, AnyElement)>,
@@ -162,6 +186,11 @@ impl Element for RichDocumentElement {
             decoration_highlights,
             block_inline_decorations,
             decoration_overlays,
+            image_assets,
+            copied_code_block,
+            selected_image_overlay,
+            column_divider_guide,
+            pending_chip_popover,
             pending_custom_blocks,
             pending_custom_inlines,
             caret_rect,
@@ -317,6 +346,7 @@ impl Element for RichDocumentElement {
 
             let mut pending_custom_blocks = Vec::new();
             let mut pending_custom_inlines = Vec::new();
+            let mut visible_image_ids: HashSet<String> = HashSet::new();
             for entry in &visible {
                 collect_pending_custom_nodes(
                     &entry.layout,
@@ -325,8 +355,99 @@ impl Element for RichDocumentElement {
                     &view.extensions,
                     &mut pending_custom_blocks,
                     &mut pending_custom_inlines,
+                    &mut visible_image_ids,
                 );
             }
+
+            let mut image_assets = HashMap::new();
+            for asset_id in visible_image_ids {
+                if let Some(loaded) = view.resolve_or_request_image(&asset_id, cx) {
+                    image_assets.insert(asset_id, loaded);
+                }
+            }
+
+            let selected_image_overlay = if view.policy.editable {
+                view.selected_image.and_then(|selected| {
+                    let canvas_rect = view.flow.inline_object_rect_in_visible(
+                        selected.block_id,
+                        selected.object_id,
+                        &visible,
+                    )?;
+                    let (preview_rect, preview_label) = match view.image_resize_drag.as_ref() {
+                        Some(drag)
+                            if drag.block_id == selected.block_id
+                                && drag.object_id == selected.object_id =>
+                        {
+                            let new_w = pt_to_px(drag.current_width_pt, view.zoom);
+                            let new_h = pt_to_px(drag.current_height_pt, view.zoom);
+                            let rect = match drag.corner {
+                                ImageResizeCorner::TopLeft => Rect::new(
+                                    canvas_rect.right() - new_w,
+                                    canvas_rect.bottom() - new_h,
+                                    new_w,
+                                    new_h,
+                                ),
+                                ImageResizeCorner::TopRight => Rect::new(
+                                    canvas_rect.x,
+                                    canvas_rect.bottom() - new_h,
+                                    new_w,
+                                    new_h,
+                                ),
+                                ImageResizeCorner::BottomLeft => Rect::new(
+                                    canvas_rect.right() - new_w,
+                                    canvas_rect.y,
+                                    new_w,
+                                    new_h,
+                                ),
+                                ImageResizeCorner::BottomRight => {
+                                    Rect::new(canvas_rect.x, canvas_rect.y, new_w, new_h)
+                                }
+                            };
+                            let label = format!(
+                                "{} × {} pt",
+                                drag.current_width_pt.round() as i32,
+                                drag.current_height_pt.round() as i32
+                            );
+                            (Some(rect), Some(label))
+                        }
+                        _ => (None, None),
+                    };
+                    Some(SelectedImageOverlay {
+                        canvas_rect,
+                        preview_rect,
+                        preview_label,
+                    })
+                })
+            } else {
+                None
+            };
+
+            let column_divider_guide = if let Some(drag) = view.table_column_drag.as_ref() {
+                Some(ColumnDividerGuide {
+                    canvas_x: drag.current_divider_x,
+                    table_y: drag.table_y,
+                    table_height: drag.table_height,
+                    dragging: true,
+                })
+            } else {
+                view.hovered_column_divider
+                    .as_ref()
+                    .map(|hit| ColumnDividerGuide {
+                        canvas_x: hit.divider_x,
+                        table_y: hit.table_y,
+                        table_height: hit.table_height,
+                        dragging: false,
+                    })
+            };
+
+            let pending_chip_popover = view.active_chip_popover.as_ref().and_then(|popover| {
+                let anchor_rect = view.flow.inline_object_rect_in_visible(
+                    popover.block_id,
+                    popover.object_id,
+                    &visible,
+                )?;
+                Some((popover.clone(), anchor_rect))
+            });
 
             let preedit_overlay = view.ime_preedit.as_ref().and_then(|preedit| {
                 let anchor_pos = view
@@ -375,7 +496,23 @@ impl Element for RichDocumentElement {
                 None
             };
 
-            let cursor_style = if view.hovered_pointer {
+            let active_handle = view
+                .image_resize_drag
+                .as_ref()
+                .map(|drag| drag.corner)
+                .or(view.hovered_image_handle);
+            let cursor_style = if let Some(corner) = active_handle {
+                match corner {
+                    ImageResizeCorner::TopLeft | ImageResizeCorner::BottomRight => {
+                        CursorStyle::ResizeUpRightDownLeft
+                    }
+                    ImageResizeCorner::TopRight | ImageResizeCorner::BottomLeft => {
+                        CursorStyle::ResizeUpLeftDownRight
+                    }
+                }
+            } else if view.table_column_drag.is_some() || view.hovered_column_divider.is_some() {
+                CursorStyle::ResizeColumn
+            } else if view.hovered_pointer {
                 CursorStyle::PointingHand
             } else if view.policy.selectable || view.policy.editable {
                 CursorStyle::IBeam
@@ -392,6 +529,11 @@ impl Element for RichDocumentElement {
                 decoration_highlights,
                 block_inline_decorations,
                 decoration_overlays,
+                image_assets,
+                view.copied_code_block,
+                selected_image_overlay,
+                column_divider_guide,
+                pending_chip_popover,
                 pending_custom_blocks,
                 pending_custom_inlines,
                 caret_rect,
@@ -492,12 +634,49 @@ impl Element for RichDocumentElement {
             }
         }
 
+        let popover_element = pending_chip_popover.map(|(popover, anchor_rect)| {
+            let popover_w = 224.0f32;
+            let popover_h = 84.0f32;
+            let anchor_bounds = rect_to_bounds(anchor_rect);
+            let anchor_left: f32 = anchor_bounds.origin.x.into();
+            let anchor_bottom: f32 = (anchor_bounds.origin.y + anchor_bounds.size.height).into();
+            let anchor_top: f32 = anchor_bounds.origin.y.into();
+
+            let clamped_x = anchor_left.clamp(
+                origin_x + 8.0,
+                (origin_x + viewport_width - popover_w - 8.0).max(origin_x + 8.0),
+            );
+            let pop_y = if anchor_bottom + 6.0 + popover_h <= origin_y + viewport_height - 8.0 {
+                anchor_bottom + 6.0
+            } else {
+                (anchor_top - popover_h - 6.0).max(origin_y + 8.0)
+            };
+            let mut element = build_smart_chip_popover_element(
+                &popover,
+                &theme,
+                self.view.clone(),
+                popover_w,
+                popover_h,
+            );
+            let available = size(
+                AvailableSpace::Definite(px(popover_w)),
+                AvailableSpace::Definite(px(popover_h)),
+            );
+            element.prepaint_as_root(point(px(clamped_x), px(pop_y)), available, window, cx);
+            element
+        });
+
         RichPrepaintState {
             visible_blocks,
             selection_rects,
             decoration_highlights,
             block_inline_decorations,
             decoration_overlays,
+            image_assets,
+            copied_code_block,
+            selected_image_overlay,
+            column_divider_guide,
+            popover_element,
             handled_custom_blocks,
             handled_custom_inlines,
             hosted_custom_elements,
@@ -610,6 +789,7 @@ impl Element for RichDocumentElement {
                     visible.y,
                     prepaint.zoom,
                     prepaint.show_heading_chevrons,
+                    prepaint.copied_code_block,
                     theme,
                     &canvas_to_window,
                     window,
@@ -656,6 +836,7 @@ impl Element for RichDocumentElement {
                     prepaint.debug_overlay,
                     theme,
                     &prepaint.block_inline_decorations,
+                    &prepaint.image_assets,
                     &prepaint.handled_custom_blocks,
                     &prepaint.handled_custom_inlines,
                     &canvas_to_window,
@@ -678,11 +859,34 @@ impl Element for RichDocumentElement {
                 );
             }
 
-            // Layer 5: Ephemeral decoration overlays (ghost text, remote carets), active caret/IME preedit, and scrollbars.
+            // Layer 5: Ephemeral decoration overlays (ghost text, remote carets), image handles,
+            // table column resize guide, active caret/IME preedit, smart chip popovers, and scrollbars.
             for overlay in &prepaint.decoration_overlays {
                 paint_decoration_overlay(
                     overlay,
                     prepaint.zoom,
+                    theme,
+                    &canvas_to_window,
+                    window,
+                    cx,
+                );
+            }
+            if let Some(guide) = &prepaint.column_divider_guide {
+                let guide_w = if guide.dragging { 2.5 } else { 2.0 };
+                let guide_color = if guide.dragging {
+                    theme.accent
+                } else {
+                    theme.accent.alpha(0.65)
+                };
+                let guide_origin = canvas_to_window(guide.canvas_x - guide_w * 0.5, guide.table_y);
+                window.paint_quad(fill(
+                    Bounds::new(guide_origin, size(px(guide_w), px(guide.table_height))),
+                    guide_color,
+                ));
+            }
+            if let Some(selected_img) = &prepaint.selected_image_overlay {
+                paint_selected_image_handles(
+                    selected_img,
                     theme,
                     &canvas_to_window,
                     window,
@@ -703,6 +907,9 @@ impl Element for RichDocumentElement {
                     Bounds::new(top_left, size(px(2.0), px(caret.height.max(12.0)))),
                     theme.caret,
                 ));
+            }
+            if let Some(mut popover) = prepaint.popover_element.take() {
+                popover.paint(window, cx);
             }
 
             if prepaint.total_height > viewport_height + 1.0 {
@@ -762,6 +969,7 @@ fn paint_block_chrome(
     block_y: f32,
     zoom: f32,
     show_heading_chevrons: bool,
+    copied_code_block: Option<BlockId>,
     theme: &RichTheme,
     to_window: &impl Fn(f32, f32) -> Point<Pixels>,
     window: &mut Window,
@@ -795,20 +1003,21 @@ fn paint_block_chrome(
             marker,
             checked,
             marker_origin,
+            checkbox_rect,
             paragraph,
         } => {
             let first_line = paragraph.lines.first();
             if let Some(is_checked) = checked {
-                // Draw vector checkbox quads so checklists do not depend on Unicode box glyph availability.
-                let box_size = pt_to_px(10.5, zoom);
-                let center_y = first_line
-                    .map(|line| line.baseline_y - line.ascent * 0.38)
-                    .unwrap_or(marker_origin.y - box_size * 0.5);
-                let box_origin = to_window(
-                    block_x + marker_origin.x,
-                    block_y + center_y - box_size * 0.5,
-                );
-                let box_bounds = Bounds::new(box_origin, size(px(box_size), px(box_size)));
+                // Draw vector checkbox quads using the exact layout `checkbox_rect` so painting and hit-testing match.
+                let rect = checkbox_rect.unwrap_or_else(|| {
+                    let box_size = pt_to_px(10.5, zoom);
+                    let center_y = first_line
+                        .map(|line| line.baseline_y - line.ascent * 0.38)
+                        .unwrap_or(marker_origin.y - box_size * 0.5);
+                    Rect::new(marker_origin.x, center_y - box_size * 0.5, box_size, box_size)
+                });
+                let box_origin = to_window(block_x + rect.x, block_y + rect.y);
+                let box_bounds = Bounds::new(box_origin, size(px(rect.width), px(rect.height)));
                 let (background, border) = if *is_checked {
                     (theme.accent, theme.accent)
                 } else {
@@ -823,12 +1032,10 @@ fn paint_block_chrome(
                     BorderStyle::Solid,
                 ));
                 if *is_checked {
-                    let inset = box_size * 0.28;
-                    let inner_origin = to_window(
-                        block_x + marker_origin.x + inset,
-                        block_y + center_y - box_size * 0.5 + inset,
-                    );
-                    let inner_size = (box_size - 2.0 * inset).max(2.0);
+                    let inset = rect.width * 0.28;
+                    let inner_origin =
+                        to_window(block_x + rect.x + inset, block_y + rect.y + inset);
+                    let inner_size = (rect.width - 2.0 * inset).max(2.0);
                     window.paint_quad(quad(
                         Bounds::new(inner_origin, size(px(inner_size), px(inner_size))),
                         Corners::all(px(1.0)),
@@ -868,6 +1075,7 @@ fn paint_block_chrome(
                     block_y + child.y,
                     zoom,
                     show_heading_chevrons,
+                    copied_code_block,
                     theme,
                     to_window,
                     window,
@@ -878,6 +1086,7 @@ fn paint_block_chrome(
         BlockLayoutKind::CodeBlock {
             language,
             frame_rect,
+            copy_button_rect,
             ..
         } => {
             let frame_origin = to_window(block_x + frame_rect.x, block_y + frame_rect.y);
@@ -892,7 +1101,7 @@ fn paint_block_chrome(
             if let Some(label) = language {
                 let label_origin = to_window(
                     block_x + pt_to_px(10.0, zoom),
-                    block_y + pt_to_px(5.0, zoom),
+                    block_y + pt_to_px(5.5, zoom),
                 );
                 paint_small_label(
                     label,
@@ -903,6 +1112,48 @@ fn paint_block_chrome(
                     cx,
                 );
             }
+            // Built-in interactive Copy button pill in the top-right corner of the code block.
+            let is_copied = copied_code_block == Some(layout.id);
+            let btn_origin = to_window(block_x + copy_button_rect.x, block_y + copy_button_rect.y);
+            let btn_bounds = Bounds::new(
+                btn_origin,
+                size(px(copy_button_rect.width), px(copy_button_rect.height)),
+            );
+            let (btn_bg, btn_border, btn_fg, btn_text) = if is_copied {
+                (theme.accent.alpha(0.14), theme.accent, theme.accent, "Copied")
+            } else {
+                (
+                    theme.surface_background,
+                    theme.code_border,
+                    theme.muted_text,
+                    "Copy",
+                )
+            };
+            window.paint_quad(quad(
+                btn_bounds,
+                Corners::all(px(pt_to_px(3.5, zoom))),
+                btn_bg,
+                Edges::all(px(1.0)),
+                btn_border,
+                BorderStyle::Solid,
+            ));
+            let text_pad_x = if is_copied {
+                pt_to_px(5.5, zoom)
+            } else {
+                pt_to_px(10.0, zoom)
+            };
+            let btn_text_origin = to_window(
+                block_x + copy_button_rect.x + text_pad_x,
+                block_y + copy_button_rect.y + pt_to_px(2.0, zoom),
+            );
+            paint_small_label(
+                btn_text,
+                btn_text_origin,
+                pt_to_px(8.0, zoom),
+                btn_fg,
+                window,
+                cx,
+            );
         }
         BlockLayoutKind::Table(table) => {
             let border_color = theme.resolve_table_border(table.border_style.color);
@@ -936,6 +1187,7 @@ fn paint_block_chrome(
                         block_y + cell.rect.y + child.y,
                         zoom,
                         show_heading_chevrons,
+                        copied_code_block,
                         theme,
                         to_window,
                         window,
@@ -1036,10 +1288,12 @@ fn paint_paragraph_backgrounds(
 
                 for decoration in &text_fragment.decorations {
                     if let Some(background) = decoration.background {
-                        let start_x = text_fragment.x
+                        let raw_a = text_fragment.x
                             + text_fragment.local_x_for_byte(decoration.doc_range.start);
-                        let end_x = text_fragment.x
+                        let raw_b = text_fragment.x
                             + text_fragment.local_x_for_byte(decoration.doc_range.end);
+                        let start_x = raw_a.min(raw_b);
+                        let end_x = raw_a.max(raw_b);
                         let width = (end_x - start_x).max(0.0);
                         if width > 0.0 {
                             let radius = if decoration.inline_code {
@@ -1075,6 +1329,7 @@ fn paint_block_foreground(
     debug_overlay: bool,
     theme: &RichTheme,
     block_inline_decorations: &HashMap<BlockId, Vec<InlineDecoration>>,
+    image_assets: &HashMap<String, LoadedAsset>,
     handled_custom_blocks: &HashSet<BlockId>,
     handled_custom_inlines: &HashSet<(BlockId, InlineObjectId)>,
     to_window: &impl Fn(f32, f32) -> Point<Pixels>,
@@ -1099,6 +1354,7 @@ fn paint_block_foreground(
                 debug_overlay,
                 theme,
                 extra_decorations,
+                image_assets,
                 handled_custom_inlines,
                 to_window,
                 window,
@@ -1119,6 +1375,7 @@ fn paint_block_foreground(
                 debug_overlay,
                 theme,
                 extra_decorations,
+                image_assets,
                 handled_custom_inlines,
                 to_window,
                 window,
@@ -1135,6 +1392,7 @@ fn paint_block_foreground(
                     debug_overlay,
                     theme,
                     block_inline_decorations,
+                    image_assets,
                     handled_custom_blocks,
                     handled_custom_inlines,
                     to_window,
@@ -1154,6 +1412,7 @@ fn paint_block_foreground(
                         debug_overlay,
                         theme,
                         block_inline_decorations,
+                        image_assets,
                         handled_custom_blocks,
                         handled_custom_inlines,
                         to_window,
@@ -1205,6 +1464,7 @@ fn paint_paragraph_foreground(
     debug_overlay: bool,
     theme: &RichTheme,
     extra_decorations: &[InlineDecoration],
+    image_assets: &HashMap<String, LoadedAsset>,
     handled_custom_inlines: &HashSet<(BlockId, InlineObjectId)>,
     to_window: &impl Fn(f32, f32) -> Point<Pixels>,
     window: &mut Window,
@@ -1250,6 +1510,7 @@ fn paint_paragraph_foreground(
                         box_rect.translate(origin_x, origin_y),
                         zoom,
                         theme,
+                        image_assets,
                         to_window,
                         window,
                         cx,
@@ -1325,8 +1586,10 @@ fn paint_text_fragment(
     let thickness = px((fragment.font_size_px * 0.065).clamp(1.0, 2.5));
 
     for decoration in &fragment.decorations {
-        let start_x = fragment.x + fragment.local_x_for_byte(decoration.doc_range.start);
-        let end_x = fragment.x + fragment.local_x_for_byte(decoration.doc_range.end);
+        let raw_a = fragment.x + fragment.local_x_for_byte(decoration.doc_range.start);
+        let raw_b = fragment.x + fragment.local_x_for_byte(decoration.doc_range.end);
+        let start_x = raw_a.min(raw_b);
+        let end_x = raw_a.max(raw_b);
         let width = (end_x - start_x).max(0.0);
         if width <= 0.0 {
             continue;
@@ -1372,8 +1635,10 @@ fn paint_text_fragment(
         if overlap_start >= overlap_end {
             continue;
         }
-        let start_x = fragment.x + fragment.local_x_for_byte(overlap_start);
-        let end_x = fragment.x + fragment.local_x_for_byte(overlap_end);
+        let raw_a = fragment.x + fragment.local_x_for_byte(overlap_start);
+        let raw_b = fragment.x + fragment.local_x_for_byte(overlap_end);
+        let start_x = raw_a.min(raw_b);
+        let end_x = raw_a.max(raw_b);
         let width = (end_x - start_x).max(0.0);
         if width <= 0.0 {
             continue;
@@ -1416,11 +1681,13 @@ fn paint_text_fragment(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn paint_inline_box(
     inline_box: &InlineBoxFragment,
     canvas_rect: Rect,
     zoom: f32,
     theme: &RichTheme,
+    image_assets: &HashMap<String, LoadedAsset>,
     to_window: &impl Fn(f32, f32) -> Point<Pixels>,
     window: &mut Window,
     cx: &mut App,
@@ -1457,16 +1724,37 @@ fn paint_inline_box(
                 cx,
             );
         }
-        InlineObject::Image { alt, .. } => {
+        InlineObject::Image { asset_id, alt, .. } => {
+            let radius = Corners::all(px(pt_to_px(4.0, zoom)));
+            if let Some(LoadedAsset::Ready(render_image)) = image_assets.get(asset_id) {
+                if let Err(error) = window.paint_image(
+                    bounds,
+                    bounds,
+                    radius,
+                    Arc::clone(render_image),
+                    0,
+                    false,
+                ) {
+                    eprintln!("rich-gpui: failed to paint inline image '{asset_id}': {error}");
+                }
+                return;
+            }
+
             window.paint_quad(quad(
                 bounds,
-                Corners::all(px(pt_to_px(4.0, zoom))),
+                radius,
                 theme.image_placeholder_background,
                 Edges::all(px(1.0)),
                 theme.image_placeholder_border,
                 BorderStyle::Solid,
             ));
-            let caption = if alt.is_empty() { "Image" } else { alt.as_str() };
+            let caption = match image_assets.get(asset_id) {
+                Some(LoadedAsset::Loading) => "Loading image...",
+                Some(LoadedAsset::Failed(_)) if !alt.is_empty() => alt.as_str(),
+                Some(LoadedAsset::Failed(_)) => "Image failed to load",
+                _ if !alt.is_empty() => alt.as_str(),
+                _ => "Image",
+            };
             let text_origin = to_window(
                 canvas_rect.x + pt_to_px(8.0, zoom),
                 canvas_rect.y + (canvas_rect.height * 0.5 - pt_to_px(6.0, zoom)).max(4.0),
@@ -1523,6 +1811,7 @@ fn collect_pending_custom_nodes(
     extensions: &ExtensionRegistry,
     out_blocks: &mut Vec<PendingCustomBlock>,
     out_inlines: &mut Vec<PendingCustomInline>,
+    out_images: &mut HashSet<String>,
 ) {
     match &layout.kind {
         BlockLayoutKind::Custom { kind, data, bounds } => {
@@ -1546,6 +1835,7 @@ fn collect_pending_custom_nodes(
                 block_y,
                 extensions,
                 out_inlines,
+                out_images,
             );
         }
         BlockLayoutKind::CodeBlock {
@@ -1560,6 +1850,7 @@ fn collect_pending_custom_nodes(
                 block_y + content_origin.y,
                 extensions,
                 out_inlines,
+                out_images,
             );
         }
         BlockLayoutKind::Blockquote { children, .. } => {
@@ -1571,6 +1862,7 @@ fn collect_pending_custom_nodes(
                     extensions,
                     out_blocks,
                     out_inlines,
+                    out_images,
                 );
             }
         }
@@ -1584,6 +1876,7 @@ fn collect_pending_custom_nodes(
                         extensions,
                         out_blocks,
                         out_inlines,
+                        out_images,
                     );
                 }
             }
@@ -1599,27 +1892,230 @@ fn collect_custom_inlines_in_paragraph(
     origin_y: f32,
     extensions: &ExtensionRegistry,
     out_inlines: &mut Vec<PendingCustomInline>,
+    out_images: &mut HashSet<String>,
 ) {
     for line in &paragraph.lines {
         for fragment in &line.fragments {
-            if let LineFragment::InlineBox(inline_box) = fragment
-                && let InlineObject::Custom { kind, data } = &inline_box.object
-                && let Some(extension) = extensions.get_node(kind)
-            {
-                let canvas_rect = line
-                    .inline_box_rect(inline_box)
-                    .translate(origin_x, origin_y);
-                out_inlines.push(PendingCustomInline {
-                    block_id,
-                    object_id: inline_box.object_id,
-                    kind: kind.clone(),
-                    data: data.clone(),
-                    canvas_rect,
-                    extension,
-                });
+            if let LineFragment::InlineBox(inline_box) = fragment {
+                match &inline_box.object {
+                    InlineObject::Custom { kind, data } => {
+                        if let Some(extension) = extensions.get_node(kind) {
+                            let canvas_rect = line
+                                .inline_box_rect(inline_box)
+                                .translate(origin_x, origin_y);
+                            out_inlines.push(PendingCustomInline {
+                                block_id,
+                                object_id: inline_box.object_id,
+                                kind: kind.clone(),
+                                data: data.clone(),
+                                canvas_rect,
+                                extension,
+                            });
+                        }
+                    }
+                    InlineObject::Image { asset_id, .. } if !asset_id.is_empty() => {
+                        out_images.insert(asset_id.clone());
+                    }
+                    _ => {}
+                }
             }
         }
     }
+}
+
+fn paint_selected_image_handles(
+    selected: &SelectedImageOverlay,
+    theme: &RichTheme,
+    to_window: &impl Fn(f32, f32) -> Point<Pixels>,
+    window: &mut Window,
+    cx: &mut App,
+) {
+    let active_rect = selected.preview_rect.unwrap_or(selected.canvas_rect);
+    let top_left = to_window(active_rect.x, active_rect.y);
+    let bounds = Bounds::new(top_left, size(px(active_rect.width), px(active_rect.height)));
+
+    if selected.preview_rect.is_some() {
+        window.paint_quad(quad(
+            bounds,
+            Corners::all(px(3.0)),
+            theme.accent.alpha(0.08),
+            Edges::all(px(1.5)),
+            theme.accent,
+            BorderStyle::Dashed,
+        ));
+    } else {
+        window.paint_quad(quad(
+            bounds,
+            Corners::all(px(3.0)),
+            gpui_kit::transparent_black(),
+            Edges::all(px(1.5)),
+            theme.accent,
+            BorderStyle::Solid,
+        ));
+    }
+
+    for (_, handle_rect) in image_resize_handle_rects(active_rect) {
+        let origin = to_window(handle_rect.x, handle_rect.y);
+        window.paint_quad(quad(
+            Bounds::new(origin, size(px(handle_rect.width), px(handle_rect.height))),
+            Corners::all(px(2.0)),
+            theme.surface_background,
+            Edges::all(px(1.5)),
+            theme.accent,
+            BorderStyle::Solid,
+        ));
+    }
+
+    if let Some(label) = &selected.preview_label {
+        let badge_w = (label.len() as f32) * 6.5 + 14.0;
+        let badge_h = 20.0;
+        let badge_origin = to_window(
+            active_rect.x + (active_rect.width - badge_w) * 0.5,
+            active_rect.bottom() + 6.0,
+        );
+        window.paint_quad(quad(
+            Bounds::new(badge_origin, size(px(badge_w), px(badge_h))),
+            Corners::all(px(4.0)),
+            theme.accent,
+            Edges::all(px(0.0)),
+            gpui_kit::transparent_black(),
+            BorderStyle::Solid,
+        ));
+        let text_origin = to_window(
+            active_rect.x + (active_rect.width - badge_w) * 0.5 + 7.0,
+            active_rect.bottom() + 9.0,
+        );
+        paint_small_label(label, text_origin, 11.0, theme.accent_foreground, window, cx);
+    }
+}
+
+fn build_smart_chip_popover_element(
+    popover: &ActiveSmartChipPopover,
+    theme: &RichTheme,
+    view: Entity<RichDocumentView>,
+    width_px: f32,
+    height_px: f32,
+) -> AnyElement {
+    let chip_colors = theme.smart_chips.for_kind(popover.kind);
+    let (badge_label, subtitle) = match popover.kind {
+        ChipKind::Person => ("Person", "People mention"),
+        ChipKind::Date => ("Date", "Calendar date chip"),
+        ChipKind::Document => ("Document", "Linked workspace document"),
+        ChipKind::Tag => ("Tag", "Status or category tag"),
+    };
+    let label_for_copy = popover.label.clone();
+    let view_for_copy = view.clone();
+    let view_for_close = view;
+    let accent_border = popover
+        .accent
+        .map(rgba_to_hsla)
+        .unwrap_or(chip_colors.border);
+
+    div()
+        .id("rich-smart-chip-popover")
+        .w(px(width_px))
+        .h(px(height_px))
+        .p(px(10.0))
+        .rounded(px(8.0))
+        .bg(theme.surface_background)
+        .border_1()
+        .border_color(theme.paper_border)
+        .shadow(vec![BoxShadow {
+            color: theme.paper_shadow,
+            offset: point(px(0.0), px(4.0)),
+            blur_radius: px(12.0),
+            spread_radius: px(0.0),
+            inset: false,
+        }])
+        .flex()
+        .flex_col()
+        .justify_between()
+        .on_mouse_down(MouseButton::Left, |_, _window, cx| {
+            cx.stop_propagation();
+        })
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .px(px(6.0))
+                                .py(px(1.5))
+                                .rounded(px(99.0))
+                                .bg(chip_colors.background)
+                                .border_1()
+                                .border_color(accent_border)
+                                .text_size(px(10.0))
+                                .text_color(chip_colors.text)
+                                .child(badge_label),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.0))
+                                .font_weight(gpui_kit::FontWeight::SEMIBOLD)
+                                .text_color(theme.text)
+                                .child(popover.label.clone()),
+                        ),
+                )
+                .child(
+                    div()
+                        .id("rich-chip-popover-close")
+                        .px(px(5.0))
+                        .py(px(1.0))
+                        .rounded(px(4.0))
+                        .text_size(px(11.0))
+                        .text_color(theme.muted_text)
+                        .cursor_pointer()
+                        .on_click(move |_, _window, cx| {
+                            view_for_close.update(cx, |this, cx| {
+                                this.dismiss_chip_popover(cx);
+                            });
+                        })
+                        .child("×"),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .text_color(theme.muted_text)
+                        .child(subtitle),
+                )
+                .child(
+                    div()
+                        .id("rich-chip-popover-copy")
+                        .px(px(8.0))
+                        .py(px(2.0))
+                        .rounded(px(4.0))
+                        .bg(theme.code_background)
+                        .border_1()
+                        .border_color(theme.code_border)
+                        .text_size(px(10.5))
+                        .text_color(theme.text)
+                        .cursor_pointer()
+                        .on_click(move |_, _window, cx| {
+                            cx.write_to_clipboard(ClipboardItem::new_string(
+                                label_for_copy.clone(),
+                            ));
+                            view_for_copy.update(cx, |this, cx| {
+                                this.dismiss_chip_popover(cx);
+                            });
+                        })
+                        .child("Copy"),
+                ),
+        )
+        .into_any_element()
 }
 
 fn paint_decoration_overlay(

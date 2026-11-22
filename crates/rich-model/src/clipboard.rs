@@ -159,6 +159,17 @@ impl ClipboardFragment {
         parser.finish()
     }
 
+    /// Builds a fragment capturing every top-level block of `document`.
+    pub fn from_document(document: &Document) -> Self {
+        Self {
+            blocks: document
+                .blocks
+                .iter()
+                .map(block_node_to_clipboard_block)
+                .collect(),
+        }
+    }
+
     /// Converts all blocks in this fragment into fresh [`BlockNode`]s allocating IDs from `document`.
     pub fn to_block_nodes(&self, document: &mut Document) -> Vec<BlockNode> {
         let mut list_id_map: HashMap<u64, ListId> = HashMap::new();

@@ -420,14 +420,47 @@ impl TextShaper for GpuiShaper<'_, '_> {
             }
         }
 
+        let is_rtl = runs.first().is_some_and(|run| run.bidi_level % 2 == 1);
         let total_width: f32 = shaped_line.width.into();
-        x_for_byte.sort_by_key(|&(byte_offset, _)| byte_offset);
-        x_for_byte.dedup_by_key(|(byte_offset, _)| *byte_offset);
-        if x_for_byte.first().map(|&(b, _)| b) != Some(0) {
-            x_for_byte.insert(0, (0, 0.0));
-        }
-        if x_for_byte.last().map(|&(b, _)| b) != Some(text.len()) {
-            x_for_byte.push((text.len(), total_width));
+
+        if is_rtl {
+            // Sort shaped clusters visually left-to-right; in RTL, each cluster's logical start
+            // lies on its visual right edge while logical end (`text.len()`) lies at x = 0.
+            let mut visual_clusters: Vec<(usize, f32)> = x_for_byte;
+            visual_clusters.sort_by(|left, right| {
+                left.1
+                    .total_cmp(&right.1)
+                    .then_with(|| right.0.cmp(&left.0))
+            });
+            visual_clusters.dedup_by_key(|(byte_offset, _)| *byte_offset);
+
+            let mut rtl_x_for_byte: Vec<(usize, f32)> =
+                Vec::with_capacity(visual_clusters.len() + 2);
+            for (idx, &(byte_offset, _)) in visual_clusters.iter().enumerate() {
+                let right_edge = visual_clusters
+                    .get(idx + 1)
+                    .map(|&(_, next_x)| next_x)
+                    .unwrap_or(total_width);
+                rtl_x_for_byte.push((byte_offset, right_edge));
+            }
+            rtl_x_for_byte.sort_by_key(|&(byte_offset, _)| byte_offset);
+            rtl_x_for_byte.dedup_by_key(|(byte_offset, _)| *byte_offset);
+            if rtl_x_for_byte.first().map(|&(b, _)| b) != Some(0) {
+                rtl_x_for_byte.insert(0, (0, total_width));
+            }
+            if rtl_x_for_byte.last().map(|&(b, _)| b) != Some(text.len()) {
+                rtl_x_for_byte.push((text.len(), 0.0));
+            }
+            x_for_byte = rtl_x_for_byte;
+        } else {
+            x_for_byte.sort_by_key(|&(byte_offset, _)| byte_offset);
+            x_for_byte.dedup_by_key(|(byte_offset, _)| *byte_offset);
+            if x_for_byte.first().map(|&(b, _)| b) != Some(0) {
+                x_for_byte.insert(0, (0, 0.0));
+            }
+            if x_for_byte.last().map(|&(b, _)| b) != Some(text.len()) {
+                x_for_byte.push((text.len(), total_width));
+            }
         }
 
         ShapedSegment {

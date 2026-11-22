@@ -1,19 +1,23 @@
 pub mod block;
 pub mod clipboard;
+pub mod codec;
 pub mod command;
 pub mod decoration;
 pub mod inline;
 pub mod selection;
 pub mod style;
+pub mod sync;
 pub mod transaction;
 
 pub use block::*;
 pub use clipboard::*;
+pub use codec::*;
 pub use command::*;
 pub use decoration::*;
 pub use inline::*;
 pub use selection::*;
 pub use style::*;
+pub use sync::*;
 pub use transaction::*;
 
 #[cfg(test)]
@@ -510,5 +514,334 @@ mod tests {
                 .font_size_pt,
             Some(20.0)
         );
+    }
+
+    #[test]
+    fn table_editing_merge_split_row_col_and_undo_roundtrip() {
+        let mut doc = Document::new();
+        let table_id = doc.alloc_block_id();
+        let mut rows = Vec::new();
+        for r in 0..2 {
+            let mut cells = Vec::new();
+            for c in 0..2 {
+                let cid = doc.alloc_block_id();
+                let pid = doc.alloc_block_id();
+                cells.push(TableCell::simple(
+                    cid,
+                    vec![BlockNode::new(
+                        pid,
+                        BlockKind::Paragraph(InlineContent::plain(format!("R{r}C{c}"))),
+                        BlockStyle::default(),
+                    )],
+                ));
+            }
+            rows.push(TableRow {
+                is_header: r == 0,
+                cells,
+            });
+        }
+        doc.push_block(BlockNode::new(
+            table_id,
+            BlockKind::Table(TableBlock {
+                columns: vec![ColumnSpec::Auto; 2],
+                rows,
+                border_style: TableBorderStyle::default(),
+            }),
+            BlockStyle::default(),
+        ));
+
+        let mut history = History::default();
+
+        // Merge top row cells (0,0)..(0,1).
+        let merge_tx = doc
+            .build_merge_table_cells_transaction(table_id, (0, 0), (0, 1), None)
+            .unwrap();
+        let applied = doc.apply(merge_tx);
+        history.push_inverse(applied.inverse);
+        let BlockKind::Table(merged) = &doc.find_block(table_id).unwrap().kind else {
+            panic!("expected table");
+        };
+        assert_eq!(merged.rows[0].cells.len(), 1);
+        assert_eq!(merged.rows[0].cells[0].colspan, 2);
+        assert_eq!(merged.rows[0].cells[0].blocks.len(), 2);
+
+        // Insert a column after visual col 0 (splits across the colspan=2 header cell!).
+        let insert_col_tx = doc
+            .build_insert_table_column_transaction(table_id, 0, true, None)
+            .unwrap();
+        let applied = doc.apply(insert_col_tx);
+        history.push_inverse(applied.inverse);
+        let BlockKind::Table(after_col) = &doc.find_block(table_id).unwrap().kind else {
+            panic!("expected table");
+        };
+        assert_eq!(after_col.grid_col_count(), 3);
+        assert_eq!(after_col.rows[0].cells[0].colspan, 3);
+        assert_eq!(after_col.rows[1].cells.len(), 3);
+
+        // Split the merged header cell back into 3 1x1 cells.
+        let split_tx = doc
+            .build_split_table_cell_transaction(table_id, 0, 0, None)
+            .unwrap();
+        let applied = doc.apply(split_tx);
+        history.push_inverse(applied.inverse);
+        let BlockKind::Table(after_split) = &doc.find_block(table_id).unwrap().kind else {
+            panic!("expected table");
+        };
+        assert_eq!(after_split.rows[0].cells.len(), 3);
+        assert_eq!(after_split.rows[0].cells[0].colspan, 1);
+
+        // Insert row below and delete it.
+        let insert_row_tx = doc
+            .build_insert_table_row_transaction(table_id, 1, true, None)
+            .unwrap();
+        let applied = doc.apply(insert_row_tx);
+        history.push_inverse(applied.inverse);
+        let BlockKind::Table(after_row) = &doc.find_block(table_id).unwrap().kind else {
+            panic!("expected table");
+        };
+        assert_eq!(after_row.rows.len(), 3);
+
+        // Undo all 4 operations restores exact 2x2 table.
+        for _ in 0..4 {
+            history.undo(&mut doc).unwrap();
+        }
+        let BlockKind::Table(restored) = &doc.find_block(table_id).unwrap().kind else {
+            panic!("expected table");
+        };
+        assert_eq!(restored.rows.len(), 2);
+        assert_eq!(restored.rows[0].cells.len(), 2);
+        assert_eq!(restored.rows[0].cells[0].colspan, 1);
+    }
+
+    #[test]
+    fn checklist_toggle_and_inline_image_resize_undo_roundtrip() {
+        let mut doc = Document::new();
+        let task_id = doc.add_list_item(
+            ListId(1),
+            ListKind::Checklist,
+            0,
+            Some(false),
+            InlineContent::plain("Ship Phase 3"),
+        );
+        let mut para = InlineContent::empty();
+        let img_id = para.push_object(
+            InlineObject::Image {
+                asset_id: "hero.png".into(),
+                alt: "Hero".into(),
+                width_pt: 200.0,
+                height_pt: 120.0,
+                valign: InlineVAlign::Baseline,
+            },
+            InlineStyle::default(),
+        );
+        let para_id = doc.add_paragraph(para, BlockStyle::default());
+
+        let mut history = History::default();
+        let toggle = doc.apply(Transaction::new(vec![Step::ToggleChecklist {
+            block_id: task_id,
+        }]));
+        history.push_inverse(toggle.inverse);
+        assert!(matches!(
+            doc.find_block(task_id).unwrap().kind,
+            BlockKind::ListItem {
+                checked: Some(true),
+                ..
+            }
+        ));
+
+        let resize = doc.apply(Transaction::new(vec![Step::UpdateInlineObject {
+            block_id: para_id,
+            object_id: img_id,
+            object: InlineObject::Image {
+                asset_id: "hero.png".into(),
+                alt: "Hero".into(),
+                width_pt: 320.0,
+                height_pt: 192.0,
+                valign: InlineVAlign::Baseline,
+            },
+        }]));
+        history.push_inverse(resize.inverse);
+        assert!(matches!(
+            doc.find_block(para_id)
+                .unwrap()
+                .kind
+                .inline_content()
+                .unwrap()
+                .object_by_id(img_id)
+                .unwrap()
+                .object,
+            InlineObject::Image {
+                width_pt,
+                height_pt,
+                ..
+            } if (width_pt - 320.0).abs() < 0.01 && (height_pt - 192.0).abs() < 0.01
+        ));
+
+        history.undo(&mut doc).unwrap();
+        history.undo(&mut doc).unwrap();
+        assert!(matches!(
+            doc.find_block(task_id).unwrap().kind,
+            BlockKind::ListItem {
+                checked: Some(false),
+                ..
+            }
+        ));
+        assert!(matches!(
+            doc.find_block(para_id)
+                .unwrap()
+                .kind
+                .inline_content()
+                .unwrap()
+                .object_by_id(img_id)
+                .unwrap()
+                .object,
+            InlineObject::Image { width_pt, .. } if (width_pt - 200.0).abs() < 0.01
+        ));
+    }
+
+    #[test]
+    fn document_codec_markdown_and_html_roundtrip() {
+        let registry = CodecRegistry::with_builtin_codecs();
+        assert!(registry.get_by_extension("md").is_some());
+        assert!(registry.get_by_mime("text/html").is_some());
+
+        let source_md = "\
+# Phase 3 Spec
+
+Hello **bold**, *italic*, `code`, and [docs](https://gpui.rs).
+
+- [x] Checklist done
+- [ ] Checklist open
+
+> Quoted insight
+
+```rust
+fn main() {}
+```
+
+| Metric | Value |
+| --- | ---: |
+| FPS | 120 |
+
+---";
+        let decoded = registry.decode_as("markdown", source_md).unwrap();
+        assert_eq!(decoded.blocks.len(), 8);
+        assert!(matches!(decoded.blocks[0].kind, BlockKind::Heading { level: 1, .. }));
+        assert!(matches!(
+            decoded.blocks[2].kind,
+            BlockKind::ListItem {
+                kind: ListKind::Checklist,
+                checked: Some(true),
+                ..
+            }
+        ));
+        assert!(matches!(decoded.blocks[4].kind, BlockKind::Blockquote(_)));
+        assert!(matches!(
+            decoded.blocks[5].kind,
+            BlockKind::CodeBlock {
+                language: Some(ref lang),
+                ..
+            } if lang == "rust"
+        ));
+        assert!(matches!(decoded.blocks[6].kind, BlockKind::Table(_)));
+        assert!(matches!(decoded.blocks[7].kind, BlockKind::HorizontalRule));
+
+        let reencoded_md = registry.encode_as("markdown", &decoded).unwrap();
+        let reparsed_md = registry.decode_as("markdown", &reencoded_md).unwrap();
+        assert_eq!(reparsed_md.blocks.len(), decoded.blocks.len());
+
+        let html = registry.encode_as("html", &decoded).unwrap();
+        let reparsed_html = registry.decode_as("html", &html).unwrap();
+        assert_eq!(reparsed_html.blocks.len(), decoded.blocks.len());
+    }
+
+    #[test]
+    fn crdt_sync_bridge_converges_out_of_order_edits() {
+        let mut base = Document::new();
+        let p1 = base.add_paragraph(InlineContent::plain("Shared"), BlockStyle::default());
+
+        let mut doc_a = base.clone();
+        let mut doc_b = base;
+        let mut bridge_a = CrdtSyncBridge::new(ReplicaId(1), &doc_a);
+        let mut bridge_b = CrdtSyncBridge::new(ReplicaId(2), &doc_b);
+
+        // Replica A edits p1 and appends block 100.
+        let new_a = BlockNode::new(
+            BlockId(100),
+            BlockKind::Paragraph(InlineContent::plain("From A")),
+            BlockStyle::default(),
+        );
+        let applied_a = doc_a.apply(Transaction::new(vec![
+            Step::InsertText {
+                block_id: p1,
+                offset: 6,
+                text: " A".into(),
+                style: None,
+            },
+            Step::InsertBlock {
+                index: 1,
+                block: new_a,
+            },
+        ]));
+        bridge_a.after_transaction(&applied_a.change_set, &doc_a, None);
+        let deltas_from_a = bridge_a.drain_outbox();
+
+        // Replica B concurrently edits p1 and appends block 200.
+        let new_b = BlockNode::new(
+            BlockId(200),
+            BlockKind::Paragraph(InlineContent::plain("From B")),
+            BlockStyle::default(),
+        );
+        let applied_b = doc_b.apply(Transaction::new(vec![
+            Step::InsertText {
+                block_id: p1,
+                offset: 6,
+                text: " B".into(),
+                style: None,
+            },
+            Step::InsertBlock {
+                index: 1,
+                block: new_b,
+            },
+        ]));
+        bridge_b.after_transaction(&applied_b.change_set, &doc_b, None);
+        let deltas_from_b = bridge_b.drain_outbox();
+
+        // Exchange deltas in opposite orders; both replicas must converge identically.
+        for delta in &deltas_from_b {
+            let serialized = delta.to_json().unwrap();
+            let parsed = SyncDelta::from_json(&serialized).unwrap();
+            if let Some(tx) = bridge_a.apply_remote_delta(&parsed, &doc_a) {
+                bridge_a.set_applying_remote(true);
+                let applied = doc_a.apply(tx);
+                bridge_a.after_transaction(&applied.change_set, &doc_a, None);
+                bridge_a.set_applying_remote(false);
+            }
+        }
+        for delta in &deltas_from_a {
+            if let Some(tx) = bridge_b.apply_remote_delta(delta, &doc_b) {
+                bridge_b.set_applying_remote(true);
+                let applied = doc_b.apply(tx);
+                bridge_b.after_transaction(&applied.change_set, &doc_b, None);
+                bridge_b.set_applying_remote(false);
+            }
+        }
+
+        // Neither replica re-broadcasts remote changes (echo suppression).
+        assert!(bridge_a.drain_outbox().is_empty());
+        assert!(bridge_b.drain_outbox().is_empty());
+
+        let texts_a: Vec<&str> = doc_a
+            .blocks
+            .iter()
+            .filter_map(|block| block.kind.inline_content().map(|c| c.text.as_str()))
+            .collect();
+        let texts_b: Vec<&str> = doc_b
+            .blocks
+            .iter()
+            .filter_map(|block| block.kind.inline_content().map(|c| c.text.as_str()))
+            .collect();
+        assert_eq!(texts_a, texts_b);
+        assert_eq!(texts_a.len(), 3);
     }
 }

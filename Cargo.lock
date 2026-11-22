@@ -5586,6 +5586,7 @@ dependencies = [
  "rich-model",
  "serde_json",
  "smallvec",
+ "unicode-bidi",
  "unicode-linebreak",
  "unicode-segmentation",
 ]

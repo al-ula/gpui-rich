@@ -360,4 +360,165 @@ mod tests {
         let expected_total_fill = expected_top + visible_fill[0].layout.height + expected_bottom;
         assert!((flow.total_height() - expected_total_fill).abs() < 0.5);
     }
+
+    #[test]
+    fn bidi_run_splitting_visual_reordering_and_rtl_hit_test_roundtrip() {
+        let mut shaper = MockShaper;
+        let sheet = StyleSheet::default();
+        let config = DocumentLayoutConfig::default();
+
+        // Mixed LTR + RTL sentence in an LTR paragraph: "Hello שלום world"
+        let mixed = InlineContent::plain("Hello שלום world");
+        let mixed_layout = layout_paragraph(
+            &mixed,
+            &BlockStyle::default(),
+            &sheet,
+            &config,
+            600.0,
+            1.0,
+            &mut shaper,
+        );
+        assert_eq!(mixed_layout.lines.len(), 1);
+        let line = &mixed_layout.lines[0];
+        assert!(!line.base_direction_rtl);
+        assert!(line.fragments.len() >= 3);
+
+        // Verify the Hebrew run has an odd BiDi level and descends visually in x.
+        let rtl_frag = line
+            .fragments
+            .iter()
+            .find_map(|frag| match frag {
+                LineFragment::Text(t) if t.is_rtl() => Some(t),
+                _ => None,
+            })
+            .expect("expected RTL fragment");
+        let rtl_start_x = rtl_frag.local_x_for_byte(rtl_frag.doc_range.start);
+        let rtl_end_x = rtl_frag.local_x_for_byte(rtl_frag.doc_range.end);
+        assert!(rtl_start_x > rtl_end_x);
+
+        // Caret -> hit_test round-trip inside the RTL run.
+        let hebrew_mid = rtl_frag.doc_range.start + "ש".len();
+        let caret = mixed_layout.caret_rect(hebrew_mid, Affinity::Downstream);
+        let hit = mixed_layout.hit_test(Point::new(caret.x, caret.center().y));
+        assert_eq!(hit.offset, hebrew_mid);
+
+        // Selection spanning from "lo " into the middle of "שלום" produces disjoint visual rects
+        // because RTL advances right-to-left while LTR advances left-to-right.
+        let sel_rects = mixed_layout.selection_rects(3..hebrew_mid, false);
+        assert_eq!(sel_rects.len(), 2);
+
+        // RTL-base paragraph ("שלום Hello") reorders visual fragments so "Hello" sits on the left
+        // and "שלום" sits on the right, right-aligned by default.
+        let rtl_para = InlineContent::plain("שלום Hello");
+        let rtl_layout = layout_paragraph(
+            &rtl_para,
+            &BlockStyle::default(),
+            &sheet,
+            &config,
+            600.0,
+            1.0,
+            &mut shaper,
+        );
+        let rtl_line = &rtl_layout.lines[0];
+        assert!(rtl_line.base_direction_rtl);
+        let first_visual = rtl_line.fragments.first().unwrap();
+        let last_visual = rtl_line.fragments.last().unwrap();
+        assert!(first_visual.doc_range().start > last_visual.doc_range().start);
+        assert!(last_visual.x() + last_visual.width() >= 595.0);
+    }
+
+    #[test]
+    fn interactive_checklist_code_copy_and_table_divider_hit_tests() {
+        let mut doc = Document::new();
+        let task_id = doc.add_list_item(
+            ListId(1),
+            ListKind::Checklist,
+            0,
+            Some(false),
+            InlineContent::plain("Check item"),
+        );
+        let code_id = doc.add_code_block(Some("rust".into()), InlineContent::plain("fn hi() {}"));
+        let table_id = doc.alloc_block_id();
+        let c1 = doc.alloc_block_id();
+        let c2 = doc.alloc_block_id();
+        let p1 = doc.alloc_block_id();
+        let p2 = doc.alloc_block_id();
+        doc.push_block(BlockNode::new(
+            table_id,
+            BlockKind::Table(TableBlock {
+                columns: vec![ColumnSpec::Ratio(1.0), ColumnSpec::Ratio(1.0)],
+                rows: vec![TableRow {
+                    is_header: false,
+                    cells: vec![
+                        TableCell::simple(
+                            c1,
+                            vec![BlockNode::new(
+                                p1,
+                                BlockKind::Paragraph(InlineContent::plain("A")),
+                                BlockStyle::default(),
+                            )],
+                        ),
+                        TableCell::simple(
+                            c2,
+                            vec![BlockNode::new(
+                                p2,
+                                BlockKind::Paragraph(InlineContent::plain("B")),
+                                BlockStyle::default(),
+                            )],
+                        ),
+                    ],
+                }],
+                border_style: TableBorderStyle::default(),
+            }),
+            BlockStyle::default(),
+        ));
+
+        let mut flow = FlowLayout::<MockBackend>::default();
+        let mut shaper = MockShaper;
+        let visible = flow.layout_visible_blocks(&doc, 0.0, 900.0, 800.0, 100.0, 1.0, &mut shaper);
+
+        // Checklist hit test.
+        let task_vis = visible.iter().find(|v| v.id == task_id).unwrap();
+        let BlockLayoutKind::ListItem {
+            checkbox_rect: Some(cb),
+            ..
+        } = &task_vis.layout.kind
+        else {
+            panic!("expected checklist rect");
+        };
+        let cb_center = cb.translate(task_vis.x, task_vis.y).center();
+        let cb_hit = flow
+            .hit_test_canvas(cb_center, &doc, 900.0, 1.0, &mut shaper)
+            .unwrap();
+        assert_eq!(cb_hit.toggled_checklist, Some(task_id));
+
+        // Code block copy button hit test.
+        let code_vis = visible.iter().find(|v| v.id == code_id).unwrap();
+        let BlockLayoutKind::CodeBlock {
+            copy_button_rect, ..
+        } = &code_vis.layout.kind
+        else {
+            panic!("expected code block");
+        };
+        let copy_center = copy_button_rect.translate(code_vis.x, code_vis.y).center();
+        let copy_hit = flow
+            .hit_test_canvas(copy_center, &doc, 900.0, 1.0, &mut shaper)
+            .unwrap();
+        assert_eq!(copy_hit.code_block_copy, Some(code_id));
+
+        // Table column divider hit test.
+        let table_vis = visible.iter().find(|v| v.id == table_id).unwrap();
+        let BlockLayoutKind::Table(table_layout) = &table_vis.layout.kind else {
+            panic!("expected table layout");
+        };
+        let divider_pt = Point::new(
+            table_vis.x + table_layout.column_widths[0],
+            table_vis.y + table_layout.total_height * 0.5,
+        );
+        let divider = flow
+            .hit_test_table_column_border(divider_pt, &doc, 900.0, 1.0, 5.0)
+            .expect("expected column divider hit");
+        assert_eq!(divider.table_id, table_id);
+        assert_eq!(divider.column_index, 0);
+    }
 }

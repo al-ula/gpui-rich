@@ -1,7 +1,7 @@
 //! Command model unifying viewer interactions, GPUI actions, and future editing operations.
 
-use crate::block::{BlockId, Document, ListKind};
-use crate::inline::InlineObject;
+use crate::block::{BlockId, ColumnSpec, Document, ListKind};
+use crate::inline::{InlineObject, InlineObjectId};
 use crate::selection::{DocPos, DocumentSelection};
 use crate::style::{
     BlockStyle, Edges, HorizontalLayout, InlineStyle, LinkTarget, NamedStyle, StyleId, TextAlign,
@@ -64,14 +64,22 @@ pub enum RichCommand {
         extend_selection: bool,
     },
     CopySelection,
+    CopyCodeBlock(BlockId),
     OpenLink(String),
     ToggleHeadingCollapsed(BlockId),
 
-    // History & Phase 2 document editing commands
+    // History & Phase 2/3 document editing commands
     Undo,
     Redo,
     InsertText(String),
     InsertInlineObject(InlineObject),
+    ToggleChecklistItem(BlockId),
+    ResizeInlineImage {
+        block_id: BlockId,
+        object_id: InlineObjectId,
+        width_pt: f32,
+        height_pt: f32,
+    },
     Delete {
         direction: MoveDirection,
         unit: MoveUnit,
@@ -97,6 +105,26 @@ pub enum RichCommand {
         html: String,
         plain_text: Option<String>,
     },
+
+    // Phase 3 interactive table commands
+    SetTableColumns {
+        table_id: BlockId,
+        columns: Vec<ColumnSpec>,
+    },
+    InsertTableRow {
+        after: bool,
+    },
+    DeleteTableRow,
+    InsertTableColumn {
+        after: bool,
+    },
+    DeleteTableColumn,
+    MergeTableCells,
+    SplitTableCell,
+    NavigateTableCell {
+        forward: bool,
+    },
+
     /// Host-defined custom command routed through policy gating, middleware, and `ExtensionRegistry`.
     Custom {
         id: String,
@@ -113,6 +141,8 @@ impl RichCommand {
             | Self::Redo
             | Self::InsertText(_)
             | Self::InsertInlineObject(_)
+            | Self::ToggleChecklistItem(_)
+            | Self::ResizeInlineImage { .. }
             | Self::Delete { .. }
             | Self::SplitBlock
             | Self::InsertSoftBreak
@@ -128,7 +158,14 @@ impl RichCommand {
             | Self::SetHeading(_)
             | Self::ToggleList(_)
             | Self::SetTextAlign(_)
-            | Self::PasteHtml { .. } => true,
+            | Self::PasteHtml { .. }
+            | Self::SetTableColumns { .. }
+            | Self::InsertTableRow { .. }
+            | Self::DeleteTableRow
+            | Self::InsertTableColumn { .. }
+            | Self::DeleteTableColumn
+            | Self::MergeTableCells
+            | Self::SplitTableCell => true,
             Self::Custom {
                 mutates_document, ..
             } => *mutates_document,
@@ -152,12 +189,15 @@ impl RichCommand {
             Self::SelectWordAt(_) => "rich.selection.select_word",
             Self::MoveCaret { .. } => "rich.selection.move_caret",
             Self::CopySelection => "rich.clipboard.copy",
+            Self::CopyCodeBlock(_) => "rich.clipboard.copy_code_block",
             Self::OpenLink(_) => "rich.navigation.open_link",
             Self::ToggleHeadingCollapsed(_) => "rich.view.toggle_heading_collapsed",
             Self::Undo => "rich.history.undo",
             Self::Redo => "rich.history.redo",
             Self::InsertText(_) => "rich.edit.insert_text",
             Self::InsertInlineObject(_) => "rich.edit.insert_inline_object",
+            Self::ToggleChecklistItem(_) => "rich.edit.toggle_checklist_item",
+            Self::ResizeInlineImage { .. } => "rich.edit.resize_inline_image",
             Self::Delete { .. } => "rich.edit.delete",
             Self::SplitBlock => "rich.edit.split_block",
             Self::InsertSoftBreak => "rich.edit.insert_soft_break",
@@ -174,6 +214,14 @@ impl RichCommand {
             Self::ToggleList(_) => "rich.format.toggle_list",
             Self::SetTextAlign(_) => "rich.format.set_text_align",
             Self::PasteHtml { .. } => "rich.clipboard.paste_html",
+            Self::SetTableColumns { .. } => "rich.table.set_columns",
+            Self::InsertTableRow { .. } => "rich.table.insert_row",
+            Self::DeleteTableRow => "rich.table.delete_row",
+            Self::InsertTableColumn { .. } => "rich.table.insert_column",
+            Self::DeleteTableColumn => "rich.table.delete_column",
+            Self::MergeTableCells => "rich.table.merge_cells",
+            Self::SplitTableCell => "rich.table.split_cell",
+            Self::NavigateTableCell { .. } => "rich.table.navigate_cell",
             Self::Custom { id, .. } => id.as_str(),
         }
     }
@@ -267,7 +315,9 @@ impl InteractionPolicy {
             | RichCommand::SelectAll
             | RichCommand::SelectWordAt(_)
             | RichCommand::MoveCaret { .. }
+            | RichCommand::NavigateTableCell { .. }
             | RichCommand::CopySelection
+            | RichCommand::CopyCodeBlock(_)
                 if !self.selectable =>
             {
                 Some(CommandOutcome::RejectedByPolicy)

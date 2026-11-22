@@ -32,6 +32,8 @@ pub struct ShaperRunSpec {
     pub underline: Option<UnderlineKind>,
     pub strikethrough: bool,
     pub inline_code: bool,
+    /// UAX #9 Unicode BiDi embedding level (even = LTR, odd = RTL).
+    pub bidi_level: u8,
 }
 
 impl ShaperRunSpec {
@@ -46,7 +48,14 @@ impl ShaperRunSpec {
             underline: style.underline,
             strikethrough: style.strikethrough,
             inline_code: style.inline_code,
+            bidi_level: 0,
         }
+    }
+
+    /// Sets the UAX #9 BiDi embedding level for this run.
+    pub fn with_bidi_level(mut self, bidi_level: u8) -> Self {
+        self.bidi_level = bidi_level;
+        self
     }
 }
 
@@ -165,10 +174,59 @@ impl TextShaper for MockShaper {
                 underline: None,
                 strikethrough: false,
                 inline_code: false,
+                bidi_level: 0,
             }]
         } else {
             runs.to_vec()
         };
+
+        let is_rtl = effective_runs
+            .first()
+            .is_some_and(|run| run.bidi_level % 2 == 1);
+
+        if is_rtl {
+            let total_width: f32 = text
+                .chars()
+                .map(|ch| if ch == ' ' { char_w * 0.65 } else { char_w })
+                .sum();
+            let mut advance = 0.0f32;
+            for (run_idx, run) in effective_runs.iter().enumerate() {
+                let end = (cursor + run.len).min(text.len());
+                let slice = &text[cursor..end];
+                let mut glyphs = Vec::new();
+                for (rel_idx, ch) in slice.char_indices() {
+                    let byte_idx = cursor + rel_idx;
+                    let adv = if ch == ' ' { char_w * 0.65 } else { char_w };
+                    let right_x = total_width - advance;
+                    let left_x = (right_x - adv).max(0.0);
+                    x_for_byte.push((byte_idx, right_x));
+                    glyphs.push(ShapedGlyph {
+                        glyph_id: ch as u32,
+                        x: left_x,
+                        y: 0.0,
+                        byte_index: byte_idx,
+                        is_emoji: false,
+                    });
+                    advance += adv;
+                }
+                glyphs.reverse();
+                shaped_runs.push(ShapedGlyphRun {
+                    font: run_idx as u32,
+                    color: run.color,
+                    glyphs,
+                });
+                cursor = end;
+            }
+            x_for_byte.push((text.len(), 0.0));
+            return ShapedSegment {
+                font_size_px,
+                ascent,
+                descent,
+                width: total_width,
+                x_for_byte,
+                runs: shaped_runs,
+            };
+        }
 
         for (run_idx, run) in effective_runs.iter().enumerate() {
             let end = (cursor + run.len).min(text.len());

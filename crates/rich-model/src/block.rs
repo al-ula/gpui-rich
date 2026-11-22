@@ -109,6 +109,110 @@ pub struct TableBlock {
     pub border_style: TableBorderStyle,
 }
 
+/// Visual grid placement for one cell inside a [`TableBlock`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TableCellPlacement {
+    pub row_index: usize,
+    pub cell_index: usize,
+    pub visual_col: usize,
+    pub colspan: usize,
+    pub rowspan: usize,
+}
+
+impl TableBlock {
+    /// Returns the number of visual grid columns spanned by this table.
+    pub fn grid_col_count(&self) -> usize {
+        let row_count = self.rows.len();
+        let mut occupied: Vec<Vec<bool>> = Vec::with_capacity(row_count);
+        let mut max_cols = self.columns.len();
+
+        for (row_index, row) in self.rows.iter().enumerate() {
+            if occupied.len() <= row_index {
+                occupied.push(Vec::new());
+            }
+            let mut visual_col = 0usize;
+            for cell in &row.cells {
+                while occupied
+                    .get(row_index)
+                    .and_then(|slots| slots.get(visual_col))
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    visual_col += 1;
+                }
+                let colspan = cell.colspan.max(1) as usize;
+                let rowspan = (cell.rowspan.max(1) as usize).min(row_count.saturating_sub(row_index));
+                let end_col = visual_col + colspan;
+                max_cols = max_cols.max(end_col);
+                for span_row in row_index..(row_index + rowspan) {
+                    while occupied.len() <= span_row {
+                        occupied.push(Vec::new());
+                    }
+                    if occupied[span_row].len() < end_col {
+                        occupied[span_row].resize(end_col, false);
+                    }
+                    for slot in &mut occupied[span_row][visual_col..end_col] {
+                        *slot = true;
+                    }
+                }
+                visual_col = end_col;
+            }
+        }
+        max_cols.max(1)
+    }
+
+    /// Computes visual grid placements for every stored [`TableCell`] and an occupancy matrix
+    /// mapping `(row, visual_col)` to the index into the returned placements vector.
+    pub fn resolve_grid(&self) -> (usize, Vec<TableCellPlacement>, Vec<Vec<Option<usize>>>) {
+        let row_count = self.rows.len();
+        let col_count = self.grid_col_count();
+        let mut occupancy = vec![vec![None; col_count]; row_count];
+        let mut placements = Vec::new();
+
+        for (row_index, row) in self.rows.iter().enumerate() {
+            let mut visual_col = 0usize;
+            for (cell_index, cell) in row.cells.iter().enumerate() {
+                while visual_col < col_count && occupancy[row_index][visual_col].is_some() {
+                    visual_col += 1;
+                }
+                if visual_col >= col_count {
+                    break;
+                }
+                let colspan = (cell.colspan.max(1) as usize).min(col_count - visual_col);
+                let rowspan = (cell.rowspan.max(1) as usize).min(row_count - row_index);
+                let placement_index = placements.len();
+                placements.push(TableCellPlacement {
+                    row_index,
+                    cell_index,
+                    visual_col,
+                    colspan,
+                    rowspan,
+                });
+                for row_slots in occupancy.iter_mut().skip(row_index).take(rowspan) {
+                    for slot in row_slots.iter_mut().skip(visual_col).take(colspan) {
+                        *slot = Some(placement_index);
+                    }
+                }
+                visual_col += colspan;
+            }
+        }
+
+        (col_count, placements, occupancy)
+    }
+
+    /// Returns the [`TableCellPlacement`] for the stored `(row_index, cell_index)` cell.
+    pub fn placement_for_stored_cell(
+        &self,
+        row_index: usize,
+        cell_index: usize,
+    ) -> Option<TableCellPlacement> {
+        let (_, placements, _) = self.resolve_grid();
+        placements
+            .into_iter()
+            .find(|placement| placement.row_index == row_index && placement.cell_index == cell_index)
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum BlockKind {
     Paragraph(InlineContent),
@@ -464,6 +568,23 @@ impl Document {
         if let BlockKind::Heading { collapsed, .. } = &mut block.kind {
             *collapsed = !*collapsed;
             let state = *collapsed;
+            block.bump_version();
+            Some(state)
+        } else {
+            None
+        }
+    }
+
+    /// Toggles the checked state of a checklist `BlockKind::ListItem`, returning the new state.
+    pub fn toggle_checklist_item(&mut self, id: BlockId) -> Option<bool> {
+        let block = self.find_block_mut(id)?;
+        if let BlockKind::ListItem {
+            checked: Some(is_checked),
+            ..
+        } = &mut block.kind
+        {
+            *is_checked = !*is_checked;
+            let state = *is_checked;
             block.bump_version();
             Some(state)
         } else {

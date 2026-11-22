@@ -1,10 +1,10 @@
 use crate::block::{BlockLayout, LayoutCache, default_list_marker};
 use crate::geometry::{Point, Rect, pt_to_px};
-use crate::line::HitResult;
+use crate::line::{HitResult, LineFragment};
 use crate::shaper::{GlyphBackend, TextShaper};
 use rich_model::{
     Affinity, BlockId, BlockKind, BlockNode, BlockWidth, DocPos, Document, DocumentLayoutConfig,
-    DocumentSelection, Edges, HorizontalLayout, ListId, PathSegment,
+    DocumentSelection, Edges, HorizontalLayout, InlineObjectId, ListId, PathSegment,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -108,6 +108,26 @@ pub struct CanvasHitResult {
     pub affinity: Affinity,
     pub hit: HitResult,
     pub toggled_heading: Option<BlockId>,
+    pub toggled_checklist: Option<BlockId>,
+    pub code_block_copy: Option<BlockId>,
+}
+
+/// Hit-test metadata for dragging an internal vertical column border of a table.
+#[derive(Clone, Debug, PartialEq)]
+pub struct TableColumnDividerHit {
+    pub table_id: BlockId,
+    /// Visual column index to the left of the divider (`0..column_widths_px.len() - 1`).
+    pub column_index: usize,
+    /// Canvas X coordinate of the column border.
+    pub divider_x: f32,
+    /// Canvas Y top coordinate of the table.
+    pub table_y: f32,
+    /// Canvas height of the table.
+    pub table_height: f32,
+    /// Current resolved column widths in logical pixels.
+    pub column_widths_px: Vec<f32>,
+    /// Total table width in logical pixels.
+    pub total_width_px: f32,
 }
 
 /// Canvas-space horizontal bounds of the continuous infinite-length paper sheet.
@@ -565,21 +585,9 @@ impl<B: GlyphBackend> FlowLayout<B> {
         );
         let local = Point::new(canvas_point.x - bx, canvas_point.y - by);
 
-        // Check heading collapse chevron click first.
-        if let crate::block::BlockLayoutKind::Heading { chevron_rect, .. } = &layout.kind
-            && chevron_rect.contains(local)
-        {
-            return Some(CanvasHitResult {
-                pos: DocPos::top_level(block.id, 0),
-                affinity: Affinity::Downstream,
-                hit: HitResult {
-                    offset: 0,
-                    affinity: Affinity::Downstream,
-                    inline_object: None,
-                    link: None,
-                },
-                toggled_heading: Some(block.id),
-            });
+        // Check interactive block chrome hit targets (heading chevron, checklist box, code copy button).
+        if let Some(chrome_hit) = hit_test_block_chrome(&layout, local, block.id) {
+            return Some(chrome_hit);
         }
 
         if let Some(hit) = layout.hit_test_local(local) {
@@ -588,6 +596,8 @@ impl<B: GlyphBackend> FlowLayout<B> {
                 affinity: hit.affinity,
                 hit,
                 toggled_heading: None,
+                toggled_checklist: None,
+                code_block_copy: None,
             });
         }
 
@@ -595,6 +605,11 @@ impl<B: GlyphBackend> FlowLayout<B> {
             crate::block::BlockLayoutKind::Blockquote { children, .. } => {
                 if let Some(child) = nearest_child_for_y(children, local.y) {
                     let child_local = Point::new(local.x - child.x, local.y - child.y);
+                    if let Some(chrome_hit) =
+                        hit_test_block_chrome(&child.layout, child_local, child.layout.id)
+                    {
+                        return Some(chrome_hit);
+                    }
                     if let Some(hit) = child.layout.hit_test_local(child_local) {
                         let mut pos = DocPos::top_level(block.id, hit.offset);
                         pos.path.push(PathSegment::Block(child.layout.id));
@@ -603,6 +618,8 @@ impl<B: GlyphBackend> FlowLayout<B> {
                             affinity: hit.affinity,
                             hit,
                             toggled_heading: None,
+                            toggled_checklist: None,
+                            code_block_copy: None,
                         });
                     }
                 }
@@ -624,12 +641,17 @@ impl<B: GlyphBackend> FlowLayout<B> {
                     if let Some(child) = nearest_child_for_y(&cell.children, cell_local.y) {
                         let child_local =
                             Point::new(cell_local.x - child.x, cell_local.y - child.y);
+                        if let Some(chrome_hit) =
+                            hit_test_block_chrome(&child.layout, child_local, child.layout.id)
+                        {
+                            return Some(chrome_hit);
+                        }
                         if let Some(hit) = child.layout.hit_test_local(child_local) {
                             let mut path = smallvec::SmallVec::new();
                             path.push(PathSegment::TableCell {
                                 table_id: block.id,
                                 row: cell.row,
-                                col: cell.col,
+                                col: cell.cell_index,
                             });
                             path.push(PathSegment::Block(child.layout.id));
                             return Some(CanvasHitResult {
@@ -640,6 +662,8 @@ impl<B: GlyphBackend> FlowLayout<B> {
                                 affinity: hit.affinity,
                                 hit,
                                 toggled_heading: None,
+                                toggled_checklist: None,
+                                code_block_copy: None,
                             });
                         }
                     }
@@ -648,6 +672,124 @@ impl<B: GlyphBackend> FlowLayout<B> {
             _ => {}
         }
 
+        None
+    }
+
+    /// Hit-tests internal vertical column dividers of cached top-level tables within `tolerance_px`.
+    pub fn hit_test_table_column_border(
+        &self,
+        canvas_point: Point,
+        doc: &Document,
+        viewport_width: f32,
+        zoom: f32,
+        tolerance_px: f32,
+    ) -> Option<TableColumnDividerHit> {
+        if doc.blocks.is_empty() {
+            return None;
+        }
+        let content_y = (canvas_point.y - self.top_padding_px).max(0.0);
+        let idx = self.height_index.index_at_y(content_y);
+        let block = doc.blocks.get(idx)?;
+        if !self.is_visible(idx) || !matches!(block.kind, BlockKind::Table(_)) {
+            return None;
+        }
+        let layout = self.cache.get_latest(block.id)?;
+        let crate::block::BlockLayoutKind::Table(table) = &layout.kind else {
+            return None;
+        };
+        if table.column_widths.len() < 2 {
+            return None;
+        }
+        let (block_x, _) =
+            resolve_block_horizontal_span(viewport_width, &doc.config, block.width_mode, zoom);
+        let block_y = self.block_y(idx);
+        if canvas_point.y < block_y || canvas_point.y > block_y + table.total_height {
+            return None;
+        }
+
+        let mut acc_x = block_x;
+        for (column_index, &width) in table
+            .column_widths
+            .iter()
+            .take(table.column_widths.len() - 1)
+            .enumerate()
+        {
+            acc_x += width;
+            if (canvas_point.x - acc_x).abs() <= tolerance_px {
+                return Some(TableColumnDividerHit {
+                    table_id: block.id,
+                    column_index,
+                    divider_x: acc_x,
+                    table_y: block_y,
+                    table_height: table.total_height,
+                    column_widths_px: table.column_widths.clone(),
+                    total_width_px: table.total_width,
+                });
+            }
+        }
+        None
+    }
+
+    /// Returns the canvas-space rectangle of an inline object inside the visible blocks.
+    pub fn inline_object_rect_in_visible(
+        &self,
+        block_id: BlockId,
+        object_id: InlineObjectId,
+        visible_blocks: &[VisibleBlock<B>],
+    ) -> Option<Rect> {
+        let mut leaves = Vec::new();
+        for visible in visible_blocks {
+            collect_leaf_paragraphs(&visible.layout, visible.x, visible.y, &mut leaves);
+        }
+        let target = leaves.into_iter().find(|leaf| leaf.block_id == block_id)?;
+        for line in &target.paragraph.lines {
+            for fragment in &line.fragments {
+                if let LineFragment::InlineBox(inline_box) = fragment
+                    && inline_box.object_id == object_id
+                {
+                    return Some(
+                        line.inline_box_rect(inline_box)
+                            .translate(target.origin_x, target.origin_y),
+                    );
+                }
+            }
+        }
+        None
+    }
+
+    /// Returns the canvas-space rectangle of an inline object using cached layouts.
+    pub fn inline_object_rect_cached(
+        &self,
+        block_id: BlockId,
+        object_id: InlineObjectId,
+        doc: &Document,
+        viewport_width: f32,
+        zoom: f32,
+    ) -> Option<Rect> {
+        let pos = doc.doc_pos_for_block(block_id, 0)?;
+        let top_id = pos.top_level_block_id()?;
+        let top_index = doc.top_level_index(top_id)?;
+        let top_block = doc.blocks.get(top_index)?;
+        let layout = self.cache.get_latest(top_id)?;
+        let (block_x, _) =
+            resolve_block_horizontal_span(viewport_width, &doc.config, top_block.width_mode, zoom);
+        let block_y = self.block_y(top_index);
+
+        let mut leaves = Vec::new();
+        collect_leaf_paragraphs(&layout, block_x, block_y, &mut leaves);
+        let target = leaves.into_iter().find(|leaf| leaf.block_id == block_id)?;
+        for line in &target.paragraph.lines {
+            for fragment in &line.fragments {
+                if let LineFragment::InlineBox(inline_box) = fragment
+                    && inline_box.object_id == object_id
+                {
+                    return Some(
+                        line.inline_box_rect(inline_box)
+                            .translate(target.origin_x, target.origin_y),
+                    );
+                }
+            }
+        }
         None
     }
 
@@ -736,9 +878,13 @@ impl<B: GlyphBackend> FlowLayout<B> {
                     }
                     if let crate::block::BlockLayoutKind::Table(table) = &visible.layout.kind {
                         for cell in &table.cells {
-                            if cell.row >= row_min
+                            let cell_row_end =
+                                cell.row + (cell.rowspan.max(1) as usize).saturating_sub(1);
+                            let cell_col_end =
+                                cell.col + (cell.colspan.max(1) as usize).saturating_sub(1);
+                            if cell_row_end >= row_min
                                 && cell.row <= row_max
-                                && cell.col >= col_min
+                                && cell_col_end >= col_min
                                 && cell.col <= col_max
                             {
                                 rects.push(cell.rect.translate(visible.x, visible.y));
@@ -1158,6 +1304,68 @@ fn nearest_child_for_y<B: GlyphBackend>(
         children.first()
     } else {
         children.last()
+    }
+}
+
+fn hit_test_block_chrome<B: GlyphBackend>(
+    layout: &BlockLayout<B>,
+    local: Point,
+    block_id: BlockId,
+) -> Option<CanvasHitResult> {
+    let empty_hit = HitResult {
+        offset: 0,
+        affinity: Affinity::Downstream,
+        inline_object: None,
+        link: None,
+    };
+    match &layout.kind {
+        crate::block::BlockLayoutKind::Heading { chevron_rect, .. }
+            if chevron_rect.contains(local) =>
+        {
+            Some(CanvasHitResult {
+                pos: DocPos::top_level(block_id, 0),
+                affinity: Affinity::Downstream,
+                hit: empty_hit,
+                toggled_heading: Some(block_id),
+                toggled_checklist: None,
+                code_block_copy: None,
+            })
+        }
+        crate::block::BlockLayoutKind::ListItem {
+            checkbox_rect: Some(rect),
+            ..
+        } => {
+            // Expand the checkbox hit target slightly so small checkboxes click comfortably.
+            let expanded = Rect::new(
+                rect.x - 3.0,
+                rect.y - 3.0,
+                rect.width + 6.0,
+                rect.height + 6.0,
+            );
+            if expanded.contains(local) {
+                Some(CanvasHitResult {
+                    pos: DocPos::top_level(block_id, 0),
+                    affinity: Affinity::Downstream,
+                    hit: empty_hit,
+                    toggled_heading: None,
+                    toggled_checklist: Some(block_id),
+                    code_block_copy: None,
+                })
+            } else {
+                None
+            }
+        }
+        crate::block::BlockLayoutKind::CodeBlock {
+            copy_button_rect, ..
+        } if copy_button_rect.contains(local) => Some(CanvasHitResult {
+            pos: DocPos::top_level(block_id, 0),
+            affinity: Affinity::Downstream,
+            hit: empty_hit,
+            toggled_heading: None,
+            toggled_checklist: None,
+            code_block_copy: Some(block_id),
+        }),
+        _ => None,
     }
 }
 

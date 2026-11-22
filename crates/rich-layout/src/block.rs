@@ -19,7 +19,10 @@ pub struct PlacedChildBlock<B: GlyphBackend> {
 pub struct TableCellLayout<B: GlyphBackend> {
     pub cell_id: BlockId,
     pub row: usize,
+    /// Visual grid column index (accounting for preceding `colspan`/`rowspan`).
     pub col: usize,
+    /// Storage index inside `TableRow::cells` (used for `PathSegment::TableCell`).
+    pub cell_index: usize,
     pub colspan: u16,
     pub rowspan: u16,
     pub is_header: bool,
@@ -51,6 +54,7 @@ pub enum BlockLayoutKind<B: GlyphBackend> {
         marker: String,
         checked: Option<bool>,
         marker_origin: Point,
+        checkbox_rect: Option<Rect>,
         paragraph: ParagraphLayout<B>,
     },
     Blockquote {
@@ -60,6 +64,7 @@ pub enum BlockLayoutKind<B: GlyphBackend> {
     CodeBlock {
         language: Option<String>,
         frame_rect: Rect,
+        copy_button_rect: Rect,
         content_origin: Point,
         paragraph: ParagraphLayout<B>,
     },
@@ -296,6 +301,15 @@ pub fn layout_block<S: TextShaper>(
                 .first()
                 .map(|line| line.baseline_y)
                 .unwrap_or(pt_to_px(11.0, zoom));
+            let checkbox_rect = checked.map(|_| {
+                let box_size = pt_to_px(10.5, zoom);
+                let center_y = para
+                    .lines
+                    .first()
+                    .map(|line| line.baseline_y - line.ascent * 0.38)
+                    .unwrap_or(baseline_y - box_size * 0.5);
+                Rect::new(gutter_x, center_y - box_size * 0.5, box_size, box_size)
+            });
             BlockLayout {
                 id: block.id,
                 version: block.version,
@@ -307,6 +321,7 @@ pub fn layout_block<S: TextShaper>(
                     marker,
                     checked: *checked,
                     marker_origin: Point::new(gutter_x, baseline_y),
+                    checkbox_rect,
                     paragraph: para,
                 },
             }
@@ -351,14 +366,18 @@ pub fn layout_block<S: TextShaper>(
         BlockKind::CodeBlock { language, content } => {
             let pad_x = pt_to_px(12.0, zoom);
             let pad_y = pt_to_px(10.0, zoom);
-            let header_h = if language.is_some() {
-                pt_to_px(18.0, zoom)
-            } else {
-                0.0
-            };
+            let header_h = pt_to_px(20.0, zoom);
             let inner_w = (max_width - 2.0 * pad_x).max(40.0);
             let para = layout_paragraph(content, &block.style, sheet, config, inner_w, zoom, shaper);
             let total_h = header_h + para.height + 2.0 * pad_y;
+            let button_w = pt_to_px(44.0, zoom);
+            let button_h = pt_to_px(15.0, zoom);
+            let copy_button_rect = Rect::new(
+                (max_width - button_w - pt_to_px(8.0, zoom)).max(pt_to_px(4.0, zoom)),
+                pt_to_px(4.5, zoom),
+                button_w,
+                button_h,
+            );
             BlockLayout {
                 id: block.id,
                 version: block.version,
@@ -369,6 +388,7 @@ pub fn layout_block<S: TextShaper>(
                 kind: BlockLayoutKind::CodeBlock {
                     language: language.clone(),
                     frame_rect: Rect::new(0.0, 0.0, max_width, total_h),
+                    copy_button_rect,
                     content_origin: Point::new(pad_x, header_h + pad_y),
                     paragraph: para,
                 },
@@ -461,6 +481,7 @@ fn layout_table<S: TextShaper>(
         cell_id: BlockId,
         row: usize,
         col: usize,
+        cell_index: usize,
         colspan: u16,
         rowspan: u16,
         is_header: bool,
@@ -480,7 +501,7 @@ fn layout_table<S: TextShaper>(
 
     for (r_idx, row) in table.rows.iter().enumerate() {
         let mut c_cursor = 0usize;
-        for cell in &row.cells {
+        for (cell_index, cell) in row.cells.iter().enumerate() {
             while c_cursor < col_count && occupied[r_idx][c_cursor] {
                 c_cursor += 1;
             }
@@ -531,6 +552,7 @@ fn layout_table<S: TextShaper>(
                 cell_id: cell.id,
                 row: r_idx,
                 col: c_cursor,
+                cell_index,
                 colspan: colspan as u16,
                 rowspan: rowspan as u16,
                 is_header: row.is_header,
@@ -590,6 +612,7 @@ fn layout_table<S: TextShaper>(
                 cell_id: mc.cell_id,
                 row: mc.row,
                 col: mc.col,
+                cell_index: mc.cell_index,
                 colspan: mc.colspan,
                 rowspan: mc.rowspan,
                 is_header: mc.is_header,
