@@ -4,7 +4,7 @@ use crate::line::HitResult;
 use crate::shaper::{GlyphBackend, TextShaper};
 use rich_model::{
     Affinity, BlockId, BlockKind, BlockNode, BlockWidth, DocPos, Document, DocumentLayoutConfig,
-    DocumentSelection, HorizontalLayout, ListId, PathSegment,
+    DocumentSelection, Edges, HorizontalLayout, ListId, PathSegment,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -116,7 +116,10 @@ pub struct PaperSheetGeometry {
     pub x: f32,
     pub top_y: f32,
     pub width: f32,
-    pub margin_x: f32,
+    pub margin_left: f32,
+    pub margin_right: f32,
+    pub margin_top: f32,
+    pub margin_bottom: f32,
     pub desk_margin: f32,
 }
 
@@ -137,32 +140,53 @@ pub fn resolve_horizontal_metrics(
 ) -> HorizontalMetrics {
     match config.horizontal_layout {
         HorizontalLayout::Fill => {
-            let padding = pt_to_px(config.horizontal_padding_pt, zoom);
-            let column_width = (viewport_width - 2.0 * padding).max(160.0);
+            let mut margin_left = pt_to_px(config.fill_margins_pt.left.max(0.0), zoom);
+            let mut margin_right = pt_to_px(config.fill_margins_pt.right.max(0.0), zoom);
+            let max_horizontal = (viewport_width - 160.0).max(0.0);
+            let total_horizontal = margin_left + margin_right;
+            if total_horizontal > max_horizontal && total_horizontal > 0.0 {
+                let scale = max_horizontal / total_horizontal;
+                margin_left *= scale;
+                margin_right *= scale;
+            }
+            let column_width = (viewport_width - margin_left - margin_right).max(160.0);
             HorizontalMetrics {
-                canvas_width: viewport_width.max(column_width + 2.0 * padding),
+                canvas_width: viewport_width.max(column_width + margin_left + margin_right),
                 paper_sheet: None,
-                column_x: padding,
+                column_x: margin_left,
                 column_width,
             }
         }
         HorizontalLayout::Paper(spec) => {
             let desk_margin = pt_to_px(spec.desk_margin_pt, zoom);
             let paper_width = pt_to_px(spec.width_pt, zoom).max(200.0);
-            let margin_x = pt_to_px(spec.margin_x_pt, zoom).min(paper_width * 0.35);
+            let mut margin_left = pt_to_px(spec.margins_pt.left.max(0.0), zoom);
+            let mut margin_right = pt_to_px(spec.margins_pt.right.max(0.0), zoom);
+            let margin_top = pt_to_px(spec.margins_pt.top.max(0.0), zoom);
+            let margin_bottom = pt_to_px(spec.margins_pt.bottom.max(0.0), zoom);
+            let max_horizontal = (paper_width - 120.0).max(0.0);
+            let total_horizontal = margin_left + margin_right;
+            if total_horizontal > max_horizontal && total_horizontal > 0.0 {
+                let scale = max_horizontal / total_horizontal;
+                margin_left *= scale;
+                margin_right *= scale;
+            }
             let canvas_width = viewport_width.max(paper_width + 2.0 * desk_margin);
             let sheet_x = ((canvas_width - paper_width) * 0.5).max(desk_margin);
-            let column_width = (paper_width - 2.0 * margin_x).max(120.0);
+            let column_width = (paper_width - margin_left - margin_right).max(120.0);
             HorizontalMetrics {
                 canvas_width,
                 paper_sheet: Some(PaperSheetGeometry {
                     x: sheet_x,
                     top_y: desk_margin,
                     width: paper_width,
-                    margin_x,
+                    margin_left,
+                    margin_right,
+                    margin_top,
+                    margin_bottom,
                     desk_margin,
                 }),
-                column_x: sheet_x + margin_x,
+                column_x: sheet_x + margin_left,
                 column_width,
             }
         }
@@ -181,12 +205,20 @@ pub fn resolve_block_horizontal_span(
         Some(sheet) => match width_mode {
             BlockWidth::Column => (metrics.column_x, metrics.column_width),
             BlockWidth::Wide => {
-                let inset = sheet.margin_x * 0.5;
-                (sheet.x + inset, (sheet.width - 2.0 * inset).max(120.0))
+                let left_inset = sheet.margin_left * 0.5;
+                let right_inset = sheet.margin_right * 0.5;
+                (
+                    sheet.x + left_inset,
+                    (sheet.width - left_inset - right_inset).max(120.0),
+                )
             }
             BlockWidth::Full => {
-                let inset = sheet.margin_x * 0.25;
-                (sheet.x + inset, (sheet.width - 2.0 * inset).max(120.0))
+                let left_inset = sheet.margin_left * 0.25;
+                let right_inset = sheet.margin_right * 0.25;
+                (
+                    sheet.x + left_inset,
+                    (sheet.width - left_inset - right_inset).max(120.0),
+                )
             }
         },
         None => (metrics.column_x, metrics.column_width),
@@ -274,6 +306,7 @@ pub struct FlowLayout<B: GlyphBackend> {
     last_column_width: f32,
     last_zoom: f32,
     last_horizontal_layout: HorizontalLayout,
+    last_margins_pt: Edges,
 }
 
 impl<B: GlyphBackend> Default for FlowLayout<B> {
@@ -292,6 +325,7 @@ impl<B: GlyphBackend> Default for FlowLayout<B> {
             last_column_width: 0.0,
             last_zoom: 1.0,
             last_horizontal_layout: HorizontalLayout::default(),
+            last_margins_pt: DocumentLayoutConfig::default().active_margins_pt(),
         }
     }
 }
@@ -317,19 +351,23 @@ impl<B: GlyphBackend> FlowLayout<B> {
     /// Synchronizes structural metadata and height estimates with `doc`.
     pub fn sync_document(&mut self, doc: &Document, viewport_width: f32, zoom: f32) {
         let horizontal = resolve_horizontal_metrics(viewport_width, &doc.config, zoom);
-        let top_desk = horizontal
-            .paper_sheet
-            .map(|sheet| sheet.top_y)
-            .unwrap_or(0.0);
-        self.top_padding_px = top_desk + pt_to_px(doc.config.vertical_padding_pt, zoom);
-        self.bottom_padding_px = pt_to_px(doc.config.vertical_padding_pt * 2.0, zoom);
+        if let Some(sheet) = horizontal.paper_sheet {
+            self.top_padding_px = sheet.top_y + sheet.margin_top;
+            self.bottom_padding_px = sheet.margin_bottom + sheet.desk_margin;
+        } else {
+            self.top_padding_px = pt_to_px(doc.config.fill_margins_pt.top.max(0.0), zoom);
+            self.bottom_padding_px = pt_to_px(doc.config.fill_margins_pt.bottom.max(0.0), zoom);
+        }
 
+        let active_margins_pt = doc.config.active_margins_pt();
         let geometry_changed = (horizontal.column_width - self.last_column_width).abs() > 0.5
             || (zoom - self.last_zoom).abs() > 0.001
-            || doc.config.horizontal_layout != self.last_horizontal_layout;
+            || doc.config.horizontal_layout != self.last_horizontal_layout
+            || active_margins_pt != self.last_margins_pt;
         self.last_column_width = horizontal.column_width;
         self.last_zoom = zoom;
         self.last_horizontal_layout = doc.config.horizontal_layout;
+        self.last_margins_pt = active_margins_pt;
 
         let prev_metrics: HashMap<BlockId, BlockMetrics> = self
             .block_ids
@@ -428,6 +466,7 @@ impl<B: GlyphBackend> FlowLayout<B> {
             || (horizontal.column_width - self.last_column_width).abs() > 0.5
             || (zoom - self.last_zoom).abs() > 0.001
             || doc.config.horizontal_layout != self.last_horizontal_layout
+            || doc.config.active_margins_pt() != self.last_margins_pt
         {
             self.sync_document(doc, viewport_width, zoom);
         }
@@ -1040,22 +1079,35 @@ impl<B: GlyphBackend> FlowLayout<B> {
     }
 }
 
-struct LeafParagraphRef<'layout, B: GlyphBackend> {
-    block_id: BlockId,
-    origin_x: f32,
-    origin_y: f32,
-    paragraph: &'layout crate::line::ParagraphLayout<B>,
+/// Canvas-space placement of a visible text-bearing leaf paragraph (top-level or nested).
+pub struct VisibleLeafParagraph<'layout, B: GlyphBackend> {
+    pub block_id: BlockId,
+    pub origin_x: f32,
+    pub origin_y: f32,
+    pub paragraph: &'layout crate::line::ParagraphLayout<B>,
+}
+
+/// Collects all visible text-bearing leaf paragraphs (including blockquote and table cell children)
+/// with their canvas-space content origins.
+pub fn collect_visible_leaf_paragraphs<'layout, B: GlyphBackend>(
+    visible_blocks: &'layout [VisibleBlock<B>],
+) -> Vec<VisibleLeafParagraph<'layout, B>> {
+    let mut leaves = Vec::new();
+    for visible in visible_blocks {
+        collect_leaf_paragraphs(&visible.layout, visible.x, visible.y, &mut leaves);
+    }
+    leaves
 }
 
 fn collect_leaf_paragraphs<'layout, B: GlyphBackend>(
     layout: &'layout BlockLayout<B>,
     origin_x: f32,
     origin_y: f32,
-    out: &mut Vec<LeafParagraphRef<'layout, B>>,
+    out: &mut Vec<VisibleLeafParagraph<'layout, B>>,
 ) {
     if let Some(paragraph) = layout.paragraph() {
         let content_origin = layout.content_origin();
-        out.push(LeafParagraphRef {
+        out.push(VisibleLeafParagraph {
             block_id: layout.id,
             origin_x: origin_x + content_origin.x,
             origin_y: origin_y + content_origin.y,
@@ -1155,6 +1207,7 @@ fn estimate_block_metrics(
         }
         BlockKind::Table(t) => (t.rows.len().max(1) as f32) * pt_to_px(30.0, zoom),
         BlockKind::HorizontalRule => pt_to_px(12.0, zoom),
+        BlockKind::Custom { .. } => pt_to_px(44.0, zoom),
     };
 
     BlockMetrics {

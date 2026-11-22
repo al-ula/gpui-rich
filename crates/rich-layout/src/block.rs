@@ -67,6 +67,11 @@ pub enum BlockLayoutKind<B: GlyphBackend> {
     HorizontalRule {
         rule_y: f32,
     },
+    Custom {
+        kind: String,
+        data: serde_json::Value,
+        bounds: Rect,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -89,7 +94,8 @@ impl<B: GlyphBackend> BlockLayout<B> {
             | BlockLayoutKind::CodeBlock { paragraph: p, .. } => Some(p),
             BlockLayoutKind::Blockquote { .. }
             | BlockLayoutKind::Table(_)
-            | BlockLayoutKind::HorizontalRule { .. } => None,
+            | BlockLayoutKind::HorizontalRule { .. }
+            | BlockLayoutKind::Custom { .. } => None,
         }
     }
 
@@ -392,6 +398,24 @@ pub fn layout_block<S: TextShaper>(
                 space_before_px,
                 space_after_px,
                 kind: BlockLayoutKind::HorizontalRule { rule_y: h * 0.5 },
+            }
+        }
+        BlockKind::Custom { kind, data } => {
+            let measured = shaper.measure_custom_block(kind, data, max_width, zoom);
+            let width = measured.width.clamp(1.0, max_width.max(1.0));
+            let height = measured.height.max(1.0);
+            BlockLayout {
+                id: block.id,
+                version: block.version,
+                width,
+                height,
+                space_before_px,
+                space_after_px,
+                kind: BlockLayoutKind::Custom {
+                    kind: kind.clone(),
+                    data: data.clone(),
+                    bounds: Rect::new(0.0, 0.0, width, height),
+                },
             }
         }
     }

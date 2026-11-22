@@ -1,21 +1,47 @@
 //! GPUI implementation of [`rich_layout::TextShaper`] backed by `WindowTextSystem`.
 
+use crate::extension::ExtensionRegistry;
 use gpui_kit::{
     Font, FontFallbacks, FontFeatures, FontId, FontStyle, FontWeight as GpuiFontWeight, GlyphId,
     Hsla, Rgba, SharedString, TextRun, Window, px,
 };
 use rich_layout::{
     GlyphBackend, InlineBoxMetrics, ShapedGlyph, ShapedGlyphRun, ShapedSegment, ShaperRunSpec,
-    TextShaper, pt_to_px,
+    Size, TextShaper, pt_to_px,
 };
 use rich_model::{InlineObject, InlineVAlign, RgbaColor};
-use std::sync::OnceLock;
+use std::collections::HashMap;
+use std::sync::{OnceLock, RwLock};
+
+const PREFERRED_SANS_FONTS: &[&str] = &[
+    "IBM Plex Sans",
+    "Inter",
+    "Noto Sans",
+    "Liberation Sans",
+    "DejaVu Sans",
+    "Ubuntu",
+    "Roboto",
+    "Helvetica",
+    "Segoe UI",
+    "Arial",
+];
+
+const PREFERRED_SERIF_FONTS: &[&str] = &[
+    "Georgia",
+    "Noto Serif",
+    "Liberation Serif",
+    "DejaVu Serif",
+    "Times New Roman",
+    "Times",
+    "PT Serif",
+    "Merriweather",
+];
 
 const PREFERRED_MONOSPACE_FONTS: &[&str] = &[
     "JetBrains Mono",
     "Fira Code",
-    "DejaVu Sans Mono",
     "Liberation Mono",
+    "DejaVu Sans Mono",
     "Noto Sans Mono",
     "Ubuntu Mono",
     "Hack",
@@ -25,26 +51,201 @@ const PREFERRED_MONOSPACE_FONTS: &[&str] = &[
     "Courier New",
 ];
 
-static RESOLVED_MONOSPACE_FAMILY: OnceLock<SharedString> = OnceLock::new();
+static FONT_RESOLUTION_CACHE: OnceLock<RwLock<HashMap<String, SharedString>>> = OnceLock::new();
 
-fn resolve_monospace_family(window: &Window) -> SharedString {
-    RESOLVED_MONOSPACE_FAMILY
-        .get_or_init(|| {
-            let installed = window.text_system().all_font_names();
-            for preferred in PREFERRED_MONOSPACE_FONTS {
-                if let Some(found) = installed.iter().find(|name| name.as_str() == *preferred) {
-                    return SharedString::from(found.clone());
+fn font_cache() -> &'static RwLock<HashMap<String, SharedString>> {
+    FONT_RESOLUTION_CACHE.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// Clears the cached font-family resolution table (call after registering custom fonts via
+/// `text_system().add_fonts(...)`).
+pub fn clear_font_resolution_cache() {
+    if let Ok(mut guard) = font_cache().write() {
+        guard.clear();
+    }
+}
+
+/// Scores how completely `family` resolves distinct Regular, Bold, Italic, and Bold-Italic faces.
+///
+/// GPUI falls back to a static Regular/Normal font stack when a requested family (such as Linux's
+/// default `.SystemUIFont` -> `IBM Plex Sans`) is not installed, silently dropping bold and italic.
+fn font_variant_score(family: &SharedString, window: &Window) -> u8 {
+    let text_system = window.text_system();
+    let probe = |weight: GpuiFontWeight, style: FontStyle| {
+        text_system.resolve_font(&Font {
+            family: family.clone(),
+            features: FontFeatures::default(),
+            fallbacks: Some(FontFallbacks::default()),
+            weight,
+            style,
+        })
+    };
+    let regular = probe(GpuiFontWeight::NORMAL, FontStyle::Normal);
+    let bold = probe(GpuiFontWeight::BOLD, FontStyle::Normal);
+    let italic = probe(GpuiFontWeight::NORMAL, FontStyle::Italic);
+    let bold_italic = probe(GpuiFontWeight::BOLD, FontStyle::Italic);
+
+    let has_bold = bold != regular;
+    let has_italic = italic != regular;
+    let has_bold_italic = bold_italic != regular && bold_italic != bold && bold_italic != italic;
+
+    match (has_bold, has_italic, has_bold_italic) {
+        (true, true, true) => 3,
+        (true, true, false) => 2,
+        (false, true, _) => 1,
+        _ => 0,
+    }
+}
+
+fn find_best_installed(
+    preferred: &[&str],
+    installed: &[String],
+    substring_filter: impl Fn(&str) -> bool,
+    window: &Window,
+) -> Option<SharedString> {
+    let mut best: Option<(u8, SharedString)> = None;
+
+    for target in preferred {
+        if let Some(found) = installed
+            .iter()
+            .find(|name| name.eq_ignore_ascii_case(target))
+        {
+            let candidate = SharedString::from(found.clone());
+            let score = font_variant_score(&candidate, window);
+            if score >= 3 {
+                return Some(candidate);
+            }
+            if best
+                .as_ref()
+                .is_none_or(|(best_score, _)| score > *best_score)
+            {
+                best = Some((score, candidate));
+            }
+        }
+    }
+
+    if best.as_ref().is_none_or(|(score, _)| *score < 2) {
+        for found in installed {
+            let lower = found.to_ascii_lowercase();
+            if substring_filter(&lower) {
+                let candidate = SharedString::from(found.clone());
+                let score = font_variant_score(&candidate, window);
+                if score >= 3 {
+                    return Some(candidate);
+                }
+                if best
+                    .as_ref()
+                    .is_none_or(|(best_score, _)| score > *best_score)
+                {
+                    best = Some((score, candidate));
                 }
             }
-            if let Some(found) = installed
-                .iter()
-                .find(|name| name.to_ascii_lowercase().contains("mono"))
-            {
-                return SharedString::from(found.clone());
-            }
-            SharedString::from(".SystemUIFont")
-        })
-        .clone()
+        }
+    }
+
+    best.map(|(_, family)| family)
+}
+
+fn resolve_sans_uncached(installed: &[String], window: &Window) -> SharedString {
+    let system_default = SharedString::from(".SystemUIFont");
+    let default_score = font_variant_score(&system_default, window);
+    if default_score >= 3 {
+        return system_default;
+    }
+    find_best_installed(
+        PREFERRED_SANS_FONTS,
+        installed,
+        |lower| lower.contains("sans") && !lower.contains("mono"),
+        window,
+    )
+    .unwrap_or(system_default)
+}
+
+fn resolve_serif_uncached(installed: &[String], window: &Window) -> SharedString {
+    find_best_installed(
+        PREFERRED_SERIF_FONTS,
+        installed,
+        |lower| lower.contains("serif") && !lower.contains("sans"),
+        window,
+    )
+    .unwrap_or_else(|| resolve_sans_uncached(installed, window))
+}
+
+fn resolve_monospace_uncached(installed: &[String], window: &Window) -> SharedString {
+    find_best_installed(
+        PREFERRED_MONOSPACE_FONTS,
+        installed,
+        |lower| lower.contains("mono"),
+        window,
+    )
+    .unwrap_or_else(|| resolve_sans_uncached(installed, window))
+}
+
+fn metric_compatible_substitutes(lower_name: &str) -> Option<&'static [&'static str]> {
+    match lower_name {
+        "arial" | "helvetica" | "helvetica neue" => {
+            Some(&["Liberation Sans", "Arimo", "Noto Sans", "DejaVu Sans"])
+        }
+        "calibri" | "carlito" | "segoe ui" | "san francisco" | "-apple-system" | "system-ui"
+        | "inter" | "roboto" | "open sans" => {
+            Some(&["Carlito", "Noto Sans", "Liberation Sans", "DejaVu Sans"])
+        }
+        "times new roman" | "times" => {
+            Some(&["Liberation Serif", "Tinos", "Noto Serif", "DejaVu Serif"])
+        }
+        "georgia" | "cambria" | "garamond" | "palatino" | "baskerville" => {
+            Some(&["Gelasio", "Caladea", "Noto Serif", "Liberation Serif", "DejaVu Serif"])
+        }
+        "courier new" | "courier" => {
+            Some(&["Liberation Mono", "Cousine", "DejaVu Sans Mono", "Noto Sans Mono"])
+        }
+        "consolas" | "menlo" | "monaco" | "sf mono" | "fira code" | "jetbrains mono"
+        | "source code pro" => {
+            Some(&["JetBrains Mono", "Liberation Mono", "DejaVu Sans Mono", "Noto Sans Mono"])
+        }
+        _ => None,
+    }
+}
+
+/// Resolves a model font family name (generic aliases or concrete families) to an installed GPUI
+/// font family with metric-compatible cross-OS substitution and bold/italic preservation.
+pub fn resolve_font_family(requested: &str, window: &Window) -> SharedString {
+    let trimmed = requested.trim();
+    let cache_key = trimmed.to_ascii_lowercase();
+
+    if let Ok(guard) = font_cache().read()
+        && let Some(cached) = guard.get(&cache_key)
+    {
+        return cached.clone();
+    }
+
+    let installed = window.text_system().all_font_names();
+    let resolved = if trimmed.is_empty()
+        || trimmed == ".SystemUIFont"
+        || cache_key == "sans-serif"
+        || cache_key == "sans"
+    {
+        resolve_sans_uncached(&installed, window)
+    } else if cache_key == "serif" {
+        resolve_serif_uncached(&installed, window)
+    } else if cache_key == "monospace" || cache_key == "mono" {
+        resolve_monospace_uncached(&installed, window)
+    } else if let Some(exact) = installed
+        .iter()
+        .find(|name| name.eq_ignore_ascii_case(trimmed))
+    {
+        SharedString::from(exact.clone())
+    } else if let Some(substitutes) = metric_compatible_substitutes(&cache_key) {
+        find_best_installed(substitutes, &installed, |_| false, window)
+            .unwrap_or_else(|| resolve_sans_uncached(&installed, window))
+    } else {
+        resolve_sans_uncached(&installed, window)
+    };
+
+    if let Ok(mut guard) = font_cache().write() {
+        guard.insert(cache_key, resolved.clone());
+    }
+    resolved
 }
 
 /// Glyph backend binding `rich-layout` directly to GPUI's native `FontId` and `GlyphId`.
@@ -67,13 +268,10 @@ pub fn rgba_to_hsla(color: RgbaColor) -> Hsla {
     .into()
 }
 
-/// Builds a GPUI [`Font`] from a `ShaperRunSpec`, resolving generic `"monospace"` to an installed face.
+/// Builds a GPUI [`Font`] from a `ShaperRunSpec`, resolving generic aliases and missing cross-OS
+/// families to installed faces with bold and italic support.
 pub fn to_gpui_font(run: &ShaperRunSpec, window: &Window) -> Font {
-    let family = if run.font_family.as_ref().eq_ignore_ascii_case("monospace") {
-        resolve_monospace_family(window)
-    } else {
-        SharedString::from(run.font_family.as_ref().to_owned())
-    };
+    let family = resolve_font_family(run.font_family.as_ref(), window);
     Font {
         family,
         features: FontFeatures::default(),
@@ -87,19 +285,54 @@ pub fn to_gpui_font(run: &ShaperRunSpec, window: &Window) -> Font {
     }
 }
 
+/// Render-time font resolver allowing host applications to override `(font_family, weight, italic)`
+/// mapping into a GPUI [`Font`] without mutating [`rich_model::Document`].
+///
+/// Return `Some(font)` to supply a custom GPUI [`Font`], or `None` to fall back to [`to_gpui_font`].
+pub type FontResolver = dyn Fn(&ShaperRunSpec, &Window) -> Option<Font>;
+
 /// Shapes uniform-size segments through GPUI's native `WindowTextSystem`.
-pub struct GpuiShaper<'window> {
+pub struct GpuiShaper<'window, 'registry> {
     window: &'window Window,
+    extensions: Option<&'registry ExtensionRegistry>,
+    font_resolver: Option<&'registry FontResolver>,
 }
 
-impl<'window> GpuiShaper<'window> {
+impl<'window> GpuiShaper<'window, 'window> {
     /// Creates a shaper borrowing the current GPUI `Window`.
     pub fn new(window: &'window Window) -> Self {
-        Self { window }
+        Self {
+            window,
+            extensions: None,
+            font_resolver: None,
+        }
     }
 }
 
-impl TextShaper for GpuiShaper<'_> {
+impl<'window, 'registry> GpuiShaper<'window, 'registry> {
+    /// Creates a shaper borrowing `window` and an [`ExtensionRegistry`] for custom node sizing.
+    pub fn with_extensions(
+        window: &'window Window,
+        extensions: &'registry ExtensionRegistry,
+    ) -> Self {
+        Self {
+            window,
+            extensions: Some(extensions),
+            font_resolver: None,
+        }
+    }
+
+    /// Attaches an optional render-time [`FontResolver`] for per-variant or custom font mapping.
+    pub fn with_optional_font_resolver(
+        mut self,
+        font_resolver: Option<&'registry FontResolver>,
+    ) -> Self {
+        self.font_resolver = font_resolver;
+        self
+    }
+}
+
+impl TextShaper for GpuiShaper<'_, '_> {
     type Backend = GpuiGlyphBackend;
 
     fn shape_segment(
@@ -116,10 +349,14 @@ impl TextShaper for GpuiShaper<'_> {
         for run in runs {
             let end = (byte_cursor + run.len).min(text.len());
             if end > byte_cursor {
+                let font = self
+                    .font_resolver
+                    .and_then(|resolver| resolver(run, self.window))
+                    .unwrap_or_else(|| to_gpui_font(run, self.window));
                 color_ranges.push((byte_cursor..end, run.color));
                 gpui_runs.push(TextRun {
                     len: end - byte_cursor,
-                    font: to_gpui_font(run, self.window),
+                    font,
                     color: rgba_to_hsla(run.color),
                     background_color: None,
                     underline: None,
@@ -262,7 +499,52 @@ impl TextShaper for GpuiShaper<'_> {
                     valign: InlineVAlign::Baseline,
                 }
             }
+            InlineObject::Custom { kind, data } => {
+                if let Some(extension) = self
+                    .extensions
+                    .and_then(|registry| registry.get_node(kind))
+                {
+                    return extension.measure_inline(data, zoom, self.window);
+                }
+                let font_size = px(pt_to_px(10.0, zoom));
+                let run = TextRun {
+                    len: kind.len(),
+                    font: gpui_kit::font(".SystemUIFont"),
+                    color: rgba_to_hsla(RgbaColor::BLACK),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let shaped = self.window.text_system().shape_line(
+                    SharedString::from(kind.clone()),
+                    font_size,
+                    &[run],
+                    None,
+                );
+                let label_width: f32 = shaped.width.into();
+                InlineBoxMetrics {
+                    width: label_width + pt_to_px(16.0, zoom),
+                    height: pt_to_px(18.0, zoom),
+                    valign: InlineVAlign::Middle,
+                }
+            }
         }
+    }
+
+    fn measure_custom_block(
+        &mut self,
+        kind: &str,
+        data: &serde_json::Value,
+        max_width: f32,
+        zoom: f32,
+    ) -> Size {
+        if let Some(extension) = self
+            .extensions
+            .and_then(|registry| registry.get_node(kind))
+        {
+            return extension.measure_block(data, max_width, zoom, self.window);
+        }
+        Size::new(max_width, pt_to_px(44.0, zoom))
     }
 }
 

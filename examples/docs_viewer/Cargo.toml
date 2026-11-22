@@ -12,3 +12,4 @@ gpui-kit.workspace = true
 rich-model.workspace = true
 rich-layout.workspace = true
 rich-gpui.workspace = true
+serde_json.workspace = true

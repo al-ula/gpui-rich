@@ -2,20 +2,24 @@
 //! policy gating, theming, host events, keyboard navigation, IME input, and core editing.
 
 use crate::element::RichDocumentElement;
-use crate::shaper::{GpuiGlyphBackend, GpuiShaper};
+use crate::extension::{CustomCommandResult, ExtensionRegistry, NodeExtension};
+use crate::shaper::{FontResolver, GpuiGlyphBackend, GpuiShaper};
 use crate::theme::RichTheme;
 use gpui_kit::{
     App, Bounds, ClipboardItem, Context, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
+    Font, InteractiveElement, IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
     MouseUpEvent, ParentElement, Pixels, Point as GpuiPoint, Render, ScrollDelta, ScrollEvent,
     Styled, Task, UTF16Selection, Window, actions, div, point, px, size,
 };
-use rich_layout::{FlowLayout, Point, resolve_horizontal_metrics};
+use rich_layout::{FlowLayout, Point, ShaperRunSpec, resolve_horizontal_metrics};
 use rich_model::{
-    Affinity, BlockId, BlockKind, BlockStyle, ChangeSet, CommandDecision, CommandMiddleware,
-    CommandOutcome, CommandSource, DocPos, Document, DocumentSelection, History, HistoryMergeGroup,
-    HorizontalLayout, InlineContent, InteractionPolicy, MoveDirection, MoveUnit, PathSegment,
-    RichCommand, Step, Transaction,
+    Affinity, BlockId, BlockKind, BlockNode, BlockStyle, ChangeSet, ClipboardBlock,
+    ClipboardFragment, CommandDecision, CommandMiddleware, CommandOutcome, CommandSource,
+    DecorationProvider, DocPos, Document, DocumentSelection, Edges, History, HistoryMergeGroup,
+    HorizontalLayout, InlineContent, InlineObject, InlineStyle, InteractionPolicy, LinkTarget,
+    ListKind, MarkKind, MoveDirection, MoveUnit, NamedStyle, NumberStyle,
+    OBJECT_REPLACEMENT_UTF8_LEN, PathSegment, ResolvedTextStyle, RgbaColor, RichCommand,
+    SelectionValue, SharedStr, Step, StyleId, TextAlign, Transaction,
 };
 use std::ops::Range;
 use std::time::Duration;
@@ -27,6 +31,7 @@ pub const RICH_DOCUMENT_KEY_CONTEXT: &str = "RichDocument";
 const CARET_BLINK_PAUSE_DELAY: Duration = Duration::from_millis(500);
 const CARET_SCROLL_MARGIN_PX: f32 = 28.0;
 const MAX_LIST_INDENT_LEVEL: u8 = 6;
+const CLIPBOARD_HTML_METADATA_KEY: &str = "gpui_rich_html";
 
 actions!(
     rich_document,
@@ -34,6 +39,7 @@ actions!(
         Copy,
         Cut,
         Paste,
+        PastePlainText,
         SelectAll,
         ClearSelection,
         ZoomIn,
@@ -70,6 +76,27 @@ actions!(
         SoftBreak,
         Indent,
         Outdent,
+        ToggleBold,
+        ToggleItalic,
+        ToggleUnderline,
+        ToggleStrikethrough,
+        ToggleInlineCode,
+        ToggleSuperscript,
+        ToggleSubscript,
+        SetHeading1,
+        SetHeading2,
+        SetHeading3,
+        SetParagraph,
+        ToggleBulletList,
+        ToggleOrderedList,
+        ToggleChecklist,
+        AlignLeft,
+        AlignCenter,
+        AlignRight,
+        AlignJustify,
+        ClearFormatting,
+        IncreaseFontSize,
+        DecreaseFontSize,
     ]
 );
 
@@ -103,6 +130,7 @@ pub fn register_default_keybindings(cx: &mut App) {
         KeyBinding::new("cmd-c", Copy, context),
         KeyBinding::new("cmd-x", Cut, context),
         KeyBinding::new("cmd-v", Paste, context),
+        KeyBinding::new("cmd-shift-v", PastePlainText, context),
         KeyBinding::new("cmd-a", SelectAll, context),
         KeyBinding::new("cmd-=", ZoomIn, context),
         KeyBinding::new("cmd--", ZoomOut, context),
@@ -110,6 +138,25 @@ pub fn register_default_keybindings(cx: &mut App) {
         KeyBinding::new("cmd-z", Undo, context),
         KeyBinding::new("cmd-shift-z", Redo, context),
         KeyBinding::new("cmd-y", Redo, context),
+        KeyBinding::new("cmd-b", ToggleBold, context),
+        KeyBinding::new("cmd-i", ToggleItalic, context),
+        KeyBinding::new("cmd-u", ToggleUnderline, context),
+        KeyBinding::new("cmd-e", ToggleInlineCode, context),
+        KeyBinding::new("cmd-shift-x", ToggleStrikethrough, context),
+        KeyBinding::new("cmd-\\", ClearFormatting, context),
+        KeyBinding::new("cmd-shift-.", IncreaseFontSize, context),
+        KeyBinding::new("cmd-shift-,", DecreaseFontSize, context),
+        KeyBinding::new("cmd-alt-1", SetHeading1, context),
+        KeyBinding::new("cmd-alt-2", SetHeading2, context),
+        KeyBinding::new("cmd-alt-3", SetHeading3, context),
+        KeyBinding::new("cmd-alt-0", SetParagraph, context),
+        KeyBinding::new("cmd-shift-8", ToggleBulletList, context),
+        KeyBinding::new("cmd-shift-7", ToggleOrderedList, context),
+        KeyBinding::new("cmd-shift-9", ToggleChecklist, context),
+        KeyBinding::new("cmd-shift-l", AlignLeft, context),
+        KeyBinding::new("cmd-shift-e", AlignCenter, context),
+        KeyBinding::new("cmd-shift-r", AlignRight, context),
+        KeyBinding::new("cmd-shift-j", AlignJustify, context),
         KeyBinding::new("alt-left", MoveWordLeft, context),
         KeyBinding::new("alt-right", MoveWordRight, context),
         KeyBinding::new("alt-shift-left", SelectWordLeft, context),
@@ -131,6 +178,7 @@ pub fn register_default_keybindings(cx: &mut App) {
         KeyBinding::new("ctrl-c", Copy, context),
         KeyBinding::new("ctrl-x", Cut, context),
         KeyBinding::new("ctrl-v", Paste, context),
+        KeyBinding::new("ctrl-shift-v", PastePlainText, context),
         KeyBinding::new("ctrl-a", SelectAll, context),
         KeyBinding::new("ctrl-=", ZoomIn, context),
         KeyBinding::new("ctrl--", ZoomOut, context),
@@ -138,6 +186,25 @@ pub fn register_default_keybindings(cx: &mut App) {
         KeyBinding::new("ctrl-z", Undo, context),
         KeyBinding::new("ctrl-shift-z", Redo, context),
         KeyBinding::new("ctrl-y", Redo, context),
+        KeyBinding::new("ctrl-b", ToggleBold, context),
+        KeyBinding::new("ctrl-i", ToggleItalic, context),
+        KeyBinding::new("ctrl-u", ToggleUnderline, context),
+        KeyBinding::new("ctrl-e", ToggleInlineCode, context),
+        KeyBinding::new("ctrl-shift-x", ToggleStrikethrough, context),
+        KeyBinding::new("ctrl-\\", ClearFormatting, context),
+        KeyBinding::new("ctrl-shift-.", IncreaseFontSize, context),
+        KeyBinding::new("ctrl-shift-,", DecreaseFontSize, context),
+        KeyBinding::new("ctrl-alt-1", SetHeading1, context),
+        KeyBinding::new("ctrl-alt-2", SetHeading2, context),
+        KeyBinding::new("ctrl-alt-3", SetHeading3, context),
+        KeyBinding::new("ctrl-alt-0", SetParagraph, context),
+        KeyBinding::new("ctrl-shift-8", ToggleBulletList, context),
+        KeyBinding::new("ctrl-shift-7", ToggleOrderedList, context),
+        KeyBinding::new("ctrl-shift-9", ToggleChecklist, context),
+        KeyBinding::new("ctrl-shift-l", AlignLeft, context),
+        KeyBinding::new("ctrl-shift-e", AlignCenter, context),
+        KeyBinding::new("ctrl-shift-r", AlignRight, context),
+        KeyBinding::new("ctrl-shift-j", AlignJustify, context),
         KeyBinding::new("ctrl-left", MoveWordLeft, context),
         KeyBinding::new("ctrl-right", MoveWordRight, context),
         KeyBinding::new("ctrl-shift-left", SelectWordLeft, context),
@@ -156,6 +223,10 @@ pub fn register_default_keybindings(cx: &mut App) {
 /// Identifier returned when registering a [`CommandMiddleware`] on [`RichDocumentView`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct MiddlewareId(u64);
+
+/// Identifier returned when registering a [`DecorationProvider`] on [`RichDocumentView`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct DecorationProviderId(u64);
 
 /// Ephemeral IME composition state held on [`RichDocumentView`] outside [`Document`] and [`History`].
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,6 +275,9 @@ pub struct RichDocumentView {
     pub follow_app_theme: bool,
     pub open_external_links: bool,
     pub ime_preedit: Option<ImePreedit>,
+    pub extensions: ExtensionRegistry,
+    pub(crate) font_resolver: Option<Box<FontResolver>>,
+    pub(crate) decoration_providers: Vec<(DecorationProviderId, Box<dyn DecorationProvider>)>,
     pub(crate) last_viewport_bounds: Bounds<Pixels>,
     pub(crate) hovered_pointer: bool,
     pub(crate) caret_visible: bool,
@@ -213,6 +287,7 @@ pub struct RichDocumentView {
     _blink_task: Task<()>,
     middleware: Vec<(MiddlewareId, Box<dyn CommandMiddleware>)>,
     next_middleware_id: u64,
+    next_decoration_provider_id: u64,
     dragging: bool,
     drag_moved: bool,
     drag_origin: Option<Point>,
@@ -241,6 +316,9 @@ impl RichDocumentView {
             follow_app_theme: false,
             open_external_links: true,
             ime_preedit: None,
+            extensions: ExtensionRegistry::new(),
+            font_resolver: None,
+            decoration_providers: Vec::new(),
             last_viewport_bounds: Bounds::default(),
             hovered_pointer: false,
             caret_visible: true,
@@ -250,6 +328,7 @@ impl RichDocumentView {
             _blink_task: Task::ready(()),
             middleware: Vec::new(),
             next_middleware_id: 1,
+            next_decoration_provider_id: 1,
             dragging: false,
             drag_moved: false,
             drag_origin: None,
@@ -269,6 +348,27 @@ impl RichDocumentView {
         self.theme = theme;
         self.follow_app_theme = false;
         self
+    }
+
+    /// Builder method configuring a render-time [`FontResolver`] for mapping `(font_family, weight, italic)`
+    /// into custom GPUI [`Font`]s without mutating the underlying [`Document`].
+    pub fn with_font_resolver(
+        mut self,
+        resolver: impl Fn(&ShaperRunSpec, &Window) -> Option<Font> + 'static,
+    ) -> Self {
+        self.font_resolver = Some(Box::new(resolver));
+        self
+    }
+
+    /// Replaces or clears the render-time [`FontResolver`], invalidating cached block layouts.
+    pub fn set_font_resolver(
+        &mut self,
+        resolver: Option<Box<FontResolver>>,
+        cx: &mut Context<Self>,
+    ) {
+        self.font_resolver = resolver;
+        self.flow.cache.clear();
+        cx.notify();
     }
 
     /// Builder method enabling or disabling live synchronization with [`gpui_kit::base::Theme`].
@@ -296,6 +396,105 @@ impl RichDocumentView {
         let previous_len = self.middleware.len();
         self.middleware.retain(|(entry_id, _)| *entry_id != id);
         self.middleware.len() != previous_len
+    }
+
+    /// Builder method attaching an ephemeral [`DecorationProvider`].
+    pub fn with_decoration_provider(
+        mut self,
+        provider: impl DecorationProvider + 'static,
+    ) -> Self {
+        self.add_decoration_provider(provider);
+        self
+    }
+
+    /// Registers an ephemeral [`DecorationProvider`] feeding paint Layers 2, 4, and 5.
+    pub fn add_decoration_provider(
+        &mut self,
+        provider: impl DecorationProvider + 'static,
+    ) -> DecorationProviderId {
+        let id = DecorationProviderId(self.next_decoration_provider_id);
+        self.next_decoration_provider_id = self.next_decoration_provider_id.wrapping_add(1);
+        self.decoration_providers.push((id, Box::new(provider)));
+        id
+    }
+
+    /// Removes a previously registered [`DecorationProvider`].
+    pub fn remove_decoration_provider(&mut self, id: DecorationProviderId) -> bool {
+        let previous_len = self.decoration_providers.len();
+        self.decoration_providers
+            .retain(|(entry_id, _)| *entry_id != id);
+        self.decoration_providers.len() != previous_len
+    }
+
+    /// Schedules a repaint so dynamic [`DecorationProvider`]s re-evaluate visible blocks.
+    pub fn invalidate_decorations(&mut self, cx: &mut Context<Self>) {
+        cx.notify();
+    }
+
+    /// Builder method registering a custom [`NodeExtension`] for `kind`.
+    pub fn with_node_extension(
+        mut self,
+        kind: impl Into<String>,
+        extension: impl NodeExtension + 'static,
+    ) -> Self {
+        self.extensions.register_node(kind, extension);
+        self
+    }
+
+    /// Registers a custom [`NodeExtension`] for `kind` and clears cached layouts for resizing.
+    pub fn register_node_extension(
+        &mut self,
+        kind: impl Into<String>,
+        extension: impl NodeExtension + 'static,
+        cx: &mut Context<Self>,
+    ) {
+        self.extensions.register_node(kind, extension);
+        self.flow.cache.clear();
+        cx.notify();
+    }
+
+    /// Unregisters a custom [`NodeExtension`] for `kind`.
+    pub fn unregister_node_extension(&mut self, kind: &str, cx: &mut Context<Self>) -> bool {
+        let removed = self.extensions.unregister_node(kind);
+        if removed {
+            self.flow.cache.clear();
+            cx.notify();
+        }
+        removed
+    }
+
+    /// Builder method registering a custom command handler on [`Self::extensions`].
+    pub fn with_custom_command(
+        mut self,
+        id: impl Into<String>,
+        handler: impl Fn(
+            &serde_json::Value,
+            &mut Document,
+            Option<&DocumentSelection>,
+        ) -> CustomCommandResult
+        + 'static,
+    ) -> Self {
+        self.extensions.register_command(id, handler);
+        self
+    }
+
+    /// Registers a custom command handler for [`RichCommand::Custom`] matching `id`.
+    pub fn register_custom_command(
+        &mut self,
+        id: impl Into<String>,
+        handler: impl Fn(
+            &serde_json::Value,
+            &mut Document,
+            Option<&DocumentSelection>,
+        ) -> CustomCommandResult
+        + 'static,
+    ) {
+        self.extensions.register_command(id, handler);
+    }
+
+    /// Unregisters a custom command handler.
+    pub fn unregister_custom_command(&mut self, id: &str) -> bool {
+        self.extensions.unregister_command(id)
     }
 
     /// Updates [`Self::policy`], clearing active selection or IME preedit when disallowed.
@@ -434,6 +633,15 @@ impl RichDocumentView {
         self.caret_visible = false;
     }
 
+    /// Sets document or paper margins through [`RichCommand::SetMargins`].
+    pub fn set_margins(&mut self, margins_pt: Edges, cx: &mut Context<Self>) -> CommandOutcome {
+        self.dispatch_command_with_source(
+            RichCommand::SetMargins(margins_pt),
+            CommandSource::Programmatic,
+            cx,
+        )
+    }
+
     /// Dispatches a user-initiated [`RichCommand`] through middleware, policy checks, and events.
     pub fn dispatch_command(
         &mut self,
@@ -564,6 +772,17 @@ impl RichDocumentView {
                 cx.notify();
                 CommandOutcome::Executed
             }
+            RichCommand::SetMargins(margins) => {
+                let clamped = margins.clamped_non_negative();
+                if self.document.config.active_margins_pt() == clamped {
+                    return CommandOutcome::NoOp;
+                }
+                let anchor = self.flow.capture_anchor(self.scroll_y);
+                self.document.config.set_active_margins_pt(clamped);
+                self.resync_layout_with_anchor(anchor);
+                cx.notify();
+                CommandOutcome::Executed
+            }
             RichCommand::SetZoom(target_zoom) => self.apply_zoom(*target_zoom, cx),
             RichCommand::AdjustZoom(delta) => self.apply_zoom(self.zoom + *delta, cx),
             RichCommand::ResetZoom => self.apply_zoom(1.0, cx),
@@ -669,10 +888,15 @@ impl RichDocumentView {
                 extend_selection,
             } => self.execute_move_caret(*direction, *unit, *extend_selection, cx),
             RichCommand::CopySelection => {
-                let Some(text) = self.selected_plain_text() else {
+                let Some(fragment) = self.selected_fragment() else {
                     return CommandOutcome::NoOp;
                 };
-                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                let plain_text = fragment.to_plain_text_with(&self.extensions);
+                let html = fragment.to_html_with(&self.extensions);
+                let metadata = serde_json::json!({ CLIPBOARD_HTML_METADATA_KEY: html }).to_string();
+                cx.write_to_clipboard(ClipboardItem::new_string_with_metadata(
+                    plain_text, metadata,
+                ));
                 CommandOutcome::Executed
             }
             RichCommand::OpenLink(href) => {
@@ -733,16 +957,30 @@ impl RichDocumentView {
                 CommandOutcome::Executed
             }
             RichCommand::InsertText(text) => self.execute_insert_text(text, cx),
+            RichCommand::InsertInlineObject(object) => {
+                self.execute_insert_inline_object(object.clone(), cx)
+            }
             RichCommand::Delete { direction, unit } => self.execute_delete(*direction, *unit, cx),
             RichCommand::SplitBlock => self.execute_split_block(cx),
             RichCommand::InsertSoftBreak => self.execute_insert_soft_break(cx),
             RichCommand::Indent => self.execute_indent(cx),
             RichCommand::Outdent => self.execute_outdent(cx),
-            RichCommand::InsertInlineObject(_)
-            | RichCommand::ToggleMark(_)
-            | RichCommand::SetInlineStyle(_)
-            | RichCommand::SetBlockStyle(_)
-            | RichCommand::SetTextAlign(_) => CommandOutcome::Unsupported,
+            RichCommand::ToggleMark(mark) => self.execute_toggle_mark(*mark, cx),
+            RichCommand::SetInlineStyle(style) => self.execute_set_inline_style(style, cx),
+            RichCommand::ClearFormatting => self.execute_clear_formatting(cx),
+            RichCommand::AdjustFontSize(delta_pt) => self.execute_adjust_font_size(*delta_pt, cx),
+            RichCommand::SetLink(target) => self.execute_set_link(target.clone(), cx),
+            RichCommand::SetBlockStyle(style) => self.execute_set_block_style(style, cx),
+            RichCommand::UpdateNamedStyle { style_id, style } => {
+                self.execute_update_named_style(*style_id, style.clone(), cx)
+            }
+            RichCommand::SetHeading(level) => self.execute_set_heading(*level, cx),
+            RichCommand::ToggleList(list_kind) => self.execute_toggle_list(*list_kind, cx),
+            RichCommand::SetTextAlign(align) => self.execute_set_text_align(*align, cx),
+            RichCommand::PasteHtml { html, plain_text } => {
+                self.execute_paste_html(html, plain_text.as_deref(), cx)
+            }
+            RichCommand::Custom { id, payload, .. } => self.execute_custom_command(id, payload, cx),
         }
     }
 
@@ -1520,6 +1758,1284 @@ impl RichDocumentView {
         }
     }
 
+    fn execute_insert_inline_object(
+        &mut self,
+        object: InlineObject,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        self.ime_preedit = None;
+        self.history.break_coalescing();
+        let Some((anchor, focus, stored_marks)) = self.active_text_selection() else {
+            return CommandOutcome::NoOp;
+        };
+        let selection_before = self.selection.clone();
+        let Some((mut steps, caret_pos)) = self.document.delete_selection_steps(&anchor, &focus)
+        else {
+            return CommandOutcome::NoOp;
+        };
+        let Some(block_id) = caret_pos.leaf_block_id() else {
+            return CommandOutcome::NoOp;
+        };
+        let style = stored_marks.unwrap_or_else(|| {
+            self.document
+                .find_block(block_id)
+                .and_then(|block| block.kind.inline_content())
+                .map(|inline| inline.style_at_caret(caret_pos.offset))
+                .unwrap_or_default()
+        });
+        let mut content = InlineContent::empty();
+        content.push_object(object, style);
+        steps.push(Step::InsertContent {
+            block_id,
+            offset: caret_pos.offset,
+            content,
+        });
+        let mut next_pos = caret_pos;
+        next_pos.offset += OBJECT_REPLACEMENT_UTF8_LEN;
+        let transaction = Transaction::new(steps).with_selections(
+            selection_before,
+            Some(DocumentSelection::caret(next_pos, Affinity::Downstream)),
+        );
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+        CommandOutcome::Executed
+    }
+
+    fn execute_toggle_mark(&mut self, mark: MarkKind, cx: &mut Context<Self>) -> CommandOutcome {
+        self.ime_preedit = None;
+        self.history.break_coalescing();
+        let Some((anchor, focus, stored_marks)) = self.active_text_selection() else {
+            return CommandOutcome::NoOp;
+        };
+
+        if anchor == focus {
+            let Some(block_id) = focus.leaf_block_id() else {
+                return CommandOutcome::NoOp;
+            };
+            let Some(block) = self.document.find_block(block_id) else {
+                return CommandOutcome::NoOp;
+            };
+            let Some(inline) = block.kind.inline_content() else {
+                return CommandOutcome::NoOp;
+            };
+            let base_style = block
+                .style
+                .resolved_base_text(&self.document.stylesheet, &self.document.config.default_style);
+            let mut next_marks =
+                stored_marks.unwrap_or_else(|| inline.style_at_caret(focus.offset));
+            let enabled = !next_marks.is_mark_active(mark, &base_style);
+            next_marks.set_mark(mark, enabled, &base_style);
+            self.set_collapsed_stored_marks(next_marks, cx);
+            return CommandOutcome::Executed;
+        }
+
+        let covered = self.covered_leaf_ranges(&anchor, &focus);
+        if covered.is_empty() {
+            return CommandOutcome::NoOp;
+        }
+        let target_enabled = !self.all_ranges_have_mark(&covered, mark);
+        let mut steps = Vec::with_capacity(covered.len());
+        for (block_id, range) in covered {
+            if range.is_empty() {
+                continue;
+            }
+            let Some(block) = self.document.find_block(block_id) else {
+                continue;
+            };
+            let Some(inline) = block.kind.inline_content() else {
+                continue;
+            };
+            let base_style = block
+                .style
+                .resolved_base_text(&self.document.stylesheet, &self.document.config.default_style);
+            let mapped = inline.mapped_spans_in_range(range, |style| {
+                style.set_mark(mark, target_enabled, &base_style);
+            });
+            if !mapped.is_empty() {
+                steps.push(Step::RestoreSpans {
+                    block_id,
+                    spans: mapped,
+                });
+            }
+        }
+        if steps.is_empty() {
+            return CommandOutcome::NoOp;
+        }
+        let selection_snapshot = self.selection.clone();
+        let transaction =
+            Transaction::new(steps).with_selections(selection_snapshot.clone(), selection_snapshot);
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+        CommandOutcome::Executed
+    }
+
+    fn execute_set_inline_style(
+        &mut self,
+        overlay: &InlineStyle,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        self.ime_preedit = None;
+        self.history.break_coalescing();
+        let Some((anchor, focus, stored_marks)) = self.active_text_selection() else {
+            return CommandOutcome::NoOp;
+        };
+
+        if anchor == focus {
+            let Some(block_id) = focus.leaf_block_id() else {
+                return CommandOutcome::NoOp;
+            };
+            let Some(inline) = self
+                .document
+                .find_block(block_id)
+                .and_then(|block| block.kind.inline_content())
+            else {
+                return CommandOutcome::NoOp;
+            };
+            let current = stored_marks.unwrap_or_else(|| inline.style_at_caret(focus.offset));
+            let next_marks = current.merge(overlay);
+            self.set_collapsed_stored_marks(next_marks, cx);
+            return CommandOutcome::Executed;
+        }
+
+        let covered = self.covered_leaf_ranges(&anchor, &focus);
+        let mut steps = Vec::new();
+        for (block_id, range) in covered {
+            if !range.is_empty() {
+                steps.push(Step::ApplyInlineStyle {
+                    block_id,
+                    range,
+                    style: overlay.clone(),
+                });
+            }
+        }
+        if steps.is_empty() {
+            return CommandOutcome::NoOp;
+        }
+        let selection_snapshot = self.selection.clone();
+        let transaction =
+            Transaction::new(steps).with_selections(selection_snapshot.clone(), selection_snapshot);
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+        CommandOutcome::Executed
+    }
+
+    fn execute_set_link(
+        &mut self,
+        target: Option<LinkTarget>,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        self.ime_preedit = None;
+        self.history.break_coalescing();
+        let Some((anchor, focus, stored_marks)) = self.active_text_selection() else {
+            return CommandOutcome::NoOp;
+        };
+
+        if anchor == focus {
+            let Some(block_id) = focus.leaf_block_id() else {
+                return CommandOutcome::NoOp;
+            };
+            let Some(inline) = self
+                .document
+                .find_block(block_id)
+                .and_then(|block| block.kind.inline_content())
+            else {
+                return CommandOutcome::NoOp;
+            };
+            let mut next_marks =
+                stored_marks.unwrap_or_else(|| inline.style_at_caret(focus.offset));
+            next_marks.link = target;
+            self.set_collapsed_stored_marks(next_marks, cx);
+            return CommandOutcome::Executed;
+        }
+
+        let covered = self.covered_leaf_ranges(&anchor, &focus);
+        let mut steps = Vec::new();
+        for (block_id, range) in covered {
+            if range.is_empty() {
+                continue;
+            }
+            let Some(inline) = self
+                .document
+                .find_block(block_id)
+                .and_then(|block| block.kind.inline_content())
+            else {
+                continue;
+            };
+            let mapped = inline.mapped_spans_in_range(range, |style| {
+                style.link = target.clone();
+            });
+            if !mapped.is_empty() {
+                steps.push(Step::RestoreSpans {
+                    block_id,
+                    spans: mapped,
+                });
+            }
+        }
+        if steps.is_empty() {
+            return CommandOutcome::NoOp;
+        }
+        let selection_snapshot = self.selection.clone();
+        let transaction =
+            Transaction::new(steps).with_selections(selection_snapshot.clone(), selection_snapshot);
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+        CommandOutcome::Executed
+    }
+
+    fn execute_set_block_style(
+        &mut self,
+        style: &BlockStyle,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        self.ime_preedit = None;
+        self.history.break_coalescing();
+        let block_ids = self.selected_leaf_block_ids();
+        if block_ids.is_empty() {
+            return CommandOutcome::NoOp;
+        }
+        let mut steps = Vec::with_capacity(block_ids.len());
+        for block_id in block_ids {
+            if self
+                .document
+                .find_block(block_id)
+                .is_some_and(|block| &block.style != style)
+            {
+                steps.push(Step::SetBlockStyle {
+                    block_id,
+                    style: style.clone(),
+                });
+            }
+        }
+        if steps.is_empty() {
+            return CommandOutcome::NoOp;
+        }
+        let selection_snapshot = self.selection.clone();
+        let transaction =
+            Transaction::new(steps).with_selections(selection_snapshot.clone(), selection_snapshot);
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+        CommandOutcome::Executed
+    }
+
+    fn execute_set_text_align(
+        &mut self,
+        align: TextAlign,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        self.ime_preedit = None;
+        self.history.break_coalescing();
+        let block_ids = self.selected_leaf_block_ids();
+        if block_ids.is_empty() {
+            return CommandOutcome::NoOp;
+        }
+        let mut steps = Vec::new();
+        for block_id in block_ids {
+            if let Some(block) = self.document.find_block(block_id)
+                && block.style.align != align
+            {
+                let mut next_style = block.style.clone();
+                next_style.align = align;
+                steps.push(Step::SetBlockStyle {
+                    block_id,
+                    style: next_style,
+                });
+            }
+        }
+        if steps.is_empty() {
+            return CommandOutcome::NoOp;
+        }
+        let selection_snapshot = self.selection.clone();
+        let transaction =
+            Transaction::new(steps).with_selections(selection_snapshot.clone(), selection_snapshot);
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+        CommandOutcome::Executed
+    }
+
+    fn execute_set_heading(
+        &mut self,
+        target_level: Option<u8>,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        self.ime_preedit = None;
+        self.history.break_coalescing();
+        let block_ids = self.selected_leaf_block_ids();
+        if block_ids.is_empty() {
+            return CommandOutcome::NoOp;
+        }
+        let clamped_level = target_level.map(|level| level.clamp(1, 6));
+        let mut steps = Vec::new();
+
+        for block_id in block_ids {
+            let Some(block) = self.document.find_block(block_id) else {
+                continue;
+            };
+            let align = block.style.align;
+            let mut content = match &block.kind {
+                BlockKind::Paragraph(content)
+                | BlockKind::Heading { content, .. }
+                | BlockKind::ListItem { content, .. } => content.clone(),
+                _ => continue,
+            };
+            let has_inline_size = content
+                .spans
+                .iter()
+                .any(|span| span.style.font_size_pt.is_some());
+
+            let already_matches = match (&block.kind, clamped_level) {
+                (BlockKind::Heading { level, .. }, Some(target)) => {
+                    *level == target
+                        && block.style.named_style == Some(StyleId::heading(target))
+                        && !has_inline_size
+                }
+                (BlockKind::Paragraph(_), None) => {
+                    block.style.named_style == Some(StyleId::NORMAL) && !has_inline_size
+                }
+                _ => false,
+            };
+            if already_matches {
+                continue;
+            }
+
+            // Clear explicit inline font-size overrides so the block adopts the target style size.
+            if has_inline_size {
+                for span in &mut content.spans {
+                    span.style.font_size_pt = None;
+                }
+                content.normalize();
+            }
+
+            let (next_kind, next_style) = match clamped_level {
+                Some(level) => (
+                    BlockKind::Heading {
+                        level,
+                        collapsed: false,
+                        content,
+                    },
+                    BlockStyle::named(StyleId::heading(level)).with_align(align),
+                ),
+                None => (
+                    BlockKind::Paragraph(content),
+                    BlockStyle::default().with_align(align),
+                ),
+            };
+            steps.push(Step::SetBlockKind {
+                block_id,
+                kind: next_kind,
+            });
+            steps.push(Step::SetBlockStyle {
+                block_id,
+                style: next_style,
+            });
+        }
+
+        if steps.is_empty() {
+            return CommandOutcome::NoOp;
+        }
+        let selection_before = self.selection.clone();
+        let selection_after = selection_before.clone().map(|selection| match selection {
+            DocumentSelection::Text {
+                anchor,
+                focus,
+                affinity,
+                goal_x,
+                mut stored_marks,
+            } => {
+                if let Some(marks) = stored_marks.as_mut() {
+                    marks.font_size_pt = None;
+                }
+                DocumentSelection::Text {
+                    anchor,
+                    focus,
+                    affinity,
+                    goal_x,
+                    stored_marks,
+                }
+            }
+            other => other,
+        });
+        let transaction =
+            Transaction::new(steps).with_selections(selection_before, selection_after);
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+        CommandOutcome::Executed
+    }
+
+    fn execute_toggle_list(
+        &mut self,
+        target_kind: ListKind,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        self.ime_preedit = None;
+        self.history.break_coalescing();
+        let block_ids = self.selected_leaf_block_ids();
+        let convertible: Vec<BlockId> = block_ids
+            .into_iter()
+            .filter(|block_id| {
+                self.document.find_block(*block_id).is_some_and(|block| {
+                    matches!(
+                        block.kind,
+                        BlockKind::Paragraph(_)
+                            | BlockKind::Heading { .. }
+                            | BlockKind::ListItem { .. }
+                    )
+                })
+            })
+            .collect();
+        if convertible.is_empty() {
+            return CommandOutcome::NoOp;
+        }
+
+        let all_already_target = convertible.iter().all(|block_id| {
+            self.document.find_block(*block_id).is_some_and(|block| {
+                matches!(block.kind, BlockKind::ListItem { kind, .. } if kind == target_kind)
+            })
+        });
+
+        let shared_list_id = if all_already_target {
+            self.document.alloc_list_id()
+        } else {
+            self.adjacent_list_id_for(convertible[0], target_kind)
+                .unwrap_or_else(|| self.document.alloc_list_id())
+        };
+
+        let mut steps = Vec::new();
+        for block_id in convertible {
+            let Some(block) = self.document.find_block(block_id) else {
+                continue;
+            };
+            let align = block.style.align;
+            let (content, existing_indent, existing_checked) = match &block.kind {
+                BlockKind::Paragraph(content) | BlockKind::Heading { content, .. } => {
+                    (content.clone(), 0u8, None)
+                }
+                BlockKind::ListItem {
+                    indent_level,
+                    checked,
+                    content,
+                    ..
+                } => (content.clone(), *indent_level, *checked),
+                _ => continue,
+            };
+
+            let (next_kind, next_style) = if all_already_target {
+                (
+                    BlockKind::Paragraph(content),
+                    BlockStyle::default().with_align(align),
+                )
+            } else {
+                let indent = 24.0 * (f32::from(existing_indent) + 1.0);
+                let mut style = BlockStyle::default().with_indent(indent, 0.0).with_align(align);
+                style.space_after_pt = Some(4.0);
+                let checked = match target_kind {
+                    ListKind::Checklist => Some(existing_checked.unwrap_or(false)),
+                    _ => None,
+                };
+                (
+                    BlockKind::ListItem {
+                        list_id: shared_list_id,
+                        kind: target_kind,
+                        indent_level: existing_indent,
+                        checked,
+                        content,
+                    },
+                    style,
+                )
+            };
+
+            steps.push(Step::SetBlockKind {
+                block_id,
+                kind: next_kind,
+            });
+            steps.push(Step::SetBlockStyle {
+                block_id,
+                style: next_style,
+            });
+        }
+
+        if steps.is_empty() {
+            return CommandOutcome::NoOp;
+        }
+        let selection_snapshot = self.selection.clone();
+        let transaction =
+            Transaction::new(steps).with_selections(selection_snapshot.clone(), selection_snapshot);
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+        CommandOutcome::Executed
+    }
+
+    fn execute_paste_html(
+        &mut self,
+        html: &str,
+        plain_fallback: Option<&str>,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        self.ime_preedit = None;
+        self.history.break_coalescing();
+
+        let fragment = ClipboardFragment::from_html(html);
+        if fragment.is_empty() {
+            return match plain_fallback {
+                Some(fallback) if !fallback.is_empty() => self.execute_insert_text(fallback, cx),
+                _ => CommandOutcome::NoOp,
+            };
+        }
+
+        let Some((anchor, focus, _)) = self.active_text_selection() else {
+            return CommandOutcome::NoOp;
+        };
+        let selection_before = self.selection.clone();
+        let Some((delete_steps, caret_pos)) = self.document.delete_selection_steps(&anchor, &focus)
+        else {
+            return CommandOutcome::NoOp;
+        };
+        let Some(first_block_id) = caret_pos.leaf_block_id() else {
+            return CommandOutcome::NoOp;
+        };
+
+        // Inside a code block, paste normalized plain text to preserve raw code semantics.
+        if self
+            .document
+            .find_block(first_block_id)
+            .is_some_and(|block| matches!(block.kind, BlockKind::CodeBlock { .. }))
+        {
+            let plain = plain_fallback
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| fragment.to_plain_text_with(&self.extensions));
+            return self.execute_insert_text(&plain, cx);
+        }
+
+        // Fast path: single plain/rich paragraph inserts inline directly into the active block.
+        if fragment.blocks.len() == 1
+            && let Some(ClipboardBlock::Paragraph { content, .. }) = fragment.blocks.first()
+        {
+            let inserted_len = content.len();
+            let mut steps = delete_steps;
+            if inserted_len > 0 {
+                steps.push(Step::InsertContent {
+                    block_id: first_block_id,
+                    offset: caret_pos.offset,
+                    content: content.clone(),
+                });
+            }
+            if steps.is_empty() {
+                return CommandOutcome::NoOp;
+            }
+            let mut next_pos = caret_pos;
+            next_pos.offset += inserted_len;
+            let transaction = Transaction::new(steps).with_selections(
+                selection_before,
+                Some(DocumentSelection::caret(next_pos, Affinity::Downstream)),
+            );
+            self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+            return CommandOutcome::Executed;
+        }
+
+        let Some((target, start_index)) = self.document.locate_block(first_block_id) else {
+            return CommandOutcome::NoOp;
+        };
+
+        let anchor_scroll = self.flow.capture_anchor(self.scroll_y);
+        let mut combined_inverse_steps = Vec::new();
+        let mut combined_change_set = ChangeSet::default();
+
+        if !delete_steps.is_empty() {
+            let applied_del = self.document.apply(Transaction::new(delete_steps));
+            combined_inverse_steps.extend(applied_del.inverse.steps);
+            combined_change_set.structure_changed |= applied_del.change_set.structure_changed;
+            for dirty in applied_del.change_set.dirty_blocks {
+                if !combined_change_set.dirty_blocks.contains(&dirty) {
+                    combined_change_set.dirty_blocks.push(dirty);
+                }
+            }
+        }
+
+        let current_inline = self
+            .document
+            .find_block(first_block_id)
+            .and_then(|block| block.kind.inline_content())
+            .cloned()
+            .unwrap_or_default();
+        let split_offset = caret_pos.offset.min(current_inline.len());
+        let trailing_after_caret = current_inline.slice(split_offset..current_inline.len());
+
+        let mut pasted_nodes = fragment.to_block_nodes(&mut self.document);
+        if pasted_nodes.is_empty() {
+            return CommandOutcome::NoOp;
+        }
+
+        let mut steps = Vec::new();
+        let mut caret_block_id = first_block_id;
+        let mut caret_offset = split_offset;
+
+        let merge_first_into_current = split_offset > 0
+            && pasted_nodes
+                .first()
+                .and_then(|node| node.kind.inline_content())
+                .is_some();
+
+        if merge_first_into_current {
+            let first_pasted = pasted_nodes.remove(0);
+            if split_offset < current_inline.len() {
+                steps.push(Step::DeleteRange {
+                    block_id: first_block_id,
+                    range: split_offset..current_inline.len(),
+                });
+            }
+            let first_inline = first_pasted.kind.inline_content().cloned().unwrap_or_default();
+            let first_len = first_inline.len();
+            if !first_inline.is_empty() {
+                steps.push(Step::InsertContent {
+                    block_id: first_block_id,
+                    offset: split_offset,
+                    content: first_inline,
+                });
+            }
+            caret_block_id = first_block_id;
+            caret_offset = split_offset + first_len;
+
+            if pasted_nodes.is_empty() {
+                if !trailing_after_caret.is_empty() {
+                    steps.push(Step::InsertContent {
+                        block_id: first_block_id,
+                        offset: caret_offset,
+                        content: trailing_after_caret,
+                    });
+                }
+            } else {
+                let mut trailing_attached = false;
+                if let Some(last_node) = pasted_nodes.last_mut()
+                    && let Some(last_inline) = last_node.kind.inline_content_mut()
+                {
+                    caret_block_id = last_node.id;
+                    caret_offset = last_inline.len();
+                    if !trailing_after_caret.is_empty() {
+                        last_inline.insert_content(caret_offset, &trailing_after_caret);
+                    }
+                    trailing_attached = true;
+                }
+                if !trailing_attached && !trailing_after_caret.is_empty() {
+                    let tail_id = self.document.alloc_block_id();
+                    pasted_nodes.push(BlockNode::new(
+                        tail_id,
+                        BlockKind::Paragraph(trailing_after_caret),
+                        BlockStyle::default(),
+                    ));
+                    caret_block_id = tail_id;
+                    caret_offset = 0;
+                } else if !trailing_attached
+                    && let Some((fallback_id, fallback_offset)) =
+                        last_text_pos_in_nodes(&pasted_nodes)
+                {
+                    caret_block_id = fallback_id;
+                    caret_offset = fallback_offset;
+                }
+
+                for (offset_index, node) in pasted_nodes.into_iter().enumerate() {
+                    steps.push(Step::InsertBlockIn {
+                        target,
+                        index: start_index + 1 + offset_index,
+                        block: node,
+                    });
+                }
+            }
+        } else {
+            // Caret at offset 0 (or first pasted block is non-inline such as a Table/HR/Custom):
+            // split prefix/suffix cleanly around the pasted block sequence.
+            let mut insert_index = start_index;
+            if split_offset > 0 && split_offset < current_inline.len() {
+                steps.push(Step::DeleteRange {
+                    block_id: first_block_id,
+                    range: split_offset..current_inline.len(),
+                });
+                insert_index = start_index + 1;
+            } else if split_offset > 0 {
+                insert_index = start_index + 1;
+            }
+
+            let replace_current_block = split_offset == 0;
+            let mut trailing_attached = false;
+            if replace_current_block
+                && let Some(last_node) = pasted_nodes.last_mut()
+                && let Some(last_inline) = last_node.kind.inline_content_mut()
+            {
+                caret_block_id = last_node.id;
+                caret_offset = last_inline.len();
+                if !trailing_after_caret.is_empty() {
+                    last_inline.insert_content(caret_offset, &trailing_after_caret);
+                }
+                trailing_attached = true;
+            } else if !replace_current_block && !trailing_after_caret.is_empty() {
+                let tail_id = self.document.alloc_block_id();
+                pasted_nodes.push(BlockNode::new(
+                    tail_id,
+                    BlockKind::Paragraph(trailing_after_caret.clone()),
+                    BlockStyle::default(),
+                ));
+                caret_block_id = tail_id;
+                caret_offset = 0;
+                trailing_attached = true;
+            } else if let Some((fallback_id, fallback_offset)) =
+                last_text_pos_in_nodes(&pasted_nodes)
+            {
+                caret_block_id = fallback_id;
+                caret_offset = fallback_offset;
+            }
+
+            let pasted_count = pasted_nodes.len();
+            for (offset_index, node) in pasted_nodes.into_iter().enumerate() {
+                steps.push(Step::InsertBlockIn {
+                    target,
+                    index: insert_index + offset_index,
+                    block: node,
+                });
+            }
+            if replace_current_block && (trailing_attached || trailing_after_caret.is_empty()) {
+                steps.push(Step::RemoveBlockIn {
+                    target,
+                    index: insert_index + pasted_count,
+                });
+            }
+        }
+
+        let applied_paste = self.document.apply(Transaction::new(steps));
+        let mut merged_inverse = applied_paste.inverse.steps;
+        merged_inverse.extend(combined_inverse_steps);
+        combined_change_set.structure_changed |= applied_paste.change_set.structure_changed;
+        for dirty in applied_paste.change_set.dirty_blocks {
+            if !combined_change_set.dirty_blocks.contains(&dirty) {
+                combined_change_set.dirty_blocks.push(dirty);
+            }
+        }
+
+        let next_selection = self
+            .document
+            .doc_pos_for_block(caret_block_id, caret_offset)
+            .map(|pos| DocumentSelection::caret(pos, Affinity::Downstream));
+
+        self.history.push_inverse_grouped(
+            Transaction {
+                steps: merged_inverse,
+                selection_before: next_selection.clone(),
+                selection_after: selection_before,
+            },
+            HistoryMergeGroup::Atomic,
+        );
+        if let Some(selection) = next_selection {
+            self.update_selection(Some(selection), cx);
+        }
+        self.resync_layout_with_anchor(anchor_scroll);
+        self.notify_transaction_applied(combined_change_set, cx);
+        self.reset_caret_blink(cx);
+        self.ensure_caret_visible();
+        cx.notify();
+        CommandOutcome::Executed
+    }
+
+    fn execute_custom_command(
+        &mut self,
+        id: &str,
+        payload: &serde_json::Value,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        let Some(result) =
+            self.extensions
+                .execute_command(id, payload, &mut self.document, self.selection.as_ref())
+        else {
+            return CommandOutcome::Unsupported;
+        };
+        match result {
+            CustomCommandResult::Transaction(transaction) => {
+                self.apply_transaction(*transaction, true, cx);
+                CommandOutcome::Executed
+            }
+            CustomCommandResult::Executed => {
+                cx.notify();
+                CommandOutcome::Executed
+            }
+            CustomCommandResult::NoOp => CommandOutcome::NoOp,
+        }
+    }
+
+    fn set_collapsed_stored_marks(&mut self, marks: InlineStyle, cx: &mut Context<Self>) {
+        if let Some(DocumentSelection::Text {
+            anchor,
+            focus,
+            affinity,
+            goal_x,
+            ..
+        }) = self.selection.clone()
+        {
+            let next_selection = DocumentSelection::Text {
+                anchor,
+                focus,
+                affinity,
+                goal_x,
+                stored_marks: Some(marks),
+            };
+            self.update_selection(Some(next_selection), cx);
+        }
+    }
+
+    fn covered_leaf_ranges(&self, anchor: &DocPos, focus: &DocPos) -> Vec<(BlockId, Range<usize>)> {
+        let (Some(anchor_leaf_id), Some(focus_leaf_id)) =
+            (anchor.leaf_block_id(), focus.leaf_block_id())
+        else {
+            return Vec::new();
+        };
+        let leaves = self.document.collect_leaf_blocks();
+        let (Some(anchor_idx), Some(focus_idx)) = (
+            leaves.iter().position(|block| block.id == anchor_leaf_id),
+            leaves.iter().position(|block| block.id == focus_leaf_id),
+        ) else {
+            return Vec::new();
+        };
+        let ((start_idx, start_off), (end_idx, end_off)) =
+            if (anchor_idx, anchor.offset) <= (focus_idx, focus.offset) {
+                ((anchor_idx, anchor.offset), (focus_idx, focus.offset))
+            } else {
+                ((focus_idx, focus.offset), (anchor_idx, anchor.offset))
+            };
+
+        let mut covered = Vec::new();
+        for index in start_idx..=end_idx {
+            let Some(block) = leaves.get(index) else {
+                continue;
+            };
+            let Some(inline) = block.kind.inline_content() else {
+                continue;
+            };
+            let range_start = if index == start_idx {
+                start_off.min(inline.len())
+            } else {
+                0
+            };
+            let range_end = if index == end_idx {
+                end_off.min(inline.len()).max(range_start)
+            } else {
+                inline.len()
+            };
+            covered.push((block.id, range_start..range_end));
+        }
+        covered
+    }
+
+    fn selected_leaf_block_ids(&self) -> Vec<BlockId> {
+        let Some((anchor, focus, _)) = self.active_text_selection() else {
+            return Vec::new();
+        };
+        if anchor == focus {
+            return focus.leaf_block_id().into_iter().collect();
+        }
+        self.covered_leaf_ranges(&anchor, &focus)
+            .into_iter()
+            .map(|(block_id, _)| block_id)
+            .collect()
+    }
+
+    fn all_ranges_have_mark(&self, ranges: &[(BlockId, Range<usize>)], mark: MarkKind) -> bool {
+        let mut saw_any_content = false;
+        for (block_id, range) in ranges {
+            if range.is_empty() {
+                continue;
+            }
+            let Some(block) = self.document.find_block(*block_id) else {
+                continue;
+            };
+            let Some(inline) = block.kind.inline_content() else {
+                continue;
+            };
+            let base_style = block
+                .style
+                .resolved_base_text(&self.document.stylesheet, &self.document.config.default_style);
+            for span in &inline.spans {
+                if span.range.end <= range.start || span.range.start >= range.end {
+                    continue;
+                }
+                saw_any_content = true;
+                if !span.style.is_mark_active(mark, &base_style) {
+                    return false;
+                }
+            }
+        }
+        saw_any_content
+    }
+
+    fn adjacent_list_id_for(
+        &self,
+        block_id: BlockId,
+        target_kind: ListKind,
+    ) -> Option<rich_model::ListId> {
+        let (target, index) = self.document.locate_block(block_id)?;
+        let siblings = self.document.container_blocks(target)?;
+        if index > 0
+            && let Some(prev) = siblings.get(index - 1)
+            && let BlockKind::ListItem { list_id, kind, .. } = prev.kind
+            && kind == target_kind
+        {
+            return Some(list_id);
+        }
+        if let Some(next) = siblings.get(index + 1)
+            && let BlockKind::ListItem { list_id, kind, .. } = next.kind
+            && kind == target_kind
+        {
+            return Some(list_id);
+        }
+        None
+    }
+
+    /// Returns the resolved inline text style at the active caret or selection start,
+    /// incorporating `stored_marks` when set.
+    pub fn active_inline_style(&self) -> Option<ResolvedTextStyle> {
+        let (anchor, focus, stored_marks) = self.active_text_selection()?;
+        let is_collapsed = anchor == focus;
+        let pos = if is_collapsed {
+            focus
+        } else {
+            self.ordered_positions(&anchor, &focus).0
+        };
+        let block_id = pos.leaf_block_id()?;
+        let block = self.document.find_block(block_id)?;
+        let inline = block.kind.inline_content()?;
+        let base_style = block
+            .style
+            .resolved_base_text(&self.document.stylesheet, &self.document.config.default_style);
+        let local_style = if is_collapsed {
+            stored_marks.unwrap_or_else(|| inline.style_at_caret(pos.offset))
+        } else {
+            inline.style_at(pos.offset)
+        };
+        Some(local_style.resolve(&base_style))
+    }
+
+    /// Returns true when `mark` is active across the active selection or at the collapsed caret.
+    pub fn is_mark_active(&self, mark: MarkKind) -> bool {
+        let Some((anchor, focus, stored_marks)) = self.active_text_selection() else {
+            return false;
+        };
+        if anchor == focus {
+            let Some(block_id) = focus.leaf_block_id() else {
+                return false;
+            };
+            let Some(block) = self.document.find_block(block_id) else {
+                return false;
+            };
+            let Some(inline) = block.kind.inline_content() else {
+                return false;
+            };
+            let base_style = block
+                .style
+                .resolved_base_text(&self.document.stylesheet, &self.document.config.default_style);
+            let style = stored_marks.unwrap_or_else(|| inline.style_at_caret(focus.offset));
+            return style.is_mark_active(mark, &base_style);
+        }
+        let covered = self.covered_leaf_ranges(&anchor, &focus);
+        self.all_ranges_have_mark(&covered, mark)
+    }
+
+    /// Returns the hyperlink active at the caret or selection start, if any.
+    pub fn active_link(&self) -> Option<LinkTarget> {
+        self.active_inline_style().and_then(|style| style.link)
+    }
+
+    /// Returns the active paragraph alignment for the focused block.
+    pub fn active_text_align(&self) -> Option<TextAlign> {
+        let (_, focus, _) = self.active_text_selection()?;
+        let block_id = focus.leaf_block_id()?;
+        Some(self.document.find_block(block_id)?.style.align)
+    }
+
+    /// Returns `Some(1..=6)` when the focused block is a heading, or `None` otherwise.
+    pub fn active_heading_level(&self) -> Option<u8> {
+        let (_, focus, _) = self.active_text_selection()?;
+        let block_id = focus.leaf_block_id()?;
+        match self.document.find_block(block_id)?.kind {
+            BlockKind::Heading { level, .. } => Some(level),
+            _ => None,
+        }
+    }
+
+    /// Returns the [`ListKind`] when the focused block is a list item, or `None` otherwise.
+    pub fn active_list_kind(&self) -> Option<ListKind> {
+        let (_, focus, _) = self.active_text_selection()?;
+        let block_id = focus.leaf_block_id()?;
+        match self.document.find_block(block_id)?.kind {
+            BlockKind::ListItem { kind, .. } => Some(kind),
+            _ => None,
+        }
+    }
+
+    fn execute_clear_formatting(&mut self, cx: &mut Context<Self>) -> CommandOutcome {
+        self.ime_preedit = None;
+        self.history.break_coalescing();
+        let Some((anchor, focus, stored_marks)) = self.active_text_selection() else {
+            return CommandOutcome::NoOp;
+        };
+
+        if anchor == focus {
+            let Some(block_id) = focus.leaf_block_id() else {
+                return CommandOutcome::NoOp;
+            };
+            let Some(inline) = self
+                .document
+                .find_block(block_id)
+                .and_then(|block| block.kind.inline_content())
+            else {
+                return CommandOutcome::NoOp;
+            };
+            let current = stored_marks.unwrap_or_else(|| inline.style_at_caret(focus.offset));
+            let cleared = current.cleared_formatting();
+            self.set_collapsed_stored_marks(cleared, cx);
+            return CommandOutcome::Executed;
+        }
+
+        let covered = self.covered_leaf_ranges(&anchor, &focus);
+        let mut steps = Vec::new();
+        for (block_id, range) in covered {
+            if range.is_empty() {
+                continue;
+            }
+            let Some(inline) = self
+                .document
+                .find_block(block_id)
+                .and_then(|block| block.kind.inline_content())
+            else {
+                continue;
+            };
+            let mapped = inline.mapped_spans_in_range(range, |style| {
+                *style = style.cleared_formatting();
+            });
+            if !mapped.is_empty() {
+                steps.push(Step::RestoreSpans {
+                    block_id,
+                    spans: mapped,
+                });
+            }
+        }
+        if steps.is_empty() {
+            return CommandOutcome::NoOp;
+        }
+        let selection_snapshot = self.selection.clone();
+        let transaction =
+            Transaction::new(steps).with_selections(selection_snapshot.clone(), selection_snapshot);
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+        CommandOutcome::Executed
+    }
+
+    fn execute_adjust_font_size(
+        &mut self,
+        delta_pt: f32,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        if delta_pt.abs() < 0.01 {
+            return CommandOutcome::NoOp;
+        }
+        self.ime_preedit = None;
+        self.history.break_coalescing();
+        let Some((anchor, focus, stored_marks)) = self.active_text_selection() else {
+            return CommandOutcome::NoOp;
+        };
+
+        if anchor == focus {
+            let Some(block_id) = focus.leaf_block_id() else {
+                return CommandOutcome::NoOp;
+            };
+            let Some(block) = self.document.find_block(block_id) else {
+                return CommandOutcome::NoOp;
+            };
+            let Some(inline) = block.kind.inline_content() else {
+                return CommandOutcome::NoOp;
+            };
+            let base_style = block
+                .style
+                .resolved_base_text(&self.document.stylesheet, &self.document.config.default_style);
+            let mut next_marks =
+                stored_marks.unwrap_or_else(|| inline.style_at_caret(focus.offset));
+            let current_pt = next_marks.font_size_pt.unwrap_or(base_style.font_size_pt);
+            let next_pt = (current_pt + delta_pt).clamp(6.0, 96.0);
+            if (next_pt - current_pt).abs() < 0.01 {
+                return CommandOutcome::NoOp;
+            }
+            next_marks.font_size_pt = Some(next_pt);
+            self.set_collapsed_stored_marks(next_marks, cx);
+            return CommandOutcome::Executed;
+        }
+
+        let covered = self.covered_leaf_ranges(&anchor, &focus);
+        let mut steps = Vec::new();
+        for (block_id, range) in covered {
+            if range.is_empty() {
+                continue;
+            }
+            let Some(block) = self.document.find_block(block_id) else {
+                continue;
+            };
+            let Some(inline) = block.kind.inline_content() else {
+                continue;
+            };
+            let base_style = block
+                .style
+                .resolved_base_text(&self.document.stylesheet, &self.document.config.default_style);
+            let mapped = inline.mapped_spans_in_range(range, |style| {
+                let current_pt = style.font_size_pt.unwrap_or(base_style.font_size_pt);
+                style.font_size_pt = Some((current_pt + delta_pt).clamp(6.0, 96.0));
+            });
+            if !mapped.is_empty() {
+                steps.push(Step::RestoreSpans {
+                    block_id,
+                    spans: mapped,
+                });
+            }
+        }
+        if steps.is_empty() {
+            return CommandOutcome::NoOp;
+        }
+        let selection_snapshot = self.selection.clone();
+        let transaction =
+            Transaction::new(steps).with_selections(selection_snapshot.clone(), selection_snapshot);
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+        CommandOutcome::Executed
+    }
+
+    fn execute_update_named_style(
+        &mut self,
+        style_id: StyleId,
+        style: NamedStyle,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        self.ime_preedit = None;
+        self.history.break_coalescing();
+        if self.document.stylesheet.get(style_id) == Some(&style) {
+            return CommandOutcome::NoOp;
+        }
+        let selection_snapshot = self.selection.clone();
+        let transaction = Transaction::new(vec![Step::UpdateNamedStyle {
+            style_id,
+            style: Some(style),
+        }])
+        .with_selections(selection_snapshot.clone(), selection_snapshot);
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+        CommandOutcome::Executed
+    }
+
+    fn collect_selection_resolved_styles(&self) -> Option<Vec<ResolvedTextStyle>> {
+        let (anchor, focus, stored_marks) = self.active_text_selection()?;
+        if anchor == focus {
+            let block_id = focus.leaf_block_id()?;
+            let block = self.document.find_block(block_id)?;
+            let inline = block.kind.inline_content()?;
+            let base_style = block
+                .style
+                .resolved_base_text(&self.document.stylesheet, &self.document.config.default_style);
+            let local = stored_marks.unwrap_or_else(|| inline.style_at_caret(focus.offset));
+            return Some(vec![local.resolve(&base_style)]);
+        }
+
+        let covered = self.covered_leaf_ranges(&anchor, &focus);
+        let mut styles = Vec::new();
+        for (block_id, range) in covered {
+            if range.is_empty() {
+                continue;
+            }
+            let Some(block) = self.document.find_block(block_id) else {
+                continue;
+            };
+            let Some(inline) = block.kind.inline_content() else {
+                continue;
+            };
+            let base_style = block
+                .style
+                .resolved_base_text(&self.document.stylesheet, &self.document.config.default_style);
+            for span in &inline.spans {
+                if span.range.end <= range.start || span.range.start >= range.end {
+                    continue;
+                }
+                styles.push(span.style.resolve(&base_style));
+            }
+        }
+        if styles.is_empty() {
+            self.active_inline_style().map(|style| vec![style])
+        } else {
+            Some(styles)
+        }
+    }
+
+    /// Returns whether the active selection has one uniform font family or spans multiple families.
+    pub fn selected_font_family(&self) -> Option<SelectionValue<SharedStr>> {
+        let styles = self.collect_selection_resolved_styles()?;
+        let first = styles.first()?.font_family.clone();
+        if styles.iter().all(|style| style.font_family == first) {
+            Some(SelectionValue::Uniform(first))
+        } else {
+            Some(SelectionValue::Mixed)
+        }
+    }
+
+    /// Returns whether the active selection has one uniform font size (in pt) or spans multiple sizes.
+    pub fn selected_font_size_pt(&self) -> Option<SelectionValue<f32>> {
+        let styles = self.collect_selection_resolved_styles()?;
+        let first = styles.first()?.font_size_pt;
+        if styles
+            .iter()
+            .all(|style| (style.font_size_pt - first).abs() < 0.05)
+        {
+            Some(SelectionValue::Uniform(first))
+        } else {
+            Some(SelectionValue::Mixed)
+        }
+    }
+
+    /// Returns whether the active selection has one uniform text color or spans multiple colors.
+    pub fn selected_text_color(&self) -> Option<SelectionValue<RgbaColor>> {
+        let styles = self.collect_selection_resolved_styles()?;
+        let first = styles.first()?.color;
+        if styles.iter().all(|style| style.color == first) {
+            Some(SelectionValue::Uniform(first))
+        } else {
+            Some(SelectionValue::Mixed)
+        }
+    }
+
+    /// Returns whether `mark` is uniformly on, uniformly off, or mixed across the active selection.
+    pub fn selected_mark_state(&self, mark: MarkKind) -> Option<SelectionValue<bool>> {
+        let styles = self.collect_selection_resolved_styles()?;
+        let first = styles.first()?.is_mark_active(mark);
+        if styles
+            .iter()
+            .all(|style| style.is_mark_active(mark) == first)
+        {
+            Some(SelectionValue::Uniform(first))
+        } else {
+            Some(SelectionValue::Mixed)
+        }
+    }
+
+    /// Returns whether all selected blocks share one [`TextAlign`] or mix multiple alignments.
+    pub fn selected_text_align(&self) -> Option<SelectionValue<TextAlign>> {
+        let block_ids = self.selected_leaf_block_ids();
+        let first_id = *block_ids.first()?;
+        let first_align = self.document.find_block(first_id)?.style.align;
+        for block_id in block_ids.into_iter().skip(1) {
+            if let Some(block) = self.document.find_block(block_id)
+                && block.style.align != first_align
+            {
+                return Some(SelectionValue::Mixed);
+            }
+        }
+        Some(SelectionValue::Uniform(first_align))
+    }
+
+    /// Returns whether all selected blocks share one heading level (`Some(1..=6)` / `None`) or mix levels.
+    pub fn selected_heading_level(&self) -> Option<SelectionValue<Option<u8>>> {
+        let block_ids = self.selected_leaf_block_ids();
+        let first_id = *block_ids.first()?;
+        let heading_of = |block_id: BlockId| match self.document.find_block(block_id)?.kind {
+            BlockKind::Heading { level, .. } => Some(Some(level)),
+            _ => Some(None),
+        };
+        let first_level = heading_of(first_id)?;
+        for block_id in block_ids.into_iter().skip(1) {
+            if let Some(level) = heading_of(block_id)
+                && level != first_level
+            {
+                return Some(SelectionValue::Mixed);
+            }
+        }
+        Some(SelectionValue::Uniform(first_level))
+    }
+
     fn active_text_selection(
         &self,
     ) -> Option<(DocPos, DocPos, Option<rich_model::InlineStyle>)> {
@@ -1700,90 +3216,22 @@ impl RichDocumentView {
         self.dispatch_command(RichCommand::ToggleDebugOverlay, cx)
     }
 
+    /// Extracts the rich [`ClipboardFragment`] covered by the current selection.
+    pub fn selected_fragment(&self) -> Option<ClipboardFragment> {
+        let selection = self.selection.as_ref()?;
+        self.document.extract_selection_fragment(selection)
+    }
+
     /// Extracts the plain UTF-8 text covered by the current selection (TSV for multi-cell table selections).
     pub fn selected_plain_text(&self) -> Option<String> {
-        match self.selection.as_ref()? {
-            DocumentSelection::TableCells {
-                table_id,
-                anchor_cell,
-                focus_cell,
-            } => {
-                let BlockKind::Table(table) = &self.document.find_block(*table_id)?.kind else {
-                    return None;
-                };
-                let row_min = anchor_cell.0.min(focus_cell.0);
-                let row_max = anchor_cell.0.max(focus_cell.0);
-                let col_min = anchor_cell.1.min(focus_cell.1);
-                let col_max = anchor_cell.1.max(focus_cell.1);
-                let mut rows_output = Vec::new();
-                for row_index in row_min..=row_max {
-                    let Some(row) = table.rows.get(row_index) else {
-                        continue;
-                    };
-                    let mut cols_output = Vec::new();
-                    let mut col_cursor = 0usize;
-                    for cell in &row.cells {
-                        let span = cell.colspan.max(1) as usize;
-                        if col_cursor >= col_min && col_cursor <= col_max {
-                            let cell_text: Vec<&str> = cell
-                                .blocks
-                                .iter()
-                                .filter_map(|block| block.kind.inline_content())
-                                .map(|inline| inline.text.as_str())
-                                .collect();
-                            cols_output.push(cell_text.join(" "));
-                        }
-                        col_cursor += span;
-                    }
-                    rows_output.push(cols_output.join("\t"));
-                }
-                Some(rows_output.join("\n"))
-            }
-            DocumentSelection::Text { anchor, focus, .. } => {
-                if anchor == focus {
-                    return None;
-                }
-                let anchor_leaf_id = anchor.leaf_block_id()?;
-                let focus_leaf_id = focus.leaf_block_id()?;
-                let leaves = self.document.collect_leaf_blocks();
-                let anchor_index = leaves.iter().position(|block| block.id == anchor_leaf_id)?;
-                let focus_index = leaves.iter().position(|block| block.id == focus_leaf_id)?;
+        let fragment = self.selected_fragment()?;
+        Some(fragment.to_plain_text_with(&self.extensions))
+    }
 
-                let ((start_index, start_offset), (end_index, end_offset)) =
-                    if (anchor_index, anchor.offset) <= (focus_index, focus.offset) {
-                        ((anchor_index, anchor.offset), (focus_index, focus.offset))
-                    } else {
-                        ((focus_index, focus.offset), (anchor_index, anchor.offset))
-                    };
-
-                let mut output = String::new();
-                for index in start_index..=end_index {
-                    let Some(block) = leaves.get(index) else {
-                        continue;
-                    };
-                    let Some(inline) = block.kind.inline_content() else {
-                        continue;
-                    };
-                    let slice_start = if index == start_index {
-                        start_offset.min(inline.text.len())
-                    } else {
-                        0
-                    };
-                    let slice_end = if index == end_index {
-                        end_offset.min(inline.text.len())
-                    } else {
-                        inline.text.len()
-                    };
-                    if let Some(segment) = inline.text.get(slice_start..slice_end) {
-                        if !output.is_empty() {
-                            output.push('\n');
-                        }
-                        output.push_str(segment);
-                    }
-                }
-                Some(output)
-            }
-        }
+    /// Extracts normalized semantic HTML (`text/html`) covering the current selection.
+    pub fn selected_html(&self) -> Option<String> {
+        let fragment = self.selected_fragment()?;
+        Some(fragment.to_html_with(&self.extensions))
     }
 
     fn apply_zoom(&mut self, target_zoom: f32, cx: &mut Context<Self>) -> CommandOutcome {
@@ -1855,7 +3303,8 @@ impl RichDocumentView {
         self.history.break_coalescing();
         let canvas_point = self.window_point_to_canvas(event.position);
         let viewport_width: f32 = self.last_viewport_bounds.size.width.into();
-        let mut shaper = GpuiShaper::new(window);
+        let mut shaper = GpuiShaper::with_extensions(window, &self.extensions)
+            .with_optional_font_resolver(self.font_resolver.as_deref());
         let Some(hit) = self.flow.hit_test_canvas(
             canvas_point,
             &self.document,
@@ -1923,7 +3372,8 @@ impl RichDocumentView {
         if viewport_width <= 1.0 {
             return;
         }
-        let mut shaper = GpuiShaper::new(window);
+        let mut shaper = GpuiShaper::with_extensions(window, &self.extensions)
+            .with_optional_font_resolver(self.font_resolver.as_deref());
         let hit = self.flow.hit_test_canvas(
             canvas_point,
             &self.document,
@@ -2151,6 +3601,7 @@ impl EntityInputHandler for RichDocumentView {
             cx.notify();
             return;
         }
+        let preserved_marks = self.active_text_selection().and_then(|(_, _, marks)| marks);
         if let (Some(anchor), Some(focus)) = (
             self.document
                 .doc_pos_for_block(preedit.block_id, preedit.replace_range.start),
@@ -2162,7 +3613,7 @@ impl EntityInputHandler for RichDocumentView {
                 focus,
                 affinity: Affinity::Downstream,
                 goal_x: None,
-                stored_marks: None,
+                stored_marks: preserved_marks,
             });
         }
         self.history.break_coalescing();
@@ -2179,6 +3630,7 @@ impl EntityInputHandler for RichDocumentView {
         if !self.policy.editable {
             return;
         }
+        let preserved_marks = self.active_text_selection().and_then(|(_, _, marks)| marks);
         let active_info = self.ime_active_block_text();
         let existing_preedit = self.ime_preedit.take();
         let had_preedit = existing_preedit.is_some();
@@ -2214,7 +3666,7 @@ impl EntityInputHandler for RichDocumentView {
                     focus,
                     affinity: Affinity::Downstream,
                     goal_x: None,
-                    stored_marks: None,
+                    stored_marks: preserved_marks,
                 });
             }
         }
@@ -2322,7 +3774,8 @@ impl EntityInputHandler for RichDocumentView {
         );
 
         let viewport_width: f32 = bounds.size.width.into();
-        let mut shaper = GpuiShaper::new(window);
+        let mut shaper = GpuiShaper::with_extensions(window, &self.extensions)
+            .with_optional_font_resolver(self.font_resolver.as_deref());
         let canvas_rect = self.flow.range_bounds_in_block(
             block_id,
             committed_range,
@@ -2351,7 +3804,8 @@ impl EntityInputHandler for RichDocumentView {
         let (active_block_id, committed, _) = self.ime_active_block_text()?;
         let canvas_point = self.window_point_to_canvas(position);
         let viewport_width: f32 = self.last_viewport_bounds.size.width.into();
-        let mut shaper = GpuiShaper::new(window);
+        let mut shaper = GpuiShaper::with_extensions(window, &self.extensions)
+            .with_optional_font_resolver(self.font_resolver.as_deref());
         let hit = self.flow.hit_test_canvas(
             canvas_point,
             &self.document,
@@ -2511,6 +3965,41 @@ fn selection_from_drag_positions(
     }
 }
 
+fn extract_clipboard_html(item: &ClipboardItem) -> Option<String> {
+    let raw_metadata = item.metadata()?;
+    let parsed: serde_json::Value = serde_json::from_str(raw_metadata).ok()?;
+    parsed
+        .get(CLIPBOARD_HTML_METADATA_KEY)
+        .and_then(|value| value.as_str())
+        .map(ToOwned::to_owned)
+}
+
+fn last_text_pos_in_nodes(nodes: &[BlockNode]) -> Option<(BlockId, usize)> {
+    for node in nodes.iter().rev() {
+        if let Some(inline) = node.kind.inline_content() {
+            return Some((node.id, inline.len()));
+        }
+        match &node.kind {
+            BlockKind::Blockquote(children) => {
+                if let Some(found) = last_text_pos_in_nodes(children) {
+                    return Some(found);
+                }
+            }
+            BlockKind::Table(table) => {
+                for row in table.rows.iter().rev() {
+                    for cell in row.cells.iter().rev() {
+                        if let Some(found) = last_text_pos_in_nodes(&cell.blocks) {
+                            return Some(found);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
 impl Focusable for RichDocumentView {
     fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
@@ -2542,6 +4031,16 @@ impl Render for RichDocumentView {
                 }
             }))
             .on_action(cx.listener(|this, _: &Paste, _window, cx| {
+                if let Some(item) = cx.read_from_clipboard() {
+                    let plain_text = item.text();
+                    if let Some(html) = extract_clipboard_html(&item) {
+                        this.dispatch_command(RichCommand::PasteHtml { html, plain_text }, cx);
+                    } else if let Some(text) = plain_text {
+                        this.dispatch_command(RichCommand::InsertText(text), cx);
+                    }
+                }
+            }))
+            .on_action(cx.listener(|this, _: &PastePlainText, _window, cx| {
                 if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
                     this.dispatch_command(RichCommand::InsertText(text), cx);
                 }
@@ -2817,6 +4316,72 @@ impl Render for RichDocumentView {
             }))
             .on_action(cx.listener(|this, _: &Outdent, _window, cx| {
                 this.dispatch_command(RichCommand::Outdent, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleBold, _window, cx| {
+                this.dispatch_command(RichCommand::ToggleMark(MarkKind::Bold), cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleItalic, _window, cx| {
+                this.dispatch_command(RichCommand::ToggleMark(MarkKind::Italic), cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleUnderline, _window, cx| {
+                this.dispatch_command(RichCommand::ToggleMark(MarkKind::Underline), cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleStrikethrough, _window, cx| {
+                this.dispatch_command(RichCommand::ToggleMark(MarkKind::Strikethrough), cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleInlineCode, _window, cx| {
+                this.dispatch_command(RichCommand::ToggleMark(MarkKind::InlineCode), cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSuperscript, _window, cx| {
+                this.dispatch_command(RichCommand::ToggleMark(MarkKind::Superscript), cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleSubscript, _window, cx| {
+                this.dispatch_command(RichCommand::ToggleMark(MarkKind::Subscript), cx);
+            }))
+            .on_action(cx.listener(|this, _: &SetHeading1, _window, cx| {
+                this.dispatch_command(RichCommand::SetHeading(Some(1)), cx);
+            }))
+            .on_action(cx.listener(|this, _: &SetHeading2, _window, cx| {
+                this.dispatch_command(RichCommand::SetHeading(Some(2)), cx);
+            }))
+            .on_action(cx.listener(|this, _: &SetHeading3, _window, cx| {
+                this.dispatch_command(RichCommand::SetHeading(Some(3)), cx);
+            }))
+            .on_action(cx.listener(|this, _: &SetParagraph, _window, cx| {
+                this.dispatch_command(RichCommand::SetHeading(None), cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleBulletList, _window, cx| {
+                this.dispatch_command(RichCommand::ToggleList(ListKind::Bullet), cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleOrderedList, _window, cx| {
+                this.dispatch_command(
+                    RichCommand::ToggleList(ListKind::Ordered(NumberStyle::Decimal)),
+                    cx,
+                );
+            }))
+            .on_action(cx.listener(|this, _: &ToggleChecklist, _window, cx| {
+                this.dispatch_command(RichCommand::ToggleList(ListKind::Checklist), cx);
+            }))
+            .on_action(cx.listener(|this, _: &AlignLeft, _window, cx| {
+                this.dispatch_command(RichCommand::SetTextAlign(TextAlign::Left), cx);
+            }))
+            .on_action(cx.listener(|this, _: &AlignCenter, _window, cx| {
+                this.dispatch_command(RichCommand::SetTextAlign(TextAlign::Center), cx);
+            }))
+            .on_action(cx.listener(|this, _: &AlignRight, _window, cx| {
+                this.dispatch_command(RichCommand::SetTextAlign(TextAlign::Right), cx);
+            }))
+            .on_action(cx.listener(|this, _: &AlignJustify, _window, cx| {
+                this.dispatch_command(RichCommand::SetTextAlign(TextAlign::Justify), cx);
+            }))
+            .on_action(cx.listener(|this, _: &ClearFormatting, _window, cx| {
+                this.dispatch_command(RichCommand::ClearFormatting, cx);
+            }))
+            .on_action(cx.listener(|this, _: &IncreaseFontSize, _window, cx| {
+                this.dispatch_command(RichCommand::AdjustFontSize(1.0), cx);
+            }))
+            .on_action(cx.listener(|this, _: &DecreaseFontSize, _window, cx| {
+                this.dispatch_command(RichCommand::AdjustFontSize(-1.0), cx);
             }))
             .on_scroll(cx.listener(Self::handle_scroll_wheel))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))

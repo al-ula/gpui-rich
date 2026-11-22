@@ -131,6 +131,11 @@ pub enum BlockKind {
     },
     Table(TableBlock),
     HorizontalRule,
+    /// Host-defined custom block node measured and rendered via `ExtensionRegistry`.
+    Custom {
+        kind: String,
+        data: serde_json::Value,
+    },
 }
 
 impl BlockKind {
@@ -140,7 +145,10 @@ impl BlockKind {
             | BlockKind::Heading { content: c, .. }
             | BlockKind::ListItem { content: c, .. }
             | BlockKind::CodeBlock { content: c, .. } => Some(c),
-            BlockKind::Blockquote(_) | BlockKind::Table(_) | BlockKind::HorizontalRule => None,
+            BlockKind::Blockquote(_)
+            | BlockKind::Table(_)
+            | BlockKind::HorizontalRule
+            | BlockKind::Custom { .. } => None,
         }
     }
 
@@ -150,7 +158,10 @@ impl BlockKind {
             | BlockKind::Heading { content: c, .. }
             | BlockKind::ListItem { content: c, .. }
             | BlockKind::CodeBlock { content: c, .. } => Some(c),
-            BlockKind::Blockquote(_) | BlockKind::Table(_) | BlockKind::HorizontalRule => None,
+            BlockKind::Blockquote(_)
+            | BlockKind::Table(_)
+            | BlockKind::HorizontalRule
+            | BlockKind::Custom { .. } => None,
         }
     }
 }
@@ -291,6 +302,34 @@ impl Document {
         style.space_before_pt = Some(10.0);
         style.space_after_pt = Some(10.0);
         self.push_block(BlockNode::new(id, BlockKind::HorizontalRule, style))
+    }
+
+    /// Appends a host-defined custom block node.
+    pub fn add_custom_block(
+        &mut self,
+        kind: impl Into<String>,
+        data: serde_json::Value,
+    ) -> BlockId {
+        let id = self.alloc_block_id();
+        let style = BlockStyle {
+            space_before_pt: Some(6.0),
+            space_after_pt: Some(8.0),
+            ..BlockStyle::default()
+        };
+        self.push_block(BlockNode::new(
+            id,
+            BlockKind::Custom {
+                kind: kind.into(),
+                data,
+            },
+            style,
+        ))
+    }
+
+    /// Allocates a [`ListId`] greater than any list currently in this document.
+    pub fn alloc_list_id(&self) -> ListId {
+        let max_id = max_list_id_in_slice(&self.blocks);
+        ListId(max_id.saturating_add(1))
     }
 
     pub fn top_level_index(&self, id: BlockId) -> Option<usize> {
@@ -456,9 +495,32 @@ fn collect_leaves_in_slice<'doc>(blocks: &'doc [BlockNode], out: &mut Vec<&'doc 
             | BlockKind::Heading { .. }
             | BlockKind::ListItem { .. }
             | BlockKind::CodeBlock { .. } => out.push(block),
-            BlockKind::HorizontalRule => {}
+            BlockKind::HorizontalRule | BlockKind::Custom { .. } => {}
         }
     }
+}
+
+fn max_list_id_in_slice(blocks: &[BlockNode]) -> u64 {
+    let mut max_id = 0u64;
+    for block in blocks {
+        match &block.kind {
+            BlockKind::ListItem { list_id, .. } => {
+                max_id = max_id.max(list_id.0);
+            }
+            BlockKind::Blockquote(children) => {
+                max_id = max_id.max(max_list_id_in_slice(children));
+            }
+            BlockKind::Table(table) => {
+                for row in &table.rows {
+                    for cell in &row.cells {
+                        max_id = max_id.max(max_list_id_in_slice(&cell.blocks));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    max_id
 }
 
 fn locate_in_slice(

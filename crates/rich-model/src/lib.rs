@@ -1,12 +1,16 @@
 pub mod block;
+pub mod clipboard;
 pub mod command;
+pub mod decoration;
 pub mod inline;
 pub mod selection;
 pub mod style;
 pub mod transaction;
 
 pub use block::*;
+pub use clipboard::*;
 pub use command::*;
+pub use decoration::*;
 pub use inline::*;
 pub use selection::*;
 pub use style::*;
@@ -291,6 +295,220 @@ mod tests {
                 .unwrap()
                 .text,
             "Alpha Beta!?."
+        );
+    }
+
+    #[test]
+    fn mark_toggling_and_rich_html_clipboard_roundtrip() {
+        let mut document = Document::new();
+        let heading_id = document.add_heading(2, InlineContent::plain("Overview"));
+        let mut body = InlineContent::empty();
+        body.push_text("Hello ", InlineStyle::default());
+        body.push_text("bold", InlineStyle::bold().with_underline(UnderlineKind::Solid));
+        body.push_text(" ", InlineStyle::default());
+        body.push_text("link", InlineStyle::default().with_link("https://gpui.rs"));
+        body.push_object(
+            InlineObject::Custom {
+                kind: "badge".into(),
+                data: serde_json::json!({ "text": "v2" }),
+            },
+            InlineStyle::default(),
+        );
+        let paragraph_id = document.add_paragraph(body, BlockStyle::default().with_align(TextAlign::Center));
+        let custom_block_id = document.add_custom_block("callout", serde_json::json!({ "tone": "info" }));
+
+        // Verify clearing underline via mapped_spans_in_range + RestoreSpans is reversible.
+        let base_style = document.config.default_style.clone();
+        let updated_spans = document
+            .find_block(paragraph_id)
+            .unwrap()
+            .kind
+            .inline_content()
+            .unwrap()
+            .mapped_spans_in_range(6..10, |style| {
+                style.set_mark(MarkKind::Underline, false, &base_style);
+            });
+        let applied = document.apply(Transaction::new(vec![Step::RestoreSpans {
+            block_id: paragraph_id,
+            spans: updated_spans,
+        }]));
+        assert!(
+            !document
+                .find_block(paragraph_id)
+                .unwrap()
+                .kind
+                .inline_content()
+                .unwrap()
+                .style_at(7)
+                .is_mark_active(MarkKind::Underline, &base_style)
+        );
+        document.apply(applied.inverse);
+        assert!(
+            document
+                .find_block(paragraph_id)
+                .unwrap()
+                .kind
+                .inline_content()
+                .unwrap()
+                .style_at(7)
+                .is_mark_active(MarkKind::Underline, &base_style)
+        );
+
+        // Extract cross-block rich selection and round-trip through normalized HTML.
+        let start = document.doc_pos_for_block(heading_id, 0).unwrap();
+        let end_len = document
+            .find_block(paragraph_id)
+            .unwrap()
+            .kind
+            .inline_content()
+            .unwrap()
+            .len();
+        let end = document.doc_pos_for_block(paragraph_id, end_len).unwrap();
+        let selection = DocumentSelection::Text {
+            anchor: start,
+            focus: end,
+            affinity: Affinity::Downstream,
+            goal_x: None,
+            stored_marks: None,
+        };
+        let fragment = document.extract_selection_fragment(&selection).unwrap();
+        let html = fragment.to_html();
+        let reparsed = ClipboardFragment::from_html(&html);
+        assert_eq!(reparsed.blocks.len(), 2);
+        assert!(matches!(reparsed.blocks[0], ClipboardBlock::Heading { level: 2, .. }));
+        if let ClipboardBlock::Paragraph { content, align } = &reparsed.blocks[1] {
+            assert_eq!(*align, TextAlign::Center);
+            assert!(content.style_at(7).is_mark_active(MarkKind::Bold, &base_style));
+            assert!(content.style_at(7).is_mark_active(MarkKind::Underline, &base_style));
+            assert_eq!(
+                content.style_at(12).link.as_ref().map(|l| l.href.as_str()),
+                Some("https://gpui.rs")
+            );
+            assert!(matches!(
+                content.objects.first().map(|entry| &entry.object),
+                Some(InlineObject::Custom { kind, .. }) if kind == "badge"
+            ));
+        } else {
+            panic!("expected paragraph block after HTML roundtrip");
+        }
+
+        // Verify unsafe script tags and javascript: links are stripped during HTML normalization.
+        let hostile = ClipboardFragment::from_html(
+            "<p>Safe<script>alert(1)</script><a href=\"javascript:evil()\">click</a></p>",
+        );
+        assert_eq!(hostile.to_plain_text(), "Safeclick");
+        if let ClipboardBlock::Paragraph { content, .. } = &hostile.blocks[0] {
+            assert!(content.style_at(5).link.is_none());
+        } else {
+            panic!("expected sanitized paragraph");
+        }
+
+        // Verify custom block serialization and Custom command policy gating.
+        assert!(document.find_block(custom_block_id).is_some());
+        let json = document.to_json_pretty().unwrap();
+        let parsed = Document::from_json(&json).unwrap();
+        assert_eq!(document, parsed);
+
+        let mutating_custom = RichCommand::Custom {
+            id: "app.insert_callout".into(),
+            payload: serde_json::json!({}),
+            mutates_document: true,
+        };
+        let readonly_custom = RichCommand::Custom {
+            id: "app.inspect_callout".into(),
+            payload: serde_json::json!({}),
+            mutates_document: false,
+        };
+        assert_eq!(mutating_custom.command_id(), "app.insert_callout");
+        let viewer = InteractionPolicy::viewer();
+        assert_eq!(
+            viewer.check_command(&mutating_custom, CommandSource::User),
+            Some(CommandOutcome::RejectedReadOnly)
+        );
+        assert_eq!(viewer.check_command(&readonly_custom, CommandSource::User), None);
+    }
+
+    #[test]
+    fn font_family_html_roundtrip_and_named_style_update_undo() {
+        let mut document = Document::new();
+        let heading_id = document.add_heading(1, InlineContent::plain("Styled Heading"));
+        let mut body = InlineContent::empty();
+        body.push_text(
+            "Serif quote",
+            InlineStyle::default()
+                .with_font_family("Georgia")
+                .with_font_size(14.0)
+                .with_italic(true),
+        );
+        let para_id = document.add_paragraph(body, BlockStyle::default());
+
+        // Verify CSS font-family survives HTML clipboard round-trip.
+        let start = document.doc_pos_for_block(para_id, 0).unwrap();
+        let end = document.doc_pos_for_block(para_id, 11).unwrap();
+        let selection = DocumentSelection::Text {
+            anchor: start,
+            focus: end,
+            affinity: Affinity::Downstream,
+            goal_x: None,
+            stored_marks: None,
+        };
+        let html = document
+            .extract_selection_fragment(&selection)
+            .unwrap()
+            .to_html();
+        assert!(html.contains("font-family:'Georgia'"));
+        let reparsed = ClipboardFragment::from_html(&html);
+        if let ClipboardBlock::Paragraph { content, .. } = &reparsed.blocks[0] {
+            assert_eq!(content.style_at(0).font_family.as_deref(), Some("Georgia"));
+            assert_eq!(content.style_at(0).font_size_pt, Some(14.0));
+        } else {
+            panic!("expected paragraph block");
+        }
+
+        // Verify UpdateNamedStyle bumps dependent block versions and reverses cleanly on Undo.
+        let initial_version = document.find_block(heading_id).unwrap().version;
+        let mut updated_heading = document.stylesheet.get(StyleId::HEADING_1).unwrap().clone();
+        updated_heading.text.font_family = Some(std::sync::Arc::from("serif"));
+        updated_heading.text.font_size_pt = Some(24.0);
+
+        let mut history = History::default();
+        let applied = document.apply(Transaction::new(vec![Step::UpdateNamedStyle {
+            style_id: StyleId::HEADING_1,
+            style: Some(updated_heading),
+        }]));
+        history.push_inverse(applied.inverse);
+
+        assert!(applied.change_set.dirty_blocks.contains(&heading_id));
+        assert!(document.find_block(heading_id).unwrap().version > initial_version);
+        assert_eq!(
+            document
+                .stylesheet
+                .get(StyleId::HEADING_1)
+                .unwrap()
+                .text
+                .font_family
+                .as_deref(),
+            Some("serif")
+        );
+
+        history.undo(&mut document).unwrap();
+        assert_eq!(
+            document
+                .stylesheet
+                .get(StyleId::HEADING_1)
+                .unwrap()
+                .text
+                .font_family,
+            None
+        );
+        assert_eq!(
+            document
+                .stylesheet
+                .get(StyleId::HEADING_1)
+                .unwrap()
+                .text
+                .font_size_pt,
+            Some(20.0)
         );
     }
 }

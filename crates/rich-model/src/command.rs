@@ -1,9 +1,11 @@
 //! Command model unifying viewer interactions, GPUI actions, and future editing operations.
 
-use crate::block::{BlockId, Document};
+use crate::block::{BlockId, Document, ListKind};
 use crate::inline::InlineObject;
 use crate::selection::{DocPos, DocumentSelection};
-use crate::style::{BlockStyle, HorizontalLayout, InlineStyle, TextAlign};
+use crate::style::{
+    BlockStyle, Edges, HorizontalLayout, InlineStyle, LinkTarget, NamedStyle, StyleId, TextAlign,
+};
 use crate::transaction::ChangeSet;
 use serde::{Deserialize, Serialize};
 
@@ -44,6 +46,7 @@ pub enum MarkKind {
 pub enum RichCommand {
     // View & canvas commands
     SetHorizontalLayout(HorizontalLayout),
+    SetMargins(Edges),
     SetZoom(f32),
     AdjustZoom(f32),
     ResetZoom,
@@ -79,35 +82,65 @@ pub enum RichCommand {
     Outdent,
     ToggleMark(MarkKind),
     SetInlineStyle(InlineStyle),
+    ClearFormatting,
+    AdjustFontSize(f32),
+    SetLink(Option<LinkTarget>),
     SetBlockStyle(BlockStyle),
+    UpdateNamedStyle {
+        style_id: StyleId,
+        style: NamedStyle,
+    },
+    SetHeading(Option<u8>),
+    ToggleList(ListKind),
     SetTextAlign(TextAlign),
+    PasteHtml {
+        html: String,
+        plain_text: Option<String>,
+    },
+    /// Host-defined custom command routed through policy gating, middleware, and `ExtensionRegistry`.
+    Custom {
+        id: String,
+        payload: serde_json::Value,
+        mutates_document: bool,
+    },
 }
 
 impl RichCommand {
     /// Returns true when the command mutates document content or document styles.
     pub fn is_document_mutation(&self) -> bool {
-        matches!(
-            self,
+        match self {
             Self::Undo
-                | Self::Redo
-                | Self::InsertText(_)
-                | Self::InsertInlineObject(_)
-                | Self::Delete { .. }
-                | Self::SplitBlock
-                | Self::InsertSoftBreak
-                | Self::Indent
-                | Self::Outdent
-                | Self::ToggleMark(_)
-                | Self::SetInlineStyle(_)
-                | Self::SetBlockStyle(_)
-                | Self::SetTextAlign(_)
-        )
+            | Self::Redo
+            | Self::InsertText(_)
+            | Self::InsertInlineObject(_)
+            | Self::Delete { .. }
+            | Self::SplitBlock
+            | Self::InsertSoftBreak
+            | Self::Indent
+            | Self::Outdent
+            | Self::ToggleMark(_)
+            | Self::SetInlineStyle(_)
+            | Self::ClearFormatting
+            | Self::AdjustFontSize(_)
+            | Self::SetLink(_)
+            | Self::SetBlockStyle(_)
+            | Self::UpdateNamedStyle { .. }
+            | Self::SetHeading(_)
+            | Self::ToggleList(_)
+            | Self::SetTextAlign(_)
+            | Self::PasteHtml { .. } => true,
+            Self::Custom {
+                mutates_document, ..
+            } => *mutates_document,
+            _ => false,
+        }
     }
 
     /// Returns a stable dot-namespaced identifier for keymaps, palettes, and logging.
-    pub fn command_id(&self) -> &'static str {
+    pub fn command_id(&self) -> &str {
         match self {
             Self::SetHorizontalLayout(_) => "rich.view.set_horizontal_layout",
+            Self::SetMargins(_) => "rich.view.set_margins",
             Self::SetZoom(_) => "rich.view.set_zoom",
             Self::AdjustZoom(_) => "rich.view.adjust_zoom",
             Self::ResetZoom => "rich.view.reset_zoom",
@@ -132,8 +165,16 @@ impl RichCommand {
             Self::Outdent => "rich.edit.outdent",
             Self::ToggleMark(_) => "rich.format.toggle_mark",
             Self::SetInlineStyle(_) => "rich.format.set_inline_style",
+            Self::ClearFormatting => "rich.format.clear_formatting",
+            Self::AdjustFontSize(_) => "rich.format.adjust_font_size",
+            Self::SetLink(_) => "rich.format.set_link",
             Self::SetBlockStyle(_) => "rich.format.set_block_style",
+            Self::UpdateNamedStyle { .. } => "rich.format.update_named_style",
+            Self::SetHeading(_) => "rich.format.set_heading",
+            Self::ToggleList(_) => "rich.format.toggle_list",
             Self::SetTextAlign(_) => "rich.format.set_text_align",
+            Self::PasteHtml { .. } => "rich.clipboard.paste_html",
+            Self::Custom { id, .. } => id.as_str(),
         }
     }
 }

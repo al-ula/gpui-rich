@@ -245,4 +245,119 @@ mod tests {
         assert!(range_bounds.width > 0.0);
         assert!(range_bounds.height > 0.0);
     }
+
+    #[test]
+    fn custom_block_and_inline_object_measure_via_shaper() {
+        struct CustomMetricShaper;
+
+        impl TextShaper for CustomMetricShaper {
+            type Backend = MockBackend;
+
+            fn shape_segment(
+                &mut self,
+                text: &str,
+                font_size_px: f32,
+                runs: &[ShaperRunSpec],
+            ) -> ShapedSegment<Self::Backend> {
+                MockShaper.shape_segment(text, font_size_px, runs)
+            }
+
+            fn measure_inline_object(&mut self, object: &InlineObject, zoom: f32) -> InlineBoxMetrics {
+                if let InlineObject::Custom { kind, .. } = object
+                    && kind == "badge"
+                {
+                    return InlineBoxMetrics {
+                        width: 64.0 * zoom,
+                        height: 20.0 * zoom,
+                        valign: InlineVAlign::Middle,
+                    };
+                }
+                MockShaper.measure_inline_object(object, zoom)
+            }
+
+            fn measure_custom_block(
+                &mut self,
+                kind: &str,
+                _data: &serde_json::Value,
+                max_width: f32,
+                zoom: f32,
+            ) -> Size {
+                if kind == "callout" {
+                    Size::new(max_width, 84.0 * zoom)
+                } else {
+                    Size::new(max_width, 40.0 * zoom)
+                }
+            }
+        }
+
+        let mut document = Document::new();
+        let mut inline = InlineContent::empty();
+        inline.push_text("Before ", InlineStyle::default());
+        inline.push_object(
+            InlineObject::Custom {
+                kind: "badge".into(),
+                data: serde_json::json!({ "label": "PRO" }),
+            },
+            InlineStyle::default(),
+        );
+        document.add_paragraph(inline, BlockStyle::default());
+        let callout_id = document.add_custom_block("callout", serde_json::json!({ "title": "Note" }));
+
+        let mut flow = FlowLayout::<MockBackend>::default();
+        let mut shaper = CustomMetricShaper;
+        let visible = flow.layout_visible_blocks(&document, 0.0, 600.0, 600.0, 100.0, 1.0, &mut shaper);
+        assert_eq!(visible.len(), 2);
+
+        let callout = visible.iter().find(|entry| entry.id == callout_id).unwrap();
+        assert!((callout.layout.height - 84.0).abs() < 0.01);
+        assert!(matches!(
+            &callout.layout.kind,
+            BlockLayoutKind::Custom { kind, .. } if kind == "callout"
+        ));
+    }
+
+    #[test]
+    fn asymmetric_document_margins_control_paper_and_fill_geometry() {
+        let mut document = Document::new();
+        document.add_paragraph(
+            InlineContent::plain("Margin invariant verification paragraph."),
+            BlockStyle::default(),
+        );
+
+        let asymmetric = Edges::new(48.0, 96.0, 60.0, 36.0);
+        document.config.horizontal_layout =
+            HorizontalLayout::Paper(PaperSpec::LETTER.with_margins(asymmetric));
+
+        let mut flow = FlowLayout::<MockBackend>::default();
+        let mut shaper = MockShaper;
+        let visible_paper = flow.layout_visible_blocks(&document, 0.0, 1200.0, 800.0, 100.0, 1.0, &mut shaper);
+        let paper_metrics = resolve_horizontal_metrics(1200.0, &document.config, 1.0);
+        let sheet = paper_metrics.paper_sheet.expect("paper sheet present");
+        let expected_left = pt_to_px(36.0, 1.0);
+        let expected_right = pt_to_px(96.0, 1.0);
+        let expected_top = pt_to_px(48.0, 1.0);
+        let expected_bottom = pt_to_px(60.0, 1.0);
+
+        assert!((paper_metrics.column_x - (sheet.x + expected_left)).abs() < 0.1);
+        assert!(
+            (paper_metrics.column_width - (sheet.width - expected_left - expected_right)).abs()
+                < 0.1
+        );
+        assert!((flow.block_y(0) - (sheet.top_y + expected_top)).abs() < 0.1);
+        let content_height = visible_paper[0].layout.height;
+        let expected_total_paper =
+            sheet.top_y + expected_top + content_height + expected_bottom + sheet.desk_margin;
+        assert!((flow.total_height() - expected_total_paper).abs() < 0.5);
+
+        document.config.horizontal_layout = HorizontalLayout::Fill;
+        document.config.set_active_margins_pt(asymmetric);
+        let visible_fill = flow.layout_visible_blocks(&document, 0.0, 1000.0, 800.0, 100.0, 1.0, &mut shaper);
+        let fill_metrics = resolve_horizontal_metrics(1000.0, &document.config, 1.0);
+        assert!(fill_metrics.paper_sheet.is_none());
+        assert!((fill_metrics.column_x - expected_left).abs() < 0.1);
+        assert!((fill_metrics.column_width - (1000.0 - expected_left - expected_right)).abs() < 0.1);
+        assert!((flow.block_y(0) - expected_top).abs() < 0.1);
+        let expected_total_fill = expected_top + visible_fill[0].layout.height + expected_bottom;
+        assert!((flow.total_height() - expected_total_fill).abs() < 0.5);
+    }
 }

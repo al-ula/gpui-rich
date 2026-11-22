@@ -85,3 +85,28 @@ impl DocumentSelection {
         }
     }
 }
+
+/// Represents whether a formatting attribute has one uniform value across a selection
+/// or spans multiple distinct values.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SelectionValue<T> {
+    /// Every covered span or block shares this exact value.
+    Uniform(T),
+    /// The selection covers multiple distinct values.
+    Mixed,
+}
+
+impl<T> SelectionValue<T> {
+    /// Returns `Some(value)` when uniform, or `None` when mixed.
+    pub fn uniform(self) -> Option<T> {
+        match self {
+            Self::Uniform(value) => Some(value),
+            Self::Mixed => None,
+        }
+    }
+
+    /// Returns true when the selection covers multiple distinct values.
+    pub fn is_mixed(&self) -> bool {
+        matches!(self, Self::Mixed)
+    }
+}

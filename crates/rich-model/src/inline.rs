@@ -43,6 +43,11 @@ pub enum InlineObject {
     FootnoteRef {
         index: u32,
     },
+    /// Host-defined custom inline atomic node rendered and measured via `ExtensionRegistry`.
+    Custom {
+        kind: String,
+        data: serde_json::Value,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -162,8 +167,72 @@ impl InlineContent {
         }
         self.spans
             .last()
-            .map(|s| s.style.clone())
+            .map(|span| span.style.clone())
             .unwrap_or_default()
+    }
+
+    /// Returns the inherited inline style at a collapsed caret offset (matching `insert_text`).
+    pub fn style_at_caret(&self, byte_offset: usize) -> InlineStyle {
+        let clamped = byte_offset.min(self.text.len());
+        if clamped > 0 {
+            self.style_at(clamped - 1)
+        } else {
+            self.style_at(0)
+        }
+    }
+
+    /// Builds a contiguous list of [`StyleSpan`]s covering `range` after applying `transform`
+    /// to each intersecting span's style (suitable for `Step::RestoreSpans`).
+    pub fn mapped_spans_in_range(
+        &self,
+        range: Range<usize>,
+        mut transform: impl FnMut(&mut InlineStyle),
+    ) -> Vec<StyleSpan> {
+        let start = self.clamp_to_char_boundary(range.start);
+        let end = self.clamp_to_char_boundary(range.end).max(start);
+        if start >= end {
+            return Vec::new();
+        }
+        let mut mapped: Vec<StyleSpan> = Vec::new();
+        for span in &self.spans {
+            if span.range.end <= start || span.range.start >= end {
+                continue;
+            }
+            let overlap_start = span.range.start.max(start);
+            let overlap_end = span.range.end.min(end);
+            if overlap_start < overlap_end {
+                let mut next_style = span.style.clone();
+                transform(&mut next_style);
+                if let Some(last) = mapped.last_mut()
+                    && last.range.end == overlap_start
+                    && last.style == next_style
+                {
+                    last.range.end = overlap_end;
+                } else {
+                    mapped.push(StyleSpan {
+                        range: overlap_start..overlap_end,
+                        style: next_style,
+                    });
+                }
+            }
+        }
+        if mapped.is_empty() {
+            let mut next_style = InlineStyle::default();
+            transform(&mut next_style);
+            mapped.push(StyleSpan {
+                range: start..end,
+                style: next_style,
+            });
+        }
+        mapped
+    }
+
+    fn clamp_to_char_boundary(&self, byte_offset: usize) -> usize {
+        let mut offset = byte_offset.min(self.text.len());
+        while offset > 0 && !self.text.is_char_boundary(offset) {
+            offset -= 1;
+        }
+        offset
     }
 
     /// Converts a UTF-8 byte offset within this block to a UTF-16 code unit offset.

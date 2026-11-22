@@ -1,4 +1,4 @@
-use crate::geometry::pt_to_px;
+use crate::geometry::{Size, pt_to_px};
 use rich_model::{
     FontWeight, InlineObject, InlineVAlign, ResolvedTextStyle, RgbaColor, SharedStr, UnderlineKind,
 };
@@ -119,6 +119,17 @@ pub trait TextShaper {
     ) -> ShapedSegment<Self::Backend>;
 
     fn measure_inline_object(&mut self, obj: &InlineObject, zoom: f32) -> InlineBoxMetrics;
+
+    /// Measures a [`rich_model::BlockKind::Custom`] block inside `max_width` pixels at `zoom`.
+    fn measure_custom_block(
+        &mut self,
+        _kind: &str,
+        _data: &serde_json::Value,
+        max_width: f32,
+        zoom: f32,
+    ) -> Size {
+        Size::new(max_width, pt_to_px(44.0, zoom))
+    }
 }
 
 /// Deterministic headless shaper for unit tests and offline layout verification.
@@ -221,6 +232,15 @@ impl TextShaper for MockShaper {
                     width: pt_to_px(8.0 + digits * 5.0, zoom),
                     height: pt_to_px(12.0, zoom),
                     valign: InlineVAlign::Baseline,
+                }
+            }
+            InlineObject::Custom { kind, .. } => {
+                let font_px = pt_to_px(10.0, zoom);
+                InlineBoxMetrics {
+                    width: (kind.chars().count().max(4) as f32) * font_px * 0.58
+                        + pt_to_px(16.0, zoom),
+                    height: pt_to_px(18.0, zoom),
+                    valign: InlineVAlign::Middle,
                 }
             }
         }

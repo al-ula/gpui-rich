@@ -43,9 +43,9 @@ flowchart TD
         Elem["RichDocumentElement (request_layout / prepaint / 6-Layer paint)"]
     end
 
-    subgraph Phase2["Phase 2: Editor Layer (Planned)"]
+    subgraph Phase2["Phase 2: Editor & Extensibility Layer"]
         IME["EntityInputHandler (Active-Block UTF-16 IME + Ephemeral Preedit)"]
-        Edit["RichCommand Pipeline, Keymaps, Stored Marks, Rich HTML Clipboard"]
+        Edit["RichCommand Pipeline, Formatting, Stored Marks, Rich HTML Clipboard, Decorations & Extensions"]
     end
 
     Doc --> Cache
@@ -127,7 +127,7 @@ flowchart TD
 
 ---
 
-### Phase 2: `gpui-kit` Migration, Extensibility Foundations & Core Rich Text Editor (In Progress)
+### Phase 2: `gpui-kit` Migration, Extensibility Foundations & Core Rich Text Editor (Complete)
 
 * **2.0 `gpui-kit` Migration** (Complete):
   * [x] Migrate `crates/rich-gpui` to `gpui-kit = { version = "0.10", default-features = false }` with optional `gpui-fast` feature passthrough and `gpui_kit::actions!`.
@@ -141,12 +141,12 @@ flowchart TD
   * [x] Caret blinking timer and keyboard navigation (Left/Right grapheme steps, Word steps, Up/Down with `goal_x`, Home/End, `Shift` selection extension, cross-block movement).
   * [x] `EntityInputHandler` on `RichDocumentView` (active-block UTF-16 scoping, `bounds_for_range` IME popup positioning, ephemeral preedit underline, committed text routed via `RichCommand`).
   * [x] Core editing commands routed through `RichCommand` -> `Transaction` + coalesced `History` (`InsertText`, `Backspace`/`Delete` including cross-block merge, `Enter` block split, `Shift+Enter` soft break, `Tab`/list indent & outdent, `Ctrl/Cmd+Z` and `Ctrl/Cmd+Shift+Z` undo/redo).
-* **2.3 Formatting & Rich Clipboard**:
-  * [ ] `Selection::stored_marks` and formatting commands/shortcuts (`Ctrl/Cmd+B`, `I`, `U`, inline code, links, headings, lists, alignment).
-  * [ ] Rich clipboard support (`text/html` + `text/plain` copy/paste normalization).
-* **2.4 Decorations & Custom Extensions**:
-  * [ ] **Extensibility Seam 2**: `DecorationProvider` interface feeding Layers 2, 4, and 5 (syntax highlighting, find-in-document, spellcheck underlines, comment highlights).
-  * [ ] **Extensibility Seam 3**: `BlockKind::Custom`, `InlineObject::Custom`, `RichCommand::Custom`, and `ExtensionRegistry` (including hosted GPUI `AnyElement` children).
+* **2.3 Formatting & Rich Clipboard** (Complete):
+  * [x] `Selection::stored_marks` and formatting commands/shortcuts (`Ctrl/Cmd+B`, `I`, `U`, `E`, `Shift+X`, inline code, links, headings, lists, alignment, and live toolbar query helpers).
+  * [x] Rich clipboard support (`ClipboardFragment` `text/html` + `text/plain` extraction, normalized HTML parsing/sanitization, and atomic multi-block paste via `RichCommand::PasteHtml`).
+* **2.4 Decorations & Custom Extensions** (Complete):
+  * [x] **Extensibility Seam 2**: `DecorationProvider` (`InlineDecoration` + `OverlayDecoration`) feeding Layers 2, 4, and 5 (find/comment highlights, per-glyph syntax foreground overrides, spellcheck underlines, ghost text, remote carets).
+  * [x] **Extensibility Seam 3**: `BlockKind::Custom`, `InlineObject::Custom`, `RichCommand::Custom`, `NodeExtension`, and `ExtensionRegistry` (including hosted interactive GPUI `AnyElement` children and direct immediate-mode paint callbacks).
 
 ### Phase 3: Advanced Google Docs Capabilities (Planned)
 

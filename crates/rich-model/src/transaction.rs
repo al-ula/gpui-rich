@@ -1,7 +1,7 @@
 use crate::block::{BlockId, BlockKind, BlockNode, ContainerTarget, Document};
 use crate::inline::{InlineContent, StyleSpan};
 use crate::selection::{Affinity, DocPos, DocumentSelection, PathSegment};
-use crate::style::{BlockStyle, InlineStyle};
+use crate::style::{BlockStyle, InlineStyle, NamedStyle, StyleId};
 use smallvec::SmallVec;
 use std::ops::Range;
 use std::time::{Duration, Instant};
@@ -59,6 +59,10 @@ pub enum Step {
     },
     ToggleHeadingCollapsed {
         block_id: BlockId,
+    },
+    UpdateNamedStyle {
+        style_id: StyleId,
+        style: Option<NamedStyle>,
     },
 }
 
@@ -338,6 +342,23 @@ impl Document {
                         change_set.structure_changed = true;
                         inverse_steps.push(Step::ToggleHeadingCollapsed { block_id });
                     }
+                }
+                Step::UpdateNamedStyle { style_id, style } => {
+                    let previous = match style {
+                        Some(next_style) => self.stylesheet.styles.insert(style_id, next_style),
+                        None => self.stylesheet.styles.remove(&style_id),
+                    };
+                    let mut affected = Vec::new();
+                    bump_blocks_using_named_style(&mut self.blocks, style_id, &mut affected);
+                    for affected_id in affected {
+                        change_set.mark_dirty(affected_id);
+                        self.bump_ancestors_of_block(affected_id, &mut change_set);
+                    }
+                    change_set.structure_changed = true;
+                    inverse_steps.push(Step::UpdateNamedStyle {
+                        style_id,
+                        style: previous,
+                    });
                 }
             }
         }
@@ -778,6 +799,32 @@ impl Document {
                 Some((parent_target, _)) => current = parent_target,
                 None => break,
             }
+        }
+    }
+}
+
+fn bump_blocks_using_named_style(
+    blocks: &mut [BlockNode],
+    style_id: StyleId,
+    affected: &mut Vec<BlockId>,
+) {
+    for block in blocks {
+        if block.style.named_style == Some(style_id) {
+            block.bump_version();
+            affected.push(block.id);
+        }
+        match &mut block.kind {
+            BlockKind::Blockquote(children) => {
+                bump_blocks_using_named_style(children, style_id, affected);
+            }
+            BlockKind::Table(table) => {
+                for row in &mut table.rows {
+                    for cell in &mut row.cells {
+                        bump_blocks_using_named_style(&mut cell.blocks, style_id, affected);
+                    }
+                }
+            }
+            _ => {}
         }
     }
 }

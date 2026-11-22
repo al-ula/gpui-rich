@@ -1,3 +1,4 @@
+use crate::command::MarkKind;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -251,6 +252,89 @@ impl InlineStyle {
             link,
         }
     }
+
+    /// Returns a copy with all visual formatting overrides reset to `None` while preserving
+    /// hyperlink targets and comment anchors.
+    pub fn cleared_formatting(&self) -> Self {
+        Self {
+            link: self.link.clone(),
+            comment_ids: self.comment_ids.clone(),
+            ..Self::default()
+        }
+    }
+
+    /// Returns whether `mark` is effectively active when `self` resolves over `base`.
+    pub fn is_mark_active(&self, mark: MarkKind, base: &ResolvedTextStyle) -> bool {
+        self.resolve(base).is_mark_active(mark)
+    }
+
+    /// Explicitly enables or disables `mark` on `self`, preserving clean `None` inheritance
+    /// whenever the block's `base` style already matches the disabled state.
+    pub fn set_mark(&mut self, mark: MarkKind, enabled: bool, base: &ResolvedTextStyle) {
+        match mark {
+            MarkKind::Bold => {
+                self.weight = if enabled {
+                    Some(FontWeight::BOLD)
+                } else if base.weight >= FontWeight::BOLD {
+                    Some(FontWeight::NORMAL)
+                } else {
+                    None
+                };
+            }
+            MarkKind::Italic => {
+                self.italic = if enabled {
+                    Some(true)
+                } else if base.italic {
+                    Some(false)
+                } else {
+                    None
+                };
+            }
+            MarkKind::Underline => {
+                self.underline = if enabled {
+                    Some(UnderlineKind::Solid)
+                } else {
+                    None
+                };
+            }
+            MarkKind::Strikethrough => {
+                self.strikethrough = if enabled {
+                    Some(true)
+                } else if base.strikethrough {
+                    Some(false)
+                } else {
+                    None
+                };
+            }
+            MarkKind::InlineCode => {
+                self.inline_code = if enabled {
+                    Some(true)
+                } else if base.inline_code {
+                    Some(false)
+                } else {
+                    None
+                };
+            }
+            MarkKind::Superscript => {
+                self.baseline_shift = if enabled {
+                    Some(BaselineShift::Superscript)
+                } else if base.baseline_shift == BaselineShift::Superscript {
+                    Some(BaselineShift::Normal)
+                } else {
+                    None
+                };
+            }
+            MarkKind::Subscript => {
+                self.baseline_shift = if enabled {
+                    Some(BaselineShift::Subscript)
+                } else if base.baseline_shift == BaselineShift::Subscript {
+                    Some(BaselineShift::Normal)
+                } else {
+                    None
+                };
+            }
+        }
+    }
 }
 
 /// Fully resolved typographic style ready for layout and shaping.
@@ -268,6 +352,21 @@ pub struct ResolvedTextStyle {
     pub background: Option<RgbaColor>,
     pub inline_code: bool,
     pub link: Option<LinkTarget>,
+}
+
+impl ResolvedTextStyle {
+    /// Returns true when `mark` is active in this resolved text style.
+    pub fn is_mark_active(&self, mark: MarkKind) -> bool {
+        match mark {
+            MarkKind::Bold => self.weight >= FontWeight::BOLD,
+            MarkKind::Italic => self.italic,
+            MarkKind::Underline => self.underline.is_some(),
+            MarkKind::Strikethrough => self.strikethrough,
+            MarkKind::InlineCode => self.inline_code,
+            MarkKind::Superscript => self.baseline_shift == BaselineShift::Superscript,
+            MarkKind::Subscript => self.baseline_shift == BaselineShift::Subscript,
+        }
+    }
 }
 
 impl Default for ResolvedTextStyle {
@@ -558,31 +657,37 @@ impl BlockStyle {
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct PaperSpec {
     pub width_pt: f32,
-    pub margin_x_pt: f32,
+    pub margins_pt: Edges,
     pub desk_margin_pt: f32,
 }
 
 impl PaperSpec {
-    /// US Letter width (8.5 in = 612pt) with 0.75 in horizontal margins.
+    /// US Letter width (8.5 in = 612pt) with standard 1 in (72pt) margins.
     pub const LETTER: Self = Self {
         width_pt: 612.0,
-        margin_x_pt: 54.0,
+        margins_pt: Edges::MARGINS_NORMAL,
         desk_margin_pt: 24.0,
     };
 
-    /// Compact reading sheet (520pt) with 44pt horizontal margins.
+    /// Compact reading sheet (520pt) with 0.5 in (36pt) margins.
     pub const NARROW: Self = Self {
         width_pt: 520.0,
-        margin_x_pt: 44.0,
+        margins_pt: Edges::MARGINS_NARROW,
         desk_margin_pt: 24.0,
     };
 
-    /// Wide sheet (760pt) with 54pt horizontal margins.
+    /// Wide sheet (760pt) with 0.75 in (54pt) margins.
     pub const WIDE: Self = Self {
         width_pt: 760.0,
-        margin_x_pt: 54.0,
+        margins_pt: Edges::MARGINS_MODERATE,
         desk_margin_pt: 24.0,
     };
+
+    /// Returns a copy of this paper specification with updated page `margins_pt`.
+    pub const fn with_margins(mut self, margins_pt: Edges) -> Self {
+        self.margins_pt = margins_pt;
+        self
+    }
 }
 
 /// Separates fluid viewport-filling layout from fixed-width infinite-length paper layout.
@@ -612,8 +717,8 @@ pub enum BlockWidth {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct DocumentLayoutConfig {
     pub horizontal_layout: HorizontalLayout,
-    pub horizontal_padding_pt: f32,
-    pub vertical_padding_pt: f32,
+    /// Document margins in typographic points used when [`HorizontalLayout::Fill`] is active.
+    pub fill_margins_pt: Edges,
     pub default_tab_interval_pt: f32,
     pub default_style: ResolvedTextStyle,
 }
@@ -622,10 +727,28 @@ impl Default for DocumentLayoutConfig {
     fn default() -> Self {
         Self {
             horizontal_layout: HorizontalLayout::default(),
-            horizontal_padding_pt: 36.0,
-            vertical_padding_pt: 28.0,
+            fill_margins_pt: Edges::xy(36.0, 28.0),
             default_tab_interval_pt: 36.0,
             default_style: ResolvedTextStyle::default(),
+        }
+    }
+}
+
+impl DocumentLayoutConfig {
+    /// Returns the active document margins in typographic points for the current layout mode.
+    pub fn active_margins_pt(&self) -> Edges {
+        match self.horizontal_layout {
+            HorizontalLayout::Fill => self.fill_margins_pt,
+            HorizontalLayout::Paper(spec) => spec.margins_pt,
+        }
+    }
+
+    /// Updates the active document margins in typographic points for the current layout mode.
+    pub fn set_active_margins_pt(&mut self, margins_pt: Edges) {
+        let clamped = margins_pt.clamped_non_negative();
+        match &mut self.horizontal_layout {
+            HorizontalLayout::Fill => self.fill_margins_pt = clamped,
+            HorizontalLayout::Paper(spec) => spec.margins_pt = clamped,
         }
     }
 }
@@ -639,6 +762,15 @@ pub struct Edges {
 }
 
 impl Edges {
+    /// Narrow document margins (0.5 in = 36pt on all sides).
+    pub const MARGINS_NARROW: Self = Self::all(36.0);
+    /// Moderate document margins (0.75 in = 54pt on all sides).
+    pub const MARGINS_MODERATE: Self = Self::all(54.0);
+    /// Standard Google Docs Normal margins (1.0 in = 72pt on all sides).
+    pub const MARGINS_NORMAL: Self = Self::all(72.0);
+    /// Wide document margins (1.5 in = 108pt left/right, 1.0 in = 72pt top/bottom).
+    pub const MARGINS_WIDE: Self = Self::xy(108.0, 72.0);
+
     pub const fn all(v: f32) -> Self {
         Self {
             top: v,
@@ -654,6 +786,32 @@ impl Edges {
             right: horizontal,
             bottom: vertical,
             left: horizontal,
+        }
+    }
+
+    pub const fn new(top: f32, right: f32, bottom: f32, left: f32) -> Self {
+        Self {
+            top,
+            right,
+            bottom,
+            left,
+        }
+    }
+
+    /// Clamps every edge to a finite value in `0.0..=288.0` pt (0 to 4 inches).
+    pub fn clamped_non_negative(self) -> Self {
+        let clamp = |value: f32| {
+            if value.is_finite() {
+                value.clamp(0.0, 288.0)
+            } else {
+                0.0
+            }
+        };
+        Self {
+            top: clamp(self.top),
+            right: clamp(self.right),
+            bottom: clamp(self.bottom),
+            left: clamp(self.left),
         }
     }
 }
