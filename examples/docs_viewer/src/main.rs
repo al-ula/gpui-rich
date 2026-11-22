@@ -1,16 +1,16 @@
 //! Demo GPUI application showcasing the non-paginated `gpui-rich` renderer.
 
-use gpui::{
-    App, AppContext, Application, Bounds, Context, Entity, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Render, SharedString, Styled, Window, WindowBounds, WindowOptions,
-    div, px, rgb, size,
+use gpui_kit::{
+    App, AppContext, Bounds, Context, Entity, InteractiveElement, IntoElement, MouseButton,
+    ParentElement, Render, SharedString, Styled, Window, WindowBounds, WindowOptions, div, px, rgb,
+    size,
 };
-use rich_gpui::RichDocumentView;
+use rich_gpui::{RichDocumentView, register_default_keybindings};
 use rich_model::{
     BaselineShift, BlockKind, BlockNode, BlockStyle, BlockWidth, ChipKind, ColumnSpec, Document,
     FontWeight, HorizontalLayout, InlineContent, InlineObject, InlineStyle, InlineVAlign, ListId,
-    ListKind, NumberStyle, PaperSpec, RgbaColor, StyleId, TableBlock, TableBorderStyle, TableCell,
-    TableRow, TextAlign, UnderlineKind,
+    ListKind, NumberStyle, PaperSpec, RgbaColor, RichCommand, StyleId, TableBlock,
+    TableBorderStyle, TableCell, TableRow, TextAlign, UnderlineKind,
 };
 
 struct DocsViewerApp {
@@ -32,7 +32,7 @@ impl DocsViewerApp {
         id: &'static str,
         label: impl Into<SharedString>,
         active: bool,
-    ) -> gpui::Stateful<gpui::Div> {
+    ) -> gpui_kit::Stateful<gpui_kit::Div> {
         let background = if active { rgb(0xd3e3fd) } else { rgb(0xf1f3f4) };
         let text_color = if active { rgb(0x0b57d0) } else { rgb(0x1f2328) };
         div()
@@ -78,7 +78,7 @@ impl Render for DocsViewerApp {
             .child(
                 div()
                     .text_size(px(13.0))
-                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .font_weight(gpui_kit::FontWeight::SEMIBOLD)
                     .text_color(rgb(0x1f2328))
                     .mr(px(8.0))
                     .child("gpui-rich"),
@@ -89,7 +89,10 @@ impl Render for DocsViewerApp {
                     cx.listener(|this, _event, _window, cx| {
                         let spec = this.last_paper_spec;
                         this.document_view.update(cx, |view, cx| {
-                            view.set_horizontal_layout(HorizontalLayout::Paper(spec), cx);
+                            view.dispatch_command(
+                                RichCommand::SetHorizontalLayout(HorizontalLayout::Paper(spec)),
+                                cx,
+                            );
                         });
                     }),
                 ),
@@ -99,7 +102,10 @@ impl Render for DocsViewerApp {
                     MouseButton::Left,
                     cx.listener(|this, _event, _window, cx| {
                         this.document_view.update(cx, |view, cx| {
-                            view.set_horizontal_layout(HorizontalLayout::Fill, cx);
+                            view.dispatch_command(
+                                RichCommand::SetHorizontalLayout(HorizontalLayout::Fill),
+                                cx,
+                            );
                         });
                     }),
                 ),
@@ -119,8 +125,10 @@ impl Render for DocsViewerApp {
                         cx.listener(|this, _event, _window, cx| {
                             this.last_paper_spec = PaperSpec::NARROW;
                             this.document_view.update(cx, |view, cx| {
-                                view.set_horizontal_layout(
-                                    HorizontalLayout::Paper(PaperSpec::NARROW),
+                                view.dispatch_command(
+                                    RichCommand::SetHorizontalLayout(HorizontalLayout::Paper(
+                                        PaperSpec::NARROW,
+                                    )),
                                     cx,
                                 );
                             });
@@ -138,8 +146,10 @@ impl Render for DocsViewerApp {
                         cx.listener(|this, _event, _window, cx| {
                             this.last_paper_spec = PaperSpec::LETTER;
                             this.document_view.update(cx, |view, cx| {
-                                view.set_horizontal_layout(
-                                    HorizontalLayout::Paper(PaperSpec::LETTER),
+                                view.dispatch_command(
+                                    RichCommand::SetHorizontalLayout(HorizontalLayout::Paper(
+                                        PaperSpec::LETTER,
+                                    )),
                                     cx,
                                 );
                             });
@@ -153,8 +163,10 @@ impl Render for DocsViewerApp {
                             cx.listener(|this, _event, _window, cx| {
                                 this.last_paper_spec = PaperSpec::WIDE;
                                 this.document_view.update(cx, |view, cx| {
-                                    view.set_horizontal_layout(
-                                        HorizontalLayout::Paper(PaperSpec::WIDE),
+                                    view.dispatch_command(
+                                        RichCommand::SetHorizontalLayout(HorizontalLayout::Paper(
+                                            PaperSpec::WIDE,
+                                        )),
                                         cx,
                                     );
                                 });
@@ -170,7 +182,7 @@ impl Render for DocsViewerApp {
                     MouseButton::Left,
                     cx.listener(|this, _event, _window, cx| {
                         this.document_view.update(cx, |view, cx| {
-                            view.set_zoom(view.zoom - 0.1, cx);
+                            view.dispatch_command(RichCommand::AdjustZoom(-0.1), cx);
                         });
                     }),
                 ),
@@ -180,7 +192,7 @@ impl Render for DocsViewerApp {
                     MouseButton::Left,
                     cx.listener(|this, _event, _window, cx| {
                         this.document_view.update(cx, |view, cx| {
-                            view.set_zoom(1.0, cx);
+                            view.dispatch_command(RichCommand::ResetZoom, cx);
                         });
                     }),
                 ),
@@ -190,7 +202,7 @@ impl Render for DocsViewerApp {
                     MouseButton::Left,
                     cx.listener(|this, _event, _window, cx| {
                         this.document_view.update(cx, |view, cx| {
-                            view.set_zoom(view.zoom + 0.1, cx);
+                            view.dispatch_command(RichCommand::AdjustZoom(0.1), cx);
                         });
                     }),
                 ),
@@ -202,7 +214,7 @@ impl Render for DocsViewerApp {
                         MouseButton::Left,
                         cx.listener(|this, _event, _window, cx| {
                             this.document_view.update(cx, |view, cx| {
-                                view.toggle_debug_overlay(cx);
+                                view.dispatch_command(RichCommand::ToggleDebugOverlay, cx);
                             });
                         }),
                     ),
@@ -467,7 +479,7 @@ fn build_sample_document() -> Document {
                     "GpuiShaper, 6-layer RichDocumentElement, zoom, scroll anchoring, selection",
                     false,
                 ),
-                make_cell(&mut document, "gpui 0.2.2", false),
+                make_cell(&mut document, "gpui-kit 0.10", false),
             ],
         },
     ];
@@ -490,13 +502,17 @@ fn build_sample_document() -> Document {
 }
 
 fn main() {
-    Application::new().run(|cx: &mut App| {
+    gpui_kit::application().run(|cx: &mut App| {
+        gpui_kit::init(cx);
+        register_default_keybindings(cx);
         let bounds = Bounds::centered(None, size(px(1080.0), px(780.0)), cx);
         let options = WindowOptions {
             window_bounds: Some(WindowBounds::Windowed(bounds)),
             ..WindowOptions::default()
         };
-        if let Err(error) = cx.open_window(options, |_window, cx| cx.new(DocsViewerApp::new)) {
+        if let Err(error) =
+            gpui_kit::open_window(options, cx, |_window, cx| cx.new(DocsViewerApp::new))
+        {
             eprintln!("docs_viewer: failed to open window: {error}");
         }
     });

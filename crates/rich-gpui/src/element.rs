@@ -2,11 +2,13 @@
 
 use crate::shaper::{GpuiGlyphBackend, GpuiShaper, rgba_to_hsla};
 use crate::view::RichDocumentView;
-use gpui::{
+#[cfg(not(feature = "gpui-fast"))]
+use gpui_kit::IntoElement;
+use gpui_kit::{
     App, BorderStyle, Bounds, BoxShadow, ContentMask, Corners, CursorStyle, Edges, Element,
     ElementId, Entity, GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId,
-    IntoElement, LayoutId, Length, Pixels, Point, SharedString, StrikethroughStyle, Style,
-    TextRun, UnderlineStyle, Window, fill, outline, point, px, quad, size,
+    LayoutId, Length, Pixels, Point, SharedString, StrikethroughStyle, Style, TextRun,
+    UnderlineStyle, Window, fill, outline, point, px, quad, size,
 };
 use rich_layout::{
     BlockLayout, BlockLayoutKind, HorizontalMetrics, InlineBoxFragment, LineFragment,
@@ -28,6 +30,8 @@ impl RichDocumentElement {
     }
 }
 
+// `gpui-fast` supplies a blanket `impl<T: Element> IntoElement for T`, while upstream `gpui-pre` requires an explicit impl.
+#[cfg(not(feature = "gpui-fast"))]
 impl IntoElement for RichDocumentElement {
     type Element = Self;
 
@@ -71,8 +75,8 @@ impl Element for RichDocumentElement {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut style = Style::default();
-        style.size.width = Length::Definite(gpui::relative(1.0).into());
-        style.size.height = Length::Definite(gpui::relative(1.0).into());
+        style.size.width = Length::Definite(gpui_kit::relative(1.0).into());
+        style.size.height = Length::Definite(gpui_kit::relative(1.0).into());
         (window.request_layout(style, [], cx), ())
     }
 
@@ -218,7 +222,7 @@ impl Element for RichDocumentElement {
                 let sheet_bounds =
                     Bounds::new(sheet_origin, size(px(sheet.width), px(sheet_height)));
                 let sheet_radius = Corners::all(px(3.0));
-                window.paint_shadows(
+                window.paint_drop_shadows(
                     sheet_bounds,
                     sheet_radius,
                     &[BoxShadow {
@@ -226,6 +230,7 @@ impl Element for RichDocumentElement {
                         offset: point(px(0.0), px(2.0)),
                         blur_radius: px(10.0),
                         spread_radius: px(0.0),
+                        inset: false,
                     }],
                 );
                 window.paint_quad(quad(
@@ -316,7 +321,7 @@ impl Element for RichDocumentElement {
                     Corners::all(px(3.5)),
                     rgba_to_hsla(RgbaColor::rgba(0x59, 0x63, 0x6e, 0x66)),
                     Edges::all(px(0.0)),
-                    gpui::transparent_black(),
+                    gpui_kit::transparent_black(),
                     BorderStyle::Solid,
                 ));
             }
@@ -340,7 +345,7 @@ impl Element for RichDocumentElement {
                     Corners::all(px(3.5)),
                     rgba_to_hsla(RgbaColor::rgba(0x59, 0x63, 0x6e, 0x66)),
                     Edges::all(px(0.0)),
-                    gpui::transparent_black(),
+                    gpui_kit::transparent_black(),
                     BorderStyle::Solid,
                 ));
             }
@@ -421,7 +426,7 @@ fn paint_block_chrome(
                         Corners::all(px(1.0)),
                         rgba_to_hsla(RgbaColor::WHITE),
                         Edges::all(px(0.0)),
-                        gpui::transparent_black(),
+                        gpui_kit::transparent_black(),
                         BorderStyle::Solid,
                     ));
                 }
@@ -445,7 +450,7 @@ fn paint_block_chrome(
                 Corners::all(px(1.5)),
                 rgba_to_hsla(RgbaColor::rgb(0xd0, 0xd7, 0xde)),
                 Edges::all(px(0.0)),
-                gpui::transparent_black(),
+                gpui_kit::transparent_black(),
                 BorderStyle::Solid,
             ));
             for child in children {
@@ -628,7 +633,7 @@ fn paint_paragraph_backgrounds(
                                 Corners::all(px(radius)),
                                 rgba_to_hsla(background),
                                 Edges::all(px(0.0)),
-                                gpui::transparent_black(),
+                                gpui_kit::transparent_black(),
                                 BorderStyle::Solid,
                             ));
                         }
@@ -948,7 +953,7 @@ fn paint_small_label(
     let hsla: Hsla = rgba_to_hsla(color);
     let run = TextRun {
         len: text.len(),
-        font: gpui::font(".SystemUIFont"),
+        font: gpui_kit::font(".SystemUIFont"),
         color: hsla,
         background_color: None,
         underline: None,
@@ -960,7 +965,14 @@ fn paint_small_label(
         &[run],
         None,
     );
-    if let Err(error) = shaped.paint(origin, px(font_size_px * 1.25), window, cx) {
+    if let Err(error) = shaped.paint(
+        origin,
+        px(font_size_px * 1.25),
+        gpui_kit::TextAlign::Left,
+        None,
+        window,
+        cx,
+    ) {
         eprintln!("rich-gpui: failed to paint label: {error}");
     }
 }

@@ -4,14 +4,14 @@
 
 This workspace implements a non-paginated, Google Docs-style rich text renderer on GPUI designed to grow cleanly into a full editor. Preserve these crate boundaries:
 
-* `crates/rich-model` (pure Rust, zero GPUI dependency): Hierarchical `BlockNode` tree with stable `BlockId` and `version`, `InlineContent` with normalized contiguous `StyleSpan`s and `\u{FFFC}` sentinels for inline atomic objects, `DocPos` + `Affinity` addressing, `DocumentSelection`, and `Transaction` / `Step` mutations with `History` undo/redo.
-* `crates/rich-layout` (pure Rust, zero GPUI dependency): Generic over `GlyphBackend` and `TextShaper` so headless tests run via `MockShaper` without a GPU window. Owns mixed-baseline line composition, UAX #14 wrapping, glyph slicing, tab stops, justification, recursive table/blockquote layout, incremental `LayoutCache`, Fenwick tree `HeightIndex`, collapsible headings, and `(BlockId, local_y_offset)` scroll anchoring.
-* `crates/rich-gpui` (`gpui 0.2.2`): `GpuiShaper` over `WindowTextSystem::shape_line`, unified `RichDocumentElement` painting 6 strict z-order layers, and `RichDocumentView` (scrolling, anchored zoom, selection, copy, and Phase 2 `EntityInputHandler` host).
+* `crates/rich-model` (pure Rust, zero GPUI dependency): Hierarchical `BlockNode` tree with stable `BlockId` and `version`, `InlineContent` with normalized contiguous `StyleSpan`s and `\u{FFFC}` sentinels for inline atomic objects, `DocPos` + `Affinity` addressing, `DocumentSelection`, `RichCommand` / `CommandOutcome`, and `Transaction` / `Step` mutations with `History` undo/redo.
+* `crates/rich-layout` (pure Rust, zero GPUI dependency): Generic over `GlyphBackend` and `TextShaper` so headless tests run via `MockShaper` without a GPU window. Owns mixed-baseline line composition, UAX #14 wrapping, glyph slicing, tab stops, justification, recursive table/blockquote layout, incremental `LayoutCache`, Fenwick tree `HeightIndex`, collapsible headings, `HorizontalLayout::Fill` vs infinite-length `Paper(PaperSpec)`, and `(BlockId, local_y_offset)` scroll anchoring.
+* `crates/rich-gpui` (`gpui-kit 0.10`, `default-features = false`, optional `gpui-fast` feature): `GpuiShaper` over `WindowTextSystem::shape_line`, unified `RichDocumentElement` painting 6 strict z-order layers, and command-driven `RichDocumentView` (all interactions and Phase 2 editing operations route through `RichCommand` + `dispatch_command` and `gpui_kit::actions!` scoped to `"RichDocument"`).
 * `examples/docs_viewer`: Interactive showcase application.
 
-### Dependency Note (Linux + `gpui 0.2.2`)
+### Dependency Note (Linux + `gpui-kit`)
 
-`gpui 0.2.2` transitively pulls `xattr 0.2.3`, which references `libc::ENOATTR` on Linux. `Cargo.lock` pins `libc 0.2.178` for compatibility. Avoid running an unconstrained `cargo update` that bumps `libc` past `0.2.178` without verifying `cargo check -p xattr -j 4`.
+On Linux, `gpui-kit` transitively uses `yeslogic-fontconfig-sys`, which queries `pkg-config` for `fontconfig.pc` unless `dlopen` is enabled. `.cargo/config.toml` sets `RUST_FONTCONFIG_DLOPEN = "1"` so builds dynamically load `libfontconfig.so.1` without requiring `fontconfig-devel` headers.
 
 ## Rust Coding Guidelines
 
@@ -26,7 +26,7 @@ This workspace implements a non-paginated, Google Docs-style rich text renderer 
 * Implement strictly what is requested. Avoid speculative features or unrequested additions.
 * Use full words for variable names without abbreviations (for example, `queue`, `index`, `context`), except framework-idiomatic names such as GPUI's `cx`.
 * Use `cargo add` to add crate dependencies.
-* Prefer rustdocs (`///` and `//!`) over separate standalone documentation files.
+* Prefer rustdocs (`///` and `//!`) for documenting current code over separate standalone documentation files. Plans and progress trackers (such as `ARCHITECTURE.md`) are outside this rule and belong in the repository.
 
 ## Testing & Build Strategy
 

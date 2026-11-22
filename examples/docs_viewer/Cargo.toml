@@ -4,8 +4,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+gpui-fast = ["gpui-kit/gpui-fast", "rich-gpui/gpui-fast"]
+
 [dependencies]
-gpui.workspace = true
+gpui-kit.workspace = true
 rich-model.workspace = true
 rich-layout.workspace = true
 rich-gpui.workspace = true

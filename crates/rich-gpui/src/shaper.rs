@@ -1,6 +1,6 @@
 //! GPUI implementation of [`rich_layout::TextShaper`] backed by `WindowTextSystem`.
 
-use gpui::{
+use gpui_kit::{
     Font, FontFallbacks, FontFeatures, FontId, FontStyle, FontWeight as GpuiFontWeight, GlyphId,
     Hsla, Rgba, SharedString, TextRun, Window, px,
 };
@@ -133,7 +133,7 @@ impl TextShaper for GpuiShaper<'_> {
             color_ranges.push((0..text.len(), RgbaColor::BLACK));
             gpui_runs.push(TextRun {
                 len: text.len(),
-                font: gpui::font(".SystemUIFont"),
+                font: gpui_kit::font(".SystemUIFont"),
                 color: rgba_to_hsla(RgbaColor::BLACK),
                 background_color: None,
                 underline: None,
@@ -219,7 +219,7 @@ impl TextShaper for GpuiShaper<'_> {
                 let font_size = px(pt_to_px(10.0, zoom));
                 let run = TextRun {
                     len: label.len(),
-                    font: gpui::font(".SystemUIFont"),
+                    font: gpui_kit::font(".SystemUIFont"),
                     color: rgba_to_hsla(RgbaColor::BLACK),
                     background_color: None,
                     underline: None,
@@ -243,7 +243,7 @@ impl TextShaper for GpuiShaper<'_> {
                 let font_size = px(pt_to_px(8.5, zoom));
                 let run = TextRun {
                     len: text.len(),
-                    font: gpui::font(".SystemUIFont"),
+                    font: gpui_kit::font(".SystemUIFont"),
                     color: rgba_to_hsla(RgbaColor::LINK),
                     background_color: None,
                     underline: None,

@@ -1,10 +1,12 @@
 pub mod block;
+pub mod command;
 pub mod inline;
 pub mod selection;
 pub mod style;
 pub mod transaction;
 
 pub use block::*;
+pub use command::*;
 pub use inline::*;
 pub use selection::*;
 pub use style::*;

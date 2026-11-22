@@ -1,22 +1,58 @@
-//! Interactive GPUI view hosting [`RichDocumentElement`] with scrolling, zoom, selection, and copy.
+//! Interactive GPUI view hosting [`RichDocumentElement`] with command-driven actions,
+//! scrolling, zoom, selection, and clipboard copy.
 
 use crate::element::RichDocumentElement;
 use crate::shaper::{GpuiGlyphBackend, GpuiShaper};
-use gpui::{
-    Bounds, ClipboardItem, Context, FocusHandle, Focusable, InteractiveElement, IntoElement,
-    KeyDownEvent, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
-    Point as GpuiPoint, Render, ScrollDelta, ScrollWheelEvent, Styled, Window, div,
+use gpui_kit::{
+    App, Bounds, ClipboardItem, Context, FocusHandle, Focusable, InteractiveElement, IntoElement,
+    KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ParentElement, Pixels,
+    Point as GpuiPoint, Render, ScrollDelta, ScrollEvent, Styled, Window, actions, div,
 };
 use rich_layout::{FlowLayout, Point, resolve_horizontal_metrics};
 use rich_model::{
-    BlockId, BlockKind, DocPos, Document, DocumentSelection, HorizontalLayout, PathSegment, Step,
-    Transaction,
+    Affinity, BlockId, BlockKind, CommandOutcome, DocPos, Document, DocumentSelection, History,
+    HorizontalLayout, PathSegment, RichCommand, Step, Transaction,
 };
 use unicode_segmentation::UnicodeSegmentation;
+
+/// GPUI keymap context attached to [`RichDocumentView`].
+pub const RICH_DOCUMENT_KEY_CONTEXT: &str = "RichDocument";
+
+actions!(
+    rich_document,
+    [
+        Copy,
+        SelectAll,
+        ClearSelection,
+        ZoomIn,
+        ZoomOut,
+        ZoomReset,
+        ToggleDebugOverlay,
+        Undo,
+        Redo,
+    ]
+);
+
+/// Registers default cross-platform keybindings scoped to [`RICH_DOCUMENT_KEY_CONTEXT`].
+pub fn register_default_keybindings(cx: &mut App) {
+    let context = Some(RICH_DOCUMENT_KEY_CONTEXT);
+    cx.bind_keys([
+        KeyBinding::new("secondary-c", Copy, context),
+        KeyBinding::new("secondary-a", SelectAll, context),
+        KeyBinding::new("escape", ClearSelection, context),
+        KeyBinding::new("secondary-=", ZoomIn, context),
+        KeyBinding::new("secondary--", ZoomOut, context),
+        KeyBinding::new("secondary-0", ZoomReset, context),
+        KeyBinding::new("secondary-z", Undo, context),
+        KeyBinding::new("secondary-shift-z", Redo, context),
+        KeyBinding::new("secondary-y", Redo, context),
+    ]);
+}
 
 /// Interactive viewer and future editor host for a non-paginated rich text document.
 pub struct RichDocumentView {
     pub document: Document,
+    pub history: History,
     pub flow: FlowLayout<GpuiGlyphBackend>,
     pub selection: Option<DocumentSelection>,
     pub focus_handle: FocusHandle,
@@ -24,6 +60,7 @@ pub struct RichDocumentView {
     pub scroll_y: f32,
     pub zoom: f32,
     pub debug_overlay: bool,
+    pub read_only: bool,
     pub(crate) last_viewport_bounds: Bounds<Pixels>,
     pub(crate) hovered_pointer: bool,
     dragging: bool,
@@ -34,10 +71,11 @@ pub struct RichDocumentView {
 }
 
 impl RichDocumentView {
-    /// Creates a new view wrapping `document`.
+    /// Creates a new read-only viewer wrapping `document`.
     pub fn new(document: Document, cx: &mut Context<Self>) -> Self {
         Self {
             document,
+            history: History::default(),
             flow: FlowLayout::default(),
             selection: None,
             focus_handle: cx.focus_handle(),
@@ -45,6 +83,7 @@ impl RichDocumentView {
             scroll_y: 0.0,
             zoom: 1.0,
             debug_overlay: false,
+            read_only: true,
             last_viewport_bounds: Bounds::default(),
             hovered_pointer: false,
             dragging: false,
@@ -55,54 +94,193 @@ impl RichDocumentView {
         }
     }
 
-    /// Adjusts zoom within `[0.5, 2.0]` while preserving the top visible scroll anchor.
-    pub fn set_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) {
-        let clamped = zoom.clamp(0.5, 2.0);
-        if (clamped - self.zoom).abs() < 0.001 {
-            return;
+    /// Central command execution seam for toolbars, GPUI actions, mouse interactions,
+    /// command palettes, and Phase 2 editing mutations.
+    pub fn dispatch_command(
+        &mut self,
+        command: RichCommand,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        if self.read_only && command.is_document_mutation() {
+            return CommandOutcome::RejectedReadOnly;
         }
-        let anchor = self.flow.capture_anchor(self.scroll_y);
-        self.zoom = clamped;
-        let viewport_width: f32 = self.last_viewport_bounds.size.width.into();
-        let viewport_height: f32 = self.last_viewport_bounds.size.height.into();
-        if viewport_width > 1.0 {
-            self.flow
-                .sync_document(&self.document, viewport_width, self.zoom);
-            if let Some(captured) = anchor {
-                self.scroll_y = self.flow.restore_anchor(captured, viewport_height);
+
+        match command {
+            RichCommand::SetHorizontalLayout(layout) => {
+                if self.document.config.horizontal_layout == layout {
+                    return CommandOutcome::NoOp;
+                }
+                let anchor = self.flow.capture_anchor(self.scroll_y);
+                self.document.config.horizontal_layout = layout;
+                self.scroll_x = 0.0;
+                self.resync_layout_with_anchor(anchor);
+                cx.notify();
+                CommandOutcome::Executed
             }
-            let horizontal =
-                resolve_horizontal_metrics(viewport_width, &self.document.config, self.zoom);
-            let max_scroll_x = (horizontal.canvas_width - viewport_width).max(0.0);
-            self.scroll_x = self.scroll_x.clamp(0.0, max_scroll_x);
+            RichCommand::SetZoom(target_zoom) => self.apply_zoom(target_zoom, cx),
+            RichCommand::AdjustZoom(delta) => self.apply_zoom(self.zoom + delta, cx),
+            RichCommand::ResetZoom => self.apply_zoom(1.0, cx),
+            RichCommand::ScrollBy { delta_x, delta_y } => {
+                let viewport_width: f32 = self.last_viewport_bounds.size.width.into();
+                let viewport_height: f32 = self.last_viewport_bounds.size.height.into();
+                let horizontal =
+                    resolve_horizontal_metrics(viewport_width, &self.document.config, self.zoom);
+                let max_scroll_x = (horizontal.canvas_width - viewport_width).max(0.0);
+                let max_scroll_y = (self.flow.total_height() - viewport_height).max(0.0);
+
+                let next_x = (self.scroll_x - delta_x).clamp(0.0, max_scroll_x);
+                let next_y = (self.scroll_y - delta_y).clamp(0.0, max_scroll_y);
+                if (next_x - self.scroll_x).abs() < 0.01 && (next_y - self.scroll_y).abs() < 0.01 {
+                    return CommandOutcome::NoOp;
+                }
+                self.scroll_x = next_x;
+                self.scroll_y = next_y;
+                cx.notify();
+                CommandOutcome::Executed
+            }
+            RichCommand::ToggleDebugOverlay => {
+                self.debug_overlay = !self.debug_overlay;
+                cx.notify();
+                CommandOutcome::Executed
+            }
+            RichCommand::SetSelection(selection) => {
+                if self.selection == selection {
+                    return CommandOutcome::NoOp;
+                }
+                self.selection = selection;
+                cx.notify();
+                CommandOutcome::Executed
+            }
+            RichCommand::ClearSelection => {
+                if self.selection.is_none() {
+                    return CommandOutcome::NoOp;
+                }
+                self.selection = None;
+                cx.notify();
+                CommandOutcome::Executed
+            }
+            RichCommand::SelectAll => {
+                let leaves = self.document.collect_leaf_blocks();
+                let (Some(first), Some(last)) = (leaves.first(), leaves.last()) else {
+                    return CommandOutcome::NoOp;
+                };
+                let end_offset = last
+                    .kind
+                    .inline_content()
+                    .map(|inline| inline.text.len())
+                    .unwrap_or(0);
+                self.selection = Some(DocumentSelection::Text {
+                    anchor: DocPos::top_level(first.id, 0),
+                    focus: DocPos::top_level(last.id, end_offset),
+                    affinity: Affinity::Downstream,
+                    goal_x: None,
+                    stored_marks: None,
+                });
+                cx.notify();
+                CommandOutcome::Executed
+            }
+            RichCommand::SelectWordAt(position) => {
+                let Some((word_start, word_end)) = self.word_bounds_at(&position) else {
+                    return CommandOutcome::NoOp;
+                };
+                let mut anchor_position = position.clone();
+                anchor_position.offset = word_start;
+                let mut focus_position = position;
+                focus_position.offset = word_end;
+                self.selection = Some(DocumentSelection::Text {
+                    anchor: anchor_position,
+                    focus: focus_position,
+                    affinity: Affinity::Downstream,
+                    goal_x: None,
+                    stored_marks: None,
+                });
+                cx.notify();
+                CommandOutcome::Executed
+            }
+            RichCommand::CopySelection => {
+                let Some(text) = self.selected_plain_text() else {
+                    return CommandOutcome::NoOp;
+                };
+                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                CommandOutcome::Executed
+            }
+            RichCommand::OpenLink(href) => {
+                if href.is_empty() {
+                    return CommandOutcome::NoOp;
+                }
+                cx.open_url(&href);
+                CommandOutcome::Executed
+            }
+            RichCommand::ToggleHeadingCollapsed(heading_id) => {
+                let anchor = self.flow.capture_anchor(self.scroll_y);
+                let applied = self
+                    .document
+                    .apply(Transaction::new(vec![Step::ToggleHeadingCollapsed {
+                        block_id: heading_id,
+                    }]));
+                if applied.change_set.dirty_blocks.is_empty() {
+                    return CommandOutcome::NoOp;
+                }
+                self.resync_layout_with_anchor(anchor);
+                cx.notify();
+                CommandOutcome::Executed
+            }
+            RichCommand::Undo => {
+                let anchor = self.flow.capture_anchor(self.scroll_y);
+                let Some((_change_set, restored_selection)) = self.history.undo(&mut self.document)
+                else {
+                    return CommandOutcome::NoOp;
+                };
+                if restored_selection.is_some() {
+                    self.selection = restored_selection;
+                }
+                self.resync_layout_with_anchor(anchor);
+                cx.notify();
+                CommandOutcome::Executed
+            }
+            RichCommand::Redo => {
+                let anchor = self.flow.capture_anchor(self.scroll_y);
+                let Some((_change_set, restored_selection)) = self.history.redo(&mut self.document)
+                else {
+                    return CommandOutcome::NoOp;
+                };
+                if restored_selection.is_some() {
+                    self.selection = restored_selection;
+                }
+                self.resync_layout_with_anchor(anchor);
+                cx.notify();
+                CommandOutcome::Executed
+            }
+            RichCommand::MoveCaret { .. }
+            | RichCommand::InsertText(_)
+            | RichCommand::InsertInlineObject(_)
+            | RichCommand::Delete { .. }
+            | RichCommand::SplitBlock
+            | RichCommand::InsertSoftBreak
+            | RichCommand::ToggleMark(_)
+            | RichCommand::SetInlineStyle(_)
+            | RichCommand::SetBlockStyle(_)
+            | RichCommand::SetTextAlign(_) => CommandOutcome::Unsupported,
         }
-        cx.notify();
     }
 
-    /// Switches between viewport-filling reflow (`Fill`) and infinite-length `Paper` layout.
-    pub fn set_horizontal_layout(&mut self, layout: HorizontalLayout, cx: &mut Context<Self>) {
-        if self.document.config.horizontal_layout == layout {
-            return;
-        }
-        let anchor = self.flow.capture_anchor(self.scroll_y);
-        self.document.config.horizontal_layout = layout;
-        self.scroll_x = 0.0;
-        let viewport_width: f32 = self.last_viewport_bounds.size.width.into();
-        let viewport_height: f32 = self.last_viewport_bounds.size.height.into();
-        if viewport_width > 1.0 {
-            self.flow
-                .sync_document(&self.document, viewport_width, self.zoom);
-            if let Some(captured) = anchor {
-                self.scroll_y = self.flow.restore_anchor(captured, viewport_height);
-            }
-        }
-        cx.notify();
+    /// Convenience wrapper dispatching [`RichCommand::SetZoom`].
+    pub fn set_zoom(&mut self, zoom: f32, cx: &mut Context<Self>) -> CommandOutcome {
+        self.dispatch_command(RichCommand::SetZoom(zoom), cx)
     }
 
-    /// Toggles the layout debug overlay showing visual line bounds and baselines.
-    pub fn toggle_debug_overlay(&mut self, cx: &mut Context<Self>) {
-        self.debug_overlay = !self.debug_overlay;
-        cx.notify();
+    /// Convenience wrapper dispatching [`RichCommand::SetHorizontalLayout`].
+    pub fn set_horizontal_layout(
+        &mut self,
+        layout: HorizontalLayout,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        self.dispatch_command(RichCommand::SetHorizontalLayout(layout), cx)
+    }
+
+    /// Convenience wrapper dispatching [`RichCommand::ToggleDebugOverlay`].
+    pub fn toggle_debug_overlay(&mut self, cx: &mut Context<Self>) -> CommandOutcome {
+        self.dispatch_command(RichCommand::ToggleDebugOverlay, cx)
     }
 
     /// Extracts the plain UTF-8 text covered by the current selection (TSV for multi-cell table selections).
@@ -191,6 +369,35 @@ impl RichDocumentView {
         }
     }
 
+    fn apply_zoom(&mut self, target_zoom: f32, cx: &mut Context<Self>) -> CommandOutcome {
+        let clamped = target_zoom.clamp(0.5, 2.0);
+        if (clamped - self.zoom).abs() < 0.001 {
+            return CommandOutcome::NoOp;
+        }
+        let anchor = self.flow.capture_anchor(self.scroll_y);
+        self.zoom = clamped;
+        self.resync_layout_with_anchor(anchor);
+        cx.notify();
+        CommandOutcome::Executed
+    }
+
+    fn resync_layout_with_anchor(&mut self, anchor: Option<rich_layout::ScrollAnchor>) {
+        let viewport_width: f32 = self.last_viewport_bounds.size.width.into();
+        let viewport_height: f32 = self.last_viewport_bounds.size.height.into();
+        if viewport_width <= 1.0 {
+            return;
+        }
+        self.flow
+            .sync_document(&self.document, viewport_width, self.zoom);
+        if let Some(captured) = anchor {
+            self.scroll_y = self.flow.restore_anchor(captured, viewport_height);
+        }
+        let horizontal =
+            resolve_horizontal_metrics(viewport_width, &self.document.config, self.zoom);
+        let max_scroll_x = (horizontal.canvas_width - viewport_width).max(0.0);
+        self.scroll_x = self.scroll_x.clamp(0.0, max_scroll_x);
+    }
+
     fn window_point_to_canvas(&self, position: GpuiPoint<Pixels>) -> Point {
         let origin_x: f32 = self.last_viewport_bounds.origin.x.into();
         let origin_y: f32 = self.last_viewport_bounds.origin.y.into();
@@ -204,7 +411,7 @@ impl RichDocumentView {
 
     fn handle_scroll_wheel(
         &mut self,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -217,17 +424,7 @@ impl RichDocumentView {
         } else {
             (raw_x, raw_y)
         };
-
-        let viewport_width: f32 = self.last_viewport_bounds.size.width.into();
-        let viewport_height: f32 = self.last_viewport_bounds.size.height.into();
-        let horizontal =
-            resolve_horizontal_metrics(viewport_width, &self.document.config, self.zoom);
-        let max_scroll_x = (horizontal.canvas_width - viewport_width).max(0.0);
-        let max_scroll_y = (self.flow.total_height() - viewport_height).max(0.0);
-
-        self.scroll_x = (self.scroll_x - delta_x).clamp(0.0, max_scroll_x);
-        self.scroll_y = (self.scroll_y - delta_y).clamp(0.0, max_scroll_y);
-        cx.notify();
+        self.dispatch_command(RichCommand::ScrollBy { delta_x, delta_y }, cx);
     }
 
     fn handle_mouse_down(
@@ -236,7 +433,7 @@ impl RichDocumentView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        window.focus(&self.focus_handle);
+        window.focus(&self.focus_handle, cx);
         let canvas_point = self.window_point_to_canvas(event.position);
         let viewport_width: f32 = self.last_viewport_bounds.size.width.into();
         let mut shaper = GpuiShaper::new(window);
@@ -251,19 +448,7 @@ impl RichDocumentView {
         };
 
         if let Some(heading_id) = hit.toggled_heading {
-            let anchor = self.flow.capture_anchor(self.scroll_y);
-            let _applied = self
-                .document
-                .apply(Transaction::new(vec![Step::ToggleHeadingCollapsed {
-                    block_id: heading_id,
-                }]));
-            self.flow
-                .sync_document(&self.document, viewport_width, self.zoom);
-            if let Some(captured) = anchor {
-                let viewport_height: f32 = self.last_viewport_bounds.size.height.into();
-                self.scroll_y = self.flow.restore_anchor(captured, viewport_height);
-            }
-            cx.notify();
+            self.dispatch_command(RichCommand::ToggleHeadingCollapsed(heading_id), cx);
             return;
         }
 
@@ -271,20 +456,10 @@ impl RichDocumentView {
             self.pending_link = None;
             self.drag_origin = None;
             self.drag_moved = false;
-            if let Some((word_start, word_end)) = self.word_bounds_at(&hit.pos) {
-                let mut anchor_pos = hit.pos.clone();
-                anchor_pos.offset = word_start;
-                let mut focus_pos = hit.pos;
-                focus_pos.offset = word_end;
-                self.selection = Some(DocumentSelection::Text {
-                    anchor: anchor_pos,
-                    focus: focus_pos,
-                    affinity: hit.affinity,
-                    goal_x: None,
-                    stored_marks: None,
-                });
-                self.dragging = false;
-                cx.notify();
+            self.dragging = false;
+            if self.dispatch_command(RichCommand::SelectWordAt(hit.pos.clone()), cx)
+                == CommandOutcome::Executed
+            {
                 return;
             }
         }
@@ -293,17 +468,17 @@ impl RichDocumentView {
         self.drag_origin = Some(canvas_point);
         self.drag_moved = false;
 
-        if event.modifiers.shift
+        let next_selection = if event.modifiers.shift
             && let Some(DocumentSelection::Text { anchor, .. }) = self.selection.clone()
         {
             self.drag_anchor_pos = Some(anchor.clone());
-            self.selection = Some(selection_from_drag_positions(anchor, hit.pos, hit.affinity));
+            selection_from_drag_positions(anchor, hit.pos, hit.affinity)
         } else {
             self.drag_anchor_pos = Some(hit.pos.clone());
-            self.selection = Some(DocumentSelection::caret(hit.pos, hit.affinity));
-        }
+            DocumentSelection::caret(hit.pos, hit.affinity)
+        };
         self.dragging = true;
-        cx.notify();
+        self.dispatch_command(RichCommand::SetSelection(Some(next_selection)), cx);
     }
 
     fn handle_mouse_move(
@@ -350,8 +525,8 @@ impl RichDocumentView {
         };
 
         if let Some(anchor) = self.drag_anchor_pos.clone() {
-            self.selection = Some(selection_from_drag_positions(anchor, hit.pos, hit.affinity));
-            cx.notify();
+            let next_selection = selection_from_drag_positions(anchor, hit.pos, hit.affinity);
+            self.dispatch_command(RichCommand::SetSelection(Some(next_selection)), cx);
         }
     }
 
@@ -367,34 +542,11 @@ impl RichDocumentView {
         if !self.drag_moved
             && let Some(href) = self.pending_link.take()
         {
-            cx.open_url(&href);
+            self.dispatch_command(RichCommand::OpenLink(href), cx);
         } else {
             self.pending_link = None;
         }
         self.drag_moved = false;
-    }
-
-    fn handle_key_down(
-        &mut self,
-        event: &KeyDownEvent,
-        _window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        let primary_modifier = event.keystroke.modifiers.control || event.keystroke.modifiers.platform;
-        if !primary_modifier {
-            return;
-        }
-        match event.keystroke.key.as_str() {
-            "c" => {
-                if let Some(text) = self.selected_plain_text() {
-                    cx.write_to_clipboard(ClipboardItem::new_string(text));
-                }
-            }
-            "=" | "+" => self.set_zoom(self.zoom + 0.1, cx),
-            "-" => self.set_zoom(self.zoom - 0.1, cx),
-            "0" => self.set_zoom(1.0, cx),
-            _ => {}
-        }
     }
 
     fn word_bounds_at(&self, pos: &DocPos) -> Option<(usize, usize)> {
@@ -422,7 +574,7 @@ fn table_cell_of(pos: &DocPos) -> Option<(BlockId, usize, usize)> {
 fn selection_from_drag_positions(
     anchor: DocPos,
     focus: DocPos,
-    affinity: rich_model::Affinity,
+    affinity: Affinity,
 ) -> DocumentSelection {
     if let (Some((anchor_table, anchor_row, anchor_col)), Some((focus_table, focus_row, focus_col))) =
         (table_cell_of(&anchor), table_cell_of(&focus))
@@ -446,7 +598,7 @@ fn selection_from_drag_positions(
 }
 
 impl Focusable for RichDocumentView {
-    fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
+    fn focus_handle(&self, _cx: &App) -> FocusHandle {
         self.focus_handle.clone()
     }
 }
@@ -455,12 +607,39 @@ impl Render for RichDocumentView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
+            .key_context(RICH_DOCUMENT_KEY_CONTEXT)
             .track_focus(&self.focus_handle)
-            .on_scroll_wheel(cx.listener(Self::handle_scroll_wheel))
+            .on_action(cx.listener(|this, _: &Copy, _window, cx| {
+                this.dispatch_command(RichCommand::CopySelection, cx);
+            }))
+            .on_action(cx.listener(|this, _: &SelectAll, _window, cx| {
+                this.dispatch_command(RichCommand::SelectAll, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ClearSelection, _window, cx| {
+                this.dispatch_command(RichCommand::ClearSelection, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ZoomIn, _window, cx| {
+                this.dispatch_command(RichCommand::AdjustZoom(0.1), cx);
+            }))
+            .on_action(cx.listener(|this, _: &ZoomOut, _window, cx| {
+                this.dispatch_command(RichCommand::AdjustZoom(-0.1), cx);
+            }))
+            .on_action(cx.listener(|this, _: &ZoomReset, _window, cx| {
+                this.dispatch_command(RichCommand::ResetZoom, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleDebugOverlay, _window, cx| {
+                this.dispatch_command(RichCommand::ToggleDebugOverlay, cx);
+            }))
+            .on_action(cx.listener(|this, _: &Undo, _window, cx| {
+                this.dispatch_command(RichCommand::Undo, cx);
+            }))
+            .on_action(cx.listener(|this, _: &Redo, _window, cx| {
+                this.dispatch_command(RichCommand::Redo, cx);
+            }))
+            .on_scroll(cx.listener(Self::handle_scroll_wheel))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
             .on_mouse_move(cx.listener(Self::handle_mouse_move))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::handle_mouse_up))
-            .on_key_down(cx.listener(Self::handle_key_down))
             .child(RichDocumentElement::new(cx.entity()))
     }
 }

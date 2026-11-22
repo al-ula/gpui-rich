@@ -1,0 +1,3 @@
+[env]
+# Dynamically load libfontconfig.so.1 on Linux via yeslogic-fontconfig-sys without requiring fontconfig-devel headers.
+RUST_FONTCONFIG_DLOPEN = "1"
