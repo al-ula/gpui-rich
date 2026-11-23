@@ -1,12 +1,6 @@
 //! GPUI implementation of [`crate::layout::TextShaper`] backed by `WindowTextSystem`.
 
-use crate::gpui::extension::{
-    BlockCallbackResult, ExtensionRegistry, InlineCallbackResult,
-};
-use gpui_kit::{
-    Font, FontFallbacks, FontFeatures, FontId, FontStyle, FontWeight as GpuiFontWeight, GlyphId,
-    Hsla, Rgba, SharedString, TextRun, Window, px,
-};
+use crate::gpui::extension::{BlockCallbackResult, ExtensionRegistry, InlineCallbackResult};
 use crate::layout::{
     GlyphBackend, InlineBoxMetrics, Insets, ShapedGlyph, ShapedGlyphRun, ShapedSegment,
     ShaperRunSpec, Size, TextShaper, is_valid_custom_insets, is_valid_custom_size, pt_to_px,
@@ -14,6 +8,10 @@ use crate::layout::{
 use crate::model::{
     AnchorId, BlockShapeKind, ChipKind, ComponentStore, CustomPayload, DROPDOWN_KIND, InlineObject,
     InlineVAlign, PLACEHOLDER_KIND, RgbaColor, VARIABLE_KIND, footnote_reference_id,
+};
+use gpui_kit::{
+    Font, FontFallbacks, FontFeatures, FontId, FontStyle, FontWeight as GpuiFontWeight, GlyphId,
+    Hsla, Rgba, SharedString, TextRun, Window, px,
 };
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
@@ -199,16 +197,26 @@ fn metric_compatible_substitutes(lower_name: &str) -> Option<&'static [&'static 
         "times new roman" | "times" => {
             Some(&["Liberation Serif", "Tinos", "Noto Serif", "DejaVu Serif"])
         }
-        "georgia" | "cambria" | "garamond" | "palatino" | "baskerville" => {
-            Some(&["Gelasio", "Caladea", "Noto Serif", "Liberation Serif", "DejaVu Serif"])
-        }
-        "courier new" | "courier" => {
-            Some(&["Liberation Mono", "Cousine", "DejaVu Sans Mono", "Noto Sans Mono"])
-        }
+        "georgia" | "cambria" | "garamond" | "palatino" | "baskerville" => Some(&[
+            "Gelasio",
+            "Caladea",
+            "Noto Serif",
+            "Liberation Serif",
+            "DejaVu Serif",
+        ]),
+        "courier new" | "courier" => Some(&[
+            "Liberation Mono",
+            "Cousine",
+            "DejaVu Sans Mono",
+            "Noto Sans Mono",
+        ]),
         "consolas" | "menlo" | "monaco" | "sf mono" | "fira code" | "jetbrains mono"
-        | "source code pro" => {
-            Some(&["JetBrains Mono", "Liberation Mono", "DejaVu Sans Mono", "Noto Sans Mono"])
-        }
+        | "source code pro" => Some(&[
+            "JetBrains Mono",
+            "Liberation Mono",
+            "DejaVu Sans Mono",
+            "Noto Sans Mono",
+        ]),
         _ => None,
     }
 }
@@ -351,7 +359,6 @@ impl<'window, 'registry> GpuiShaper<'window, 'registry> {
         self.components = Some(components);
         self
     }
-
 }
 
 impl TextShaper for GpuiShaper<'_, '_> {
@@ -565,13 +572,11 @@ impl TextShaper for GpuiShaper<'_, '_> {
                 if let Some(renderer) = self
                     .extensions
                     .and_then(|registry| registry.get_inline(kind))
-                {
-                    if let InlineCallbackResult::Ok(metrics) =
+                    && let InlineCallbackResult::Ok(metrics) =
                         renderer.measure(data, zoom, self.window)
-                        && metrics.is_valid()
-                    {
-                        return metrics;
-                    }
+                    && metrics.is_valid()
+                {
+                    return metrics;
                 }
                 let label = kind.to_string();
                 let font_size = px(pt_to_px(10.0, zoom));
@@ -601,11 +606,19 @@ impl TextShaper for GpuiShaper<'_, '_> {
 
     fn resolve_inline_object(&self, object: &InlineObject) -> Option<InlineObject> {
         if let Some(id) = footnote_reference_id(object) {
-            return self.footnote_numbers.as_ref()?.get(&id)
+            return self
+                .footnote_numbers
+                .as_ref()?
+                .get(&id)
                 .map(|&index| InlineObject::FootnoteRef { index });
         }
-        let InlineObject::Custom { kind, data } = object else { return None; };
-        if !matches!(kind.as_ref(), DROPDOWN_KIND | VARIABLE_KIND | PLACEHOLDER_KIND) {
+        let InlineObject::Custom { kind, data } = object else {
+            return None;
+        };
+        if !matches!(
+            kind.as_ref(),
+            DROPDOWN_KIND | VARIABLE_KIND | PLACEHOLDER_KIND
+        ) {
             return None;
         }
         let components = self.components?;
@@ -614,11 +627,19 @@ impl TextShaper for GpuiShaper<'_, '_> {
         if kind.as_ref() == DROPDOWN_KIND {
             label.push_str(" ▾");
         }
-        Some(InlineObject::SmartChip { kind: ChipKind::Tag, label, accent: None })
+        Some(InlineObject::SmartChip {
+            kind: ChipKind::Tag,
+            label,
+            accent: None,
+        })
     }
 
     fn set_footnote_numbers(&mut self, numbers: &Arc<HashMap<AnchorId, u32>>) {
-        if !self.footnote_numbers.as_ref().is_some_and(|current| Arc::ptr_eq(current, numbers)) {
+        if !self
+            .footnote_numbers
+            .as_ref()
+            .is_some_and(|current| Arc::ptr_eq(current, numbers))
+        {
             self.footnote_numbers = Some(Arc::clone(numbers));
         }
     }

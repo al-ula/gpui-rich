@@ -66,16 +66,13 @@ fn paint_table_chrome(
     for cell in &table.cells {
         let cell_origin = to_window(origin_x + cell.rect.x, origin_y + cell.rect.y);
         let cell_bounds = Bounds::new(cell_origin, size(px(cell.rect.width), px(cell.rect.height)));
-        let fill_color = cell
-            .background
-            .map(rgba_to_hsla)
-            .unwrap_or_else(|| {
-                if cell.is_header {
-                    theme.table_header_background
-                } else {
-                    theme.table_cell_background
-                }
-            });
+        let fill_color = cell.background.map(rgba_to_hsla).unwrap_or_else(|| {
+            if cell.is_header {
+                theme.table_header_background
+            } else {
+                theme.table_cell_background
+            }
+        });
         window.paint_quad(quad(
             cell_bounds,
             Corners::all(px(0.0)),
@@ -155,7 +152,12 @@ pub(super) fn paint_block_chrome(
                     let center_y = first_line
                         .map(|line| line.baseline_y - line.ascent * 0.38)
                         .unwrap_or(marker_origin.y - box_size * 0.5);
-                    Rect::new(marker_origin.x, center_y - box_size * 0.5, box_size, box_size)
+                    Rect::new(
+                        marker_origin.x,
+                        center_y - box_size * 0.5,
+                        box_size,
+                        box_size,
+                    )
                 });
                 let box_origin = to_window(block_x + rect.x, block_y + rect.y);
                 let box_bounds = Bounds::new(box_origin, size(px(rect.width), px(rect.height)));
@@ -233,7 +235,10 @@ pub(super) fn paint_block_chrome(
         } => {
             let frame_origin = to_window(block_x + frame_rect.x, block_y + frame_rect.y);
             window.paint_quad(quad(
-                Bounds::new(frame_origin, size(px(frame_rect.width), px(frame_rect.height))),
+                Bounds::new(
+                    frame_origin,
+                    size(px(frame_rect.width), px(frame_rect.height)),
+                ),
                 Corners::all(px(pt_to_px(5.0, zoom))),
                 theme.code_background,
                 Edges::all(px(1.0)),
@@ -264,7 +269,12 @@ pub(super) fn paint_block_chrome(
                 size(px(copy_button_rect.width), px(copy_button_rect.height)),
             );
             let (btn_bg, btn_border, btn_fg, btn_text) = if is_copied {
-                (theme.accent.alpha(0.14), theme.accent, theme.accent, "Copied")
+                (
+                    theme.accent.alpha(0.14),
+                    theme.accent,
+                    theme.accent,
+                    "Copied",
+                )
             } else {
                 (
                     theme.surface_background,
@@ -419,7 +429,9 @@ pub(super) fn paint_block_inline_backgrounds(
         BlockLayoutKind::Paragraph(paragraph)
         | BlockLayoutKind::Heading { paragraph, .. }
         | BlockLayoutKind::ListItem { paragraph, .. } => {
-            paint_paragraph_backgrounds(paragraph, block_x, block_y, zoom, theme, to_window, window);
+            paint_paragraph_backgrounds(
+                paragraph, block_x, block_y, zoom, theme, to_window, window,
+            );
         }
         BlockLayoutKind::CodeBlock {
             content_origin,
@@ -525,8 +537,7 @@ fn paint_paragraph_backgrounds(
                                 0.0
                             };
                             let pad_x = if decoration.inline_code { 2.0 } else { 0.0 };
-                            let top_left =
-                                to_window(origin_x + start_x - pad_x, origin_y + top);
+                            let top_left = to_window(origin_x + start_x - pad_x, origin_y + top);
                             window.paint_quad(quad(
                                 Bounds::new(top_left, size(px(width + 2.0 * pad_x), px(height))),
                                 Corners::all(px(radius)),
@@ -680,8 +691,7 @@ pub(super) fn paint_block_foreground(
         BlockLayoutKind::CustomLeaf { kind, bounds, .. } => {
             if !handled_custom_blocks.contains(&layout.id) {
                 let origin = to_window(block_x + bounds.x, block_y + bounds.y);
-                let node_bounds =
-                    Bounds::new(origin, size(px(bounds.width), px(bounds.height)));
+                let node_bounds = Bounds::new(origin, size(px(bounds.width), px(bounds.height)));
                 window.paint_quad(quad(
                     node_bounds,
                     Corners::all(px(pt_to_px(5.0, zoom))),
@@ -817,10 +827,7 @@ fn paint_text_fragment(
             } else {
                 base_color
             };
-            let glyph_origin = to_window(
-                origin_x + fragment.x + glyph.x,
-                baseline_y + glyph.y,
-            );
+            let glyph_origin = to_window(origin_x + fragment.x + glyph.x, baseline_y + glyph.y);
             let paint_result = if glyph.is_emoji {
                 window.paint_emoji(glyph_origin, run.font, glyph.glyph_id, font_size)
             } else {
@@ -948,7 +955,10 @@ fn paint_inline_box(
     cx: &mut App,
 ) {
     let top_left = to_window(canvas_rect.x, canvas_rect.y);
-    let bounds = Bounds::new(top_left, size(px(canvas_rect.width), px(canvas_rect.height)));
+    let bounds = Bounds::new(
+        top_left,
+        size(px(canvas_rect.width), px(canvas_rect.height)),
+    );
 
     match &inline_box.object {
         InlineObject::SmartChip {
@@ -982,14 +992,9 @@ fn paint_inline_box(
         InlineObject::Image { asset_id, alt, .. } => {
             let radius = Corners::all(px(pt_to_px(4.0, zoom)));
             if let Some(LoadedAsset::Ready(render_image)) = image_assets.get(asset_id) {
-                if let Err(error) = window.paint_image(
-                    bounds,
-                    bounds,
-                    radius,
-                    Arc::clone(render_image),
-                    0,
-                    false,
-                ) {
+                if let Err(error) =
+                    window.paint_image(bounds, bounds, radius, Arc::clone(render_image), 0, false)
+                {
                     eprintln!("rich-gpui: failed to paint inline image '{asset_id}': {error}");
                 }
                 return;
@@ -1007,8 +1012,12 @@ fn paint_inline_box(
                 Some(LoadedAsset::Loading) => "Loading image...",
                 Some(LoadedAsset::Failed(_)) if !alt.is_empty() => alt.as_str(),
                 Some(LoadedAsset::Failed(ImageAssetError::NotFound { .. })) => "Image not found",
-                Some(LoadedAsset::Failed(ImageAssetError::Decode { .. })) => "Image could not decode",
-                Some(LoadedAsset::Failed(ImageAssetError::Provider { .. })) => "Image failed to load",
+                Some(LoadedAsset::Failed(ImageAssetError::Decode { .. })) => {
+                    "Image could not decode"
+                }
+                Some(LoadedAsset::Failed(ImageAssetError::Provider { .. })) => {
+                    "Image failed to load"
+                }
                 _ if !alt.is_empty() => alt.as_str(),
                 _ => "Image",
             };
@@ -1287,7 +1296,10 @@ pub(super) fn paint_selected_image_handles(
 ) {
     let active_rect = selected.preview_rect.unwrap_or(selected.canvas_rect);
     let top_left = to_window(active_rect.x, active_rect.y);
-    let bounds = Bounds::new(top_left, size(px(active_rect.width), px(active_rect.height)));
+    let bounds = Bounds::new(
+        top_left,
+        size(px(active_rect.width), px(active_rect.height)),
+    );
 
     if selected.preview_rect.is_some() {
         window.paint_quad(quad(
@@ -1340,7 +1352,14 @@ pub(super) fn paint_selected_image_handles(
             active_rect.x + (active_rect.width - badge_w) * 0.5 + 7.0,
             active_rect.bottom() + 9.0,
         );
-        paint_small_label(label, text_origin, 11.0, theme.accent_foreground, window, cx);
+        paint_small_label(
+            label,
+            text_origin,
+            11.0,
+            theme.accent_foreground,
+            window,
+            cx,
+        );
     }
 }
 

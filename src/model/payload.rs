@@ -25,7 +25,10 @@ impl fmt::Display for PayloadError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::TypeMismatch { expected, actual } => {
-                write!(formatter, "payload type mismatch: expected {expected}, found {actual}")
+                write!(
+                    formatter,
+                    "payload type mismatch: expected {expected}, found {actual}"
+                )
             }
             Self::Deserialize(message) => write!(formatter, "payload decode error: {message}"),
             Self::Serialize(message) => write!(formatter, "payload serialize error: {message}"),
@@ -220,9 +223,7 @@ impl Serialize for CustomPayload {
     {
         match &self.0 {
             PayloadInner::Typed(data) => {
-                let value = data
-                    .to_json()
-                    .map_err(serde::ser::Error::custom)?;
+                let value = data.to_json().map_err(serde::ser::Error::custom)?;
                 value.serialize(serializer)
             }
             PayloadInner::Raw(value) => value.as_ref().serialize(serializer),

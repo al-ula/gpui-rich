@@ -96,17 +96,17 @@ pub enum NodeDataError {
         actual: BlockShapeKind,
     },
     /// The node matches the specification's kind and shape, but its payload is invalid or incompatible.
-    InvalidData {
-        kind: &'static str,
-        message: String,
-    },
+    InvalidData { kind: &'static str, message: String },
 }
 
 impl fmt::Display for NodeDataError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::KindMismatch { expected, actual } => {
-                write!(formatter, "expected node kind '{expected}', found '{actual}'")
+                write!(
+                    formatter,
+                    "expected node kind '{expected}', found '{actual}'"
+                )
             }
             Self::ShapeMismatch {
                 kind,
@@ -117,7 +117,10 @@ impl fmt::Display for NodeDataError {
                 "node kind '{kind}' expected {expected} shape, found {actual}"
             ),
             Self::InvalidData { kind, message } => {
-                write!(formatter, "invalid payload for node kind '{kind}': {message}")
+                write!(
+                    formatter,
+                    "invalid payload for node kind '{kind}': {message}"
+                )
             }
         }
     }
@@ -360,8 +363,11 @@ impl TableBlock {
             return Vec::new();
         }
         let (_, placements, occupancy) = self.resolve_grid();
-        let Some(placement) = occupancy.get(row).and_then(|slots| slots.get(visual_col))
-            .and_then(|slot| slot.and_then(|index| placements.get(index))) else {
+        let Some(placement) = occupancy
+            .get(row)
+            .and_then(|slots| slots.get(visual_col))
+            .and_then(|slot| slot.and_then(|index| placements.get(index)))
+        else {
             return Vec::new();
         };
         let row = &self.rows[placement.row_index];
@@ -372,32 +378,56 @@ impl TableBlock {
         let mut actual = None;
         let mut mixed = false;
         for block in &cell.blocks {
-            let Some(content) = block.kind.inline_content() else { mixed = true; break; };
-            if content.text.trim().is_empty() { continue; }
-            let [entry] = content.objects.as_slice() else { mixed = true; break; };
-            if content.text.trim() != "\u{fffc}" || actual.is_some() { mixed = true; break; }
+            let Some(content) = block.kind.inline_content() else {
+                mixed = true;
+                break;
+            };
+            if content.text.trim().is_empty() {
+                continue;
+            }
+            let [entry] = content.objects.as_slice() else {
+                mixed = true;
+                break;
+            };
+            if content.text.trim() != "\u{fffc}" || actual.is_some() {
+                mixed = true;
+                break;
+            }
             actual = match &entry.object {
-                InlineObject::Custom { kind, data } if kind.as_ref() == PLACEHOLDER_KIND => data
-                    .as_json()
-                    .ok()
-                    .and_then(|json| {
+                InlineObject::Custom { kind, data } if kind.as_ref() == PLACEHOLDER_KIND => {
+                    data.as_json().ok().and_then(|json| {
                         json.get("kind")
                             .and_then(serde_json::Value::as_str)
                             .and_then(PlaceholderKind::from_name)
-                    }),
-                InlineObject::SmartChip { kind: ChipKind::Date, .. } => Some(PlaceholderKind::Date),
-                InlineObject::SmartChip { kind: ChipKind::Person, .. } => Some(PlaceholderKind::Person),
-                InlineObject::SmartChip { kind: ChipKind::Document, .. } => Some(PlaceholderKind::File),
+                    })
+                }
+                InlineObject::SmartChip {
+                    kind: ChipKind::Date,
+                    ..
+                } => Some(PlaceholderKind::Date),
+                InlineObject::SmartChip {
+                    kind: ChipKind::Person,
+                    ..
+                } => Some(PlaceholderKind::Person),
+                InlineObject::SmartChip {
+                    kind: ChipKind::Document,
+                    ..
+                } => Some(PlaceholderKind::File),
                 _ => None,
             };
-            if actual.is_none() { mixed = true; break; }
+            if actual.is_none() {
+                mixed = true;
+                break;
+            }
         }
         if actual.is_none() && !mixed {
             return Vec::new();
         }
         self.column_kinds
             .range(placement.visual_col..placement.visual_col + placement.colspan)
-            .filter_map(|(&column, &expected)| (mixed || actual != Some(expected)).then_some(column))
+            .filter_map(|(&column, &expected)| {
+                (mixed || actual != Some(expected)).then_some(column)
+            })
             .collect()
     }
 
@@ -422,7 +452,8 @@ impl TableBlock {
                     visual_col += 1;
                 }
                 let colspan = cell.colspan.max(1) as usize;
-                let rowspan = (cell.rowspan.max(1) as usize).min(row_count.saturating_sub(row_index));
+                let rowspan =
+                    (cell.rowspan.max(1) as usize).min(row_count.saturating_sub(row_index));
                 let end_col = visual_col + colspan;
                 max_cols = max_cols.max(end_col);
                 for span_row in row_index..(row_index + rowspan) {
@@ -488,9 +519,9 @@ impl TableBlock {
         cell_index: usize,
     ) -> Option<TableCellPlacement> {
         let (_, placements, _) = self.resolve_grid();
-        placements
-            .into_iter()
-            .find(|placement| placement.row_index == row_index && placement.cell_index == cell_index)
+        placements.into_iter().find(|placement| {
+            placement.row_index == row_index && placement.cell_index == cell_index
+        })
     }
 }
 
@@ -621,10 +652,7 @@ impl BlockKind {
     }
 
     /// Constructs a custom grid block bound to [`BlockSpec`] `S`.
-    pub fn grid<S: BlockSpec<Shape = block_shape::Grid>>(
-        data: S::Data,
-        table: TableBlock,
-    ) -> Self {
+    pub fn grid<S: BlockSpec<Shape = block_shape::Grid>>(data: S::Data, table: TableBlock) -> Self {
         Self::Grid {
             kind: Arc::from(S::KIND),
             data: CustomPayload::typed(data),
@@ -979,18 +1007,22 @@ impl Document {
 
     pub fn add_blockquote(&mut self, children: Vec<BlockNode>) -> BlockId {
         let id = self.alloc_block_id();
-        let mut style = BlockStyle::default();
-        style.indent_start_pt = 16.0;
-        style.space_before_pt = Some(6.0);
-        style.space_after_pt = Some(10.0);
+        let style = BlockStyle {
+            indent_start_pt: 16.0,
+            space_before_pt: Some(6.0),
+            space_after_pt: Some(10.0),
+            ..BlockStyle::default()
+        };
         self.push_block(BlockNode::new(id, BlockKind::blockquote(children), style))
     }
 
     pub fn add_horizontal_rule(&mut self) -> BlockId {
         let id = self.alloc_block_id();
-        let mut style = BlockStyle::default();
-        style.space_before_pt = Some(10.0);
-        style.space_after_pt = Some(10.0);
+        let style = BlockStyle {
+            space_before_pt: Some(10.0),
+            space_after_pt: Some(10.0),
+            ..BlockStyle::default()
+        };
         self.push_block(BlockNode::new(id, BlockKind::horizontal_rule(), style))
     }
 

@@ -1,6 +1,6 @@
 use gpui_kit::{
-    App, AppContext, Bounds, Context, Entity, InteractiveElement, IntoElement, ParentElement, Render,
-    Styled, Window, WindowBounds, WindowOptions, div, point, px, size,
+    App, AppContext, Bounds, Context, Entity, InteractiveElement, IntoElement, ParentElement,
+    Render, Styled, Window, WindowBounds, WindowOptions, div, point, px, size,
 };
 use gpui_rich::gpui::{
     BlockRenderContext, BlockRenderer, CustomRenderOutput, ExtensionDiagnosticKind,
@@ -258,8 +258,7 @@ impl Render for ConsumerHost {
             .size_full()
             .on_action(
                 cx.listener(move |_this, _action: &RenameFirstBadge, _window, cx| {
-                    if let Some((target_block, target_object, next_label)) =
-                        target.borrow().clone()
+                    if let Some((target_block, target_object, next_label)) = target.borrow().clone()
                     {
                         view.update(cx, |document_view, cx| {
                             document_view.dispatch_extension_command(
@@ -359,11 +358,11 @@ impl CommandMiddleware for TestCommandMiddleware {
         if command.args::<CountBadges>().is_some()
             && let Some(replacement) = self.replace_count_with_rename.borrow().as_ref()
         {
-            return CommandDecision::Replace(RichCommand::extension(RenameBadge {
+            return CommandDecision::Replace(Box::new(RichCommand::extension(RenameBadge {
                 block_id: replacement.block_id,
                 object_id: replacement.object_id,
                 new_label: replacement.new_label.clone(),
-            }));
+            })));
         }
         CommandDecision::Continue
     }
@@ -511,8 +510,9 @@ fn verify_two_views_badge_policy_middleware_and_clipboard(cx: &mut App) {
     let rename_calls = Arc::new(AtomicUsize::new(0));
     let read_calls = Arc::new(AtomicUsize::new(0));
     let replace_slot: Rc<RefCell<Option<RenameBadge>>> = Rc::new(RefCell::new(None));
-    let events: Rc<RefCell<Vec<(String, CommandEffectKind, CommandResolution, CommandOutcome)>>> =
-        Rc::new(RefCell::new(Vec::new()));
+    type CommandEventLog =
+        Rc<RefCell<Vec<(String, CommandEffectKind, CommandResolution, CommandOutcome)>>>;
+    let events: CommandEventLog = Rc::new(RefCell::new(Vec::new()));
     let mutations = Arc::new(AtomicUsize::new(0));
 
     let rename_target: Rc<RefCell<Option<(BlockId, InlineObjectId, String)>>> =
@@ -523,8 +523,10 @@ fn verify_two_views_badge_policy_middleware_and_clipboard(cx: &mut App) {
     let replace_for_build = Rc::clone(&replace_slot);
     let view_one_slot: Rc<RefCell<Option<Entity<RichDocumentView>>>> = Rc::new(RefCell::new(None));
     let view_one_capture = Rc::clone(&view_one_slot);
-    let (window_one, _host_one) =
-        gpui_kit::open_window(fixed_window_options(640.0, 480.0), cx, move |_window, cx| {
+    let (window_one, _host_one) = gpui_kit::open_window(
+        fixed_window_options(640.0, 480.0),
+        cx,
+        move |_window, cx| {
             let view = cx.new(|cx| {
                 let mut view = RichDocumentView::new(source_doc, cx);
                 view.set_policy(InteractionPolicy::editable(), cx);
@@ -570,8 +572,9 @@ fn verify_two_views_badge_policy_middleware_and_clipboard(cx: &mut App) {
                 view,
                 target: rename_target_for_host,
             })
-        })
-        .expect("open window one");
+        },
+    )
+    .expect("open window one");
     let view_one = view_one_slot.borrow().clone().expect("view one entity");
 
     let events_for_sub = Rc::clone(&events);
@@ -608,10 +611,10 @@ fn verify_two_views_badge_policy_middleware_and_clipboard(cx: &mut App) {
             .unwrap_or(0);
         let pos = DocPos::top_level(paragraph_id, end_offset);
         view.dispatch_command(
-            RichCommand::SetSelection(Some(DocumentSelection::caret(
+            RichCommand::SetSelection(Some(Box::new(DocumentSelection::caret(
                 pos,
                 Affinity::Downstream,
-            ))),
+            )))),
             cx,
         );
         let insert_outcome = view.dispatch_command(
@@ -789,8 +792,10 @@ fn verify_two_views_badge_policy_middleware_and_clipboard(cx: &mut App) {
     );
     assert!(html_meta.contains("<span>Approved</span>"));
 
-    let (window_two, view_two) =
-        gpui_kit::open_window(fixed_window_options(640.0, 480.0), cx, move |_window, cx| {
+    let (window_two, view_two) = gpui_kit::open_window(
+        fixed_window_options(640.0, 480.0),
+        cx,
+        move |_window, cx| {
             cx.new(|cx| {
                 let mut view = RichDocumentView::new(dest_doc, cx);
                 view.set_policy(InteractionPolicy::editable(), cx);
@@ -804,15 +809,16 @@ fn verify_two_views_badge_policy_middleware_and_clipboard(cx: &mut App) {
                     .expect("register SameNameBlockRenderer on view two");
                 view
             })
-        })
-        .expect("open window two");
+        },
+    )
+    .expect("open window two");
 
     view_two.update(cx, |view, cx| {
         view.dispatch_command(
-            RichCommand::SetSelection(Some(DocumentSelection::caret(
+            RichCommand::SetSelection(Some(Box::new(DocumentSelection::caret(
                 DocPos::top_level(dest_para, 0),
                 Affinity::Downstream,
-            ))),
+            )))),
             cx,
         );
         assert_eq!(
@@ -847,22 +853,25 @@ fn verify_two_views_badge_policy_middleware_and_clipboard(cx: &mut App) {
     // Plain-text paste must ignore private structured metadata.
     let mut plain_doc = Document::new();
     let plain_para = plain_doc.add_paragraph(InlineContent::empty(), BlockStyle::default());
-    let (window_three, view_three) =
-        gpui_kit::open_window(fixed_window_options(640.0, 480.0), cx, move |_window, cx| {
+    let (window_three, view_three) = gpui_kit::open_window(
+        fixed_window_options(640.0, 480.0),
+        cx,
+        move |_window, cx| {
             cx.new(|cx| {
                 let mut view = RichDocumentView::new(plain_doc, cx);
                 view.set_policy(InteractionPolicy::editable(), cx);
                 view
             })
-        })
-        .expect("open window three");
+        },
+    )
+    .expect("open window three");
 
     view_three.update(cx, |view, cx| {
         view.dispatch_command(
-            RichCommand::SetSelection(Some(DocumentSelection::caret(
+            RichCommand::SetSelection(Some(Box::new(DocumentSelection::caret(
                 DocPos::top_level(plain_para, 0),
                 Affinity::Downstream,
-            ))),
+            )))),
             cx,
         );
         assert_eq!(
@@ -903,9 +912,13 @@ fn verify_payload_cache_unknown_fields_and_diagnostics(cx: &mut App) {
         caption: "placeholder".to_owned(),
     });
 
-    let mut raw_doc_json: serde_json::Value =
-        serde_json::from_str(JsonCodec.encode(&template).expect("encode template").as_str())
-            .expect("parse template json");
+    let mut raw_doc_json: serde_json::Value = serde_json::from_str(
+        JsonCodec
+            .encode(&template)
+            .expect("encode template")
+            .as_str(),
+    )
+    .expect("parse template json");
     let blocks = raw_doc_json
         .get_mut("blocks")
         .and_then(serde_json::Value::as_array_mut)
@@ -943,7 +956,10 @@ fn verify_payload_cache_unknown_fields_and_diagnostics(cx: &mut App) {
     draw_window(window.into(), cx);
 
     let view_ref = view.read(cx);
-    let block = view_ref.document.find_block(valid_raw_id).expect("valid block");
+    let block = view_ref
+        .document
+        .find_block(valid_raw_id)
+        .expect("valid block");
     let BlockKind::Leaf { kind, data } = &block.kind else {
         panic!("expected BlockKind::Leaf");
     };
@@ -1134,9 +1150,8 @@ fn gpui_extension_type_safety_end_to_end() {
         let image_view_capture = Rc::clone(&image_view_slot);
         let image_window = cx
             .open_window(fixed_window_options(640.0, 240.0), move |_window, cx| {
-                let view = cx.new(|cx| {
-                    RichDocumentView::new(image_doc, cx).with_asset_provider(provider)
-                });
+                let view =
+                    cx.new(|cx| RichDocumentView::new(image_doc, cx).with_asset_provider(provider));
                 *image_view_capture.borrow_mut() = Some(view.clone());
                 view
             })

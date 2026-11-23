@@ -148,7 +148,9 @@ fn write_single_block_html(
             if !table.column_kinds.is_empty() {
                 output.push_str(" data-rich-column-kinds=\"");
                 for (index, (column, kind)) in table.column_kinds.iter().enumerate() {
-                    if index > 0 { output.push(','); }
+                    if index > 0 {
+                        output.push(',');
+                    }
                     output.push_str(&column.to_string());
                     output.push(':');
                     output.push_str(kind.as_str());
@@ -294,7 +296,10 @@ pub(super) fn write_inline_html(
             close_tags.push("</span>");
         }
 
-        if style.weight.is_some_and(|weight| weight >= FontWeight::BOLD) {
+        if style
+            .weight
+            .is_some_and(|weight| weight >= FontWeight::BOLD)
+        {
             output.push_str("<strong>");
             close_tags.push("</strong>");
         }
@@ -697,11 +702,12 @@ fn decode_single_entity(entity: &str) -> Option<String> {
         "nbsp" => Some(" ".into()),
         _ => {
             let num = entity.strip_prefix('#')?;
-            let code_point = if let Some(hex) = num.strip_prefix('x').or_else(|| num.strip_prefix('X')) {
-                u32::from_str_radix(hex, 16).ok()?
-            } else {
-                num.parse::<u32>().ok()?
-            };
+            let code_point =
+                if let Some(hex) = num.strip_prefix('x').or_else(|| num.strip_prefix('X')) {
+                    u32::from_str_radix(hex, 16).ok()?
+                } else {
+                    num.parse::<u32>().ok()?
+                };
             char::from_u32(code_point).map(|character| character.to_string())
         }
     }
@@ -1086,11 +1092,14 @@ impl HtmlFragmentParser {
                 self.flush_current_block();
                 self.table_stack.push(TableBuildState {
                     rows: Vec::new(),
-                    column_kinds: attr_value(attrs, "data-rich-column-kinds").unwrap_or_default()
-                        .split(',').filter_map(|pair| {
+                    column_kinds: attr_value(attrs, "data-rich-column-kinds")
+                        .unwrap_or_default()
+                        .split(',')
+                        .filter_map(|pair| {
                             let (column, kind) = pair.split_once(':')?;
                             Some((column.parse().ok()?, PlaceholderKind::from_name(kind)?))
-                        }).collect(),
+                        })
+                        .collect(),
                     current_row: None,
                     current_cell: None,
                 });
@@ -1287,7 +1296,9 @@ impl HtmlFragmentParser {
     }
 
     fn handle_text(&mut self, raw_text: &str) {
-        if self.skip_depth > 0 || self.skip_custom_inner_depth > 0 || self.pending_footnote.is_some()
+        if self.skip_depth > 0
+            || self.skip_custom_inner_depth > 0
+            || self.pending_footnote.is_some()
         {
             return;
         }
@@ -1352,14 +1363,13 @@ fn finish_table_state(mut state: TableBuildState) -> ClipboardTable {
     {
         state.rows.push(row);
     }
-    ClipboardTable { rows: state.rows, column_kinds: state.column_kinds }
+    ClipboardTable {
+        rows: state.rows,
+        column_kinds: state.column_kinds,
+    }
 }
 
-fn inline_style_for_tag(
-    name: &str,
-    attrs: &[(String, String)],
-    css_style: &str,
-) -> InlineStyle {
+fn inline_style_for_tag(name: &str, attrs: &[(String, String)], css_style: &str) -> InlineStyle {
     let mut style = InlineStyle::default();
     match name {
         "b" | "strong" => style.weight = Some(FontWeight::BOLD),

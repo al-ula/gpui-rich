@@ -10,12 +10,6 @@ use crate::gpui::extension::{
 };
 use crate::gpui::shaper::{FontResolver, GpuiGlyphBackend, GpuiShaper};
 use crate::gpui::theme::RichTheme;
-use gpui_kit::{
-    App, Bounds, ClipboardItem, Context, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
-    Font, InteractiveElement, IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
-    MouseUpEvent, ParentElement, Pixels, Point as GpuiPoint, Render, ScrollDelta, ScrollEvent,
-    Styled, Task, UTF16Selection, Window, actions, div, point, px, size,
-};
 use crate::layout::{
     FlowLayout, Point, Rect, ShaperRunSpec, TableColumnDividerHit, pt_to_px,
     resolve_horizontal_metrics,
@@ -25,12 +19,18 @@ use crate::model::{
     ClipboardBlock, ClipboardFragment, CodecError, ColumnSpec, CommandDecision, CommandEffectKind,
     CommandMiddleware, CommandOutcome, CommandResolution, CommandSource, CrdtSyncBridge,
     DecorationProvider, DocPos, Document, DocumentCodec, DocumentSelection, DynamicDocumentCodec,
-    Edit, Edges, EncodedDocument, ExtensionCommand, ExtensionInvocation, History,
+    Edges, Edit, EncodedDocument, ExtensionCommand, ExtensionInvocation, History,
     HistoryMergeGroup, HorizontalLayout, ImageAssetId, InlineContent, InlineObject, InlineObjectId,
     InlineSpec, InlineStyle, InteractionPolicy, LinkTarget, ListKind, MarkKind, MoveDirection,
     MoveUnit, NamedStyle, NumberStyle, OBJECT_REPLACEMENT_UTF8_LEN, PathSegment, ReadOnly,
     ResolvedCommand, ResolvedTextStyle, RgbaColor, RichCommand, SelectionValue, SharedStr, Step,
     StyleId, SyncDelta, TextAlign, Transaction,
+};
+use gpui_kit::{
+    App, Bounds, ClipboardItem, Context, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
+    Font, InteractiveElement, IntoElement, KeyBinding, MouseButton, MouseDownEvent, MouseMoveEvent,
+    MouseUpEvent, ParentElement, Pixels, Point as GpuiPoint, Render, ScrollDelta, ScrollEvent,
+    Styled, Task, UTF16Selection, Window, actions, div, point, px, size,
 };
 use std::collections::HashMap;
 use std::ops::Range;
@@ -51,9 +51,9 @@ mod table;
 pub use actions::*;
 pub(crate) use input::image_resize_handle_rects;
 use input::{
-    extract_clipboard_fragment, extract_clipboard_html, is_external_uri,
-    last_text_pos_in_nodes, next_grapheme_boundary, next_word_boundary,
-    previous_grapheme_boundary, previous_word_boundary, table_cell_of,
+    extract_clipboard_fragment, extract_clipboard_html, is_external_uri, last_text_pos_in_nodes,
+    next_grapheme_boundary, next_word_boundary, previous_grapheme_boundary, previous_word_boundary,
+    table_cell_of,
 };
 
 const CARET_BLINK_PAUSE_DELAY: Duration = Duration::from_millis(500);
@@ -61,7 +61,6 @@ const CARET_SCROLL_MARGIN_PX: f32 = 28.0;
 const MAX_LIST_INDENT_LEVEL: u8 = 6;
 const CLIPBOARD_HTML_METADATA_KEY: &str = "gpui_rich_html";
 const CLIPBOARD_FRAGMENT_METADATA_KEY: &str = "gpui_rich_fragment_v1";
-
 
 /// Interactive viewer and rich text editor host for a non-paginated document.
 pub struct RichDocumentView {
@@ -296,10 +295,7 @@ impl RichDocumentView {
         let plain_text = fragment.to_plain_text_with(&formatter);
         let html = fragment.to_html_with(&formatter);
         let mut structured = fragment;
-        clipboard::attach_component_definitions(
-            &self.document.components,
-            &mut structured,
-        );
+        clipboard::attach_component_definitions(&self.document.components, &mut structured);
         let mut metadata_map = serde_json::Map::new();
         metadata_map.insert(
             CLIPBOARD_HTML_METADATA_KEY.to_owned(),
@@ -542,10 +538,7 @@ impl RichDocumentView {
     }
 
     /// Builder method attaching an ephemeral [`DecorationProvider`].
-    pub fn with_decoration_provider(
-        mut self,
-        provider: impl DecorationProvider + 'static,
-    ) -> Self {
+    pub fn with_decoration_provider(mut self, provider: impl DecorationProvider + 'static) -> Self {
         self.add_decoration_provider(provider);
         self
     }
@@ -818,7 +811,10 @@ impl RichDocumentView {
                             return false;
                         }
                         if let Some(timeout) = idle_timeout
-                            && cx.background_executor().now().saturating_duration_since(started_at)
+                            && cx
+                                .background_executor()
+                                .now()
+                                .saturating_duration_since(started_at)
                                 >= timeout
                         {
                             view.caret_visible = true;
@@ -883,7 +879,6 @@ impl RichDocumentView {
             px_y - origin_y + self.scroll_y,
         )
     }
-
 }
 
 impl Focusable for RichDocumentView {
@@ -1269,12 +1264,16 @@ impl Render for RichDocumentView {
             .on_action(cx.listener(|this, _: &DeleteTableRow, _window, cx| {
                 this.dispatch_command(RichCommand::DeleteTableRow, cx);
             }))
-            .on_action(cx.listener(|this, _: &InsertTableColumnBefore, _window, cx| {
-                this.dispatch_command(RichCommand::InsertTableColumn { after: false }, cx);
-            }))
-            .on_action(cx.listener(|this, _: &InsertTableColumnAfter, _window, cx| {
-                this.dispatch_command(RichCommand::InsertTableColumn { after: true }, cx);
-            }))
+            .on_action(
+                cx.listener(|this, _: &InsertTableColumnBefore, _window, cx| {
+                    this.dispatch_command(RichCommand::InsertTableColumn { after: false }, cx);
+                }),
+            )
+            .on_action(
+                cx.listener(|this, _: &InsertTableColumnAfter, _window, cx| {
+                    this.dispatch_command(RichCommand::InsertTableColumn { after: true }, cx);
+                }),
+            )
             .on_action(cx.listener(|this, _: &DeleteTableColumn, _window, cx| {
                 this.dispatch_command(RichCommand::DeleteTableColumn, cx);
             }))

@@ -157,10 +157,7 @@ impl ExtensionInvocation {
 
     /// Performs a checked borrow of the wrapped arguments as `C`.
     pub fn args<C: ExtensionCommand>(&self) -> Option<&C> {
-        if self.id != C::ID
-            || self.effect != C::Effect::KIND
-            || self.type_id != TypeId::of::<C>()
-        {
+        if self.id != C::ID || self.effect != C::Effect::KIND || self.type_id != TypeId::of::<C>() {
             return None;
         }
         (*self.args).as_any().downcast_ref::<C>()
@@ -295,11 +292,14 @@ pub enum RichCommand {
     SetZoom(f32),
     AdjustZoom(f32),
     ResetZoom,
-    ScrollBy { delta_x: f32, delta_y: f32 },
+    ScrollBy {
+        delta_x: f32,
+        delta_y: f32,
+    },
     ToggleDebugOverlay,
 
     // Navigation, selection, and reader interactions
-    SetSelection(Option<DocumentSelection>),
+    SetSelection(Option<Box<DocumentSelection>>),
     ClearSelection,
     SelectAll,
     SelectWordAt(DocPos),
@@ -829,7 +829,7 @@ pub enum CommandDecision {
     /// Abort command execution and report [`CommandOutcome::Cancelled`].
     Cancel,
     /// Substitute a different command for remaining middleware, policy, and execution.
-    Replace(RichCommand),
+    Replace(Box<RichCommand>),
 }
 
 /// Extension hook intercepting commands before execution and observing applied transactions.

@@ -2,8 +2,8 @@
 //! `gpui-kit` [`gpui_kit::base::Theme`] synchronization.
 
 use crate::gpui::shaper::rgba_to_hsla;
-use gpui_kit::{App, Hsla, base::Theme as GpuiBaseTheme, base::ThemeAppearance};
 use crate::model::{ChipKind, RgbaColor, TableBorderStyle};
+use gpui_kit::{App, Hsla, base::Theme as GpuiBaseTheme, base::ThemeAppearance};
 
 /// Color tokens for a single [`ChipKind`] smart chip pill.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -222,11 +222,7 @@ impl RichTheme {
     /// Derives a [`RichTheme`] from a `gpui-kit` base [`gpui_kit::base::Theme`].
     pub fn from_gpui_theme(theme: &GpuiBaseTheme) -> Self {
         let is_dark = theme.appearance == ThemeAppearance::Dark;
-        let mut resolved = if is_dark {
-            Self::dark()
-        } else {
-            Self::light()
-        };
+        let mut resolved = if is_dark { Self::dark() } else { Self::light() };
         let colors = &theme.tokens.colors;
 
         resolved.surface_background = colors.surface;

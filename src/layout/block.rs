@@ -1,6 +1,8 @@
 use crate::layout::geometry::{Insets, Point, Rect, pt_to_px};
 use crate::layout::line::{HitResult, ParagraphLayout, layout_paragraph};
-use crate::layout::shaper::{GlyphBackend, TextShaper, is_valid_custom_insets, is_valid_custom_size};
+use crate::layout::shaper::{
+    GlyphBackend, TextShaper, is_valid_custom_insets, is_valid_custom_size,
+};
 use crate::model::{
     BlockId, BlockKind, BlockNode, BlockShapeKind, CellVAlign, ColumnSpec, CustomPayload, Document,
     DocumentLayoutConfig, ListKind, NumberStyle, RgbaColor, SharedStr, StyleSheet, TableBlock,
@@ -228,9 +230,8 @@ impl<B: GlyphBackend> LayoutCache<B> {
                 && let Some(inline) = block.kind.inline_content()
             {
                 changed |= inline.objects.iter().any(|entry| {
-                    crate::model::footnote_reference_id(&entry.object).is_some_and(|id| {
-                        cache.footnote_numbers.get(&id) != numbers.get(&id)
-                    })
+                    crate::model::footnote_reference_id(&entry.object)
+                        .is_some_and(|id| cache.footnote_numbers.get(&id) != numbers.get(&id))
                 });
             }
             match &block.kind {
@@ -240,7 +241,12 @@ impl<B: GlyphBackend> LayoutCache<B> {
                     }
                 }
                 BlockKind::Grid { table, .. } => {
-                    for child in table.rows.iter().flat_map(|row| &row.cells).flat_map(|cell| &cell.blocks) {
+                    for child in table
+                        .rows
+                        .iter()
+                        .flat_map(|row| &row.cells)
+                        .flat_map(|cell| &cell.blocks)
+                    {
                         changed |= invalidate_changed(cache, next, changed_notes, child);
                     }
                 }
@@ -257,12 +263,17 @@ impl<B: GlyphBackend> LayoutCache<B> {
         if changed_notes.is_some() {
             self.footnote_numbers = Arc::new(next_notes);
         }
-        self.ordered_markers = next.into_iter().map(|(id, marker)| {
-            let marker = self.ordered_markers.remove(&id)
-                .filter(|previous| previous.as_ref() == marker)
-                .unwrap_or_else(|| Arc::from(marker));
-            (id, marker)
-        }).collect();
+        self.ordered_markers = next
+            .into_iter()
+            .map(|(id, marker)| {
+                let marker = self
+                    .ordered_markers
+                    .remove(&id)
+                    .filter(|previous| previous.as_ref() == marker)
+                    .unwrap_or_else(|| Arc::from(marker));
+                (id, marker)
+            })
+            .collect();
     }
 
     pub fn get_cached(
@@ -352,8 +363,15 @@ pub fn layout_block<S: TextShaper>(
             content,
         } => match kind.as_ref() {
             block_kinds::PARAGRAPH => {
-                let para =
-                    layout_paragraph(content, &block.style, sheet, config, max_width, zoom, shaper);
+                let para = layout_paragraph(
+                    content,
+                    &block.style,
+                    sheet,
+                    config,
+                    max_width,
+                    zoom,
+                    shaper,
+                );
                 let height = para.height;
                 BlockLayout {
                     id: block.id,
@@ -366,12 +384,22 @@ pub fn layout_block<S: TextShaper>(
                 }
             }
             block_kinds::HEADING => {
-                let heading = block.kind.heading_data().unwrap_or(crate::model::HeadingData {
-                    level: 1,
-                    collapsed: false,
-                });
-                let para =
-                    layout_paragraph(content, &block.style, sheet, config, max_width, zoom, shaper);
+                let heading = block
+                    .kind
+                    .heading_data()
+                    .unwrap_or(crate::model::HeadingData {
+                        level: 1,
+                        collapsed: false,
+                    });
+                let para = layout_paragraph(
+                    content,
+                    &block.style,
+                    sheet,
+                    config,
+                    max_width,
+                    zoom,
+                    shaper,
+                );
                 let height = para.height;
                 let chevron_size = pt_to_px(16.0, zoom);
                 let first_line_center = para
@@ -401,14 +429,24 @@ pub fn layout_block<S: TextShaper>(
                 }
             }
             block_kinds::LIST_ITEM => {
-                let item = block.kind.list_item_data().unwrap_or(crate::model::ListItemData {
-                    list_id: crate::model::ListId(1),
-                    kind: ListKind::Bullet,
-                    indent_level: 0,
-                    checked: None,
-                });
-                let para =
-                    layout_paragraph(content, &block.style, sheet, config, max_width, zoom, shaper);
+                let item = block
+                    .kind
+                    .list_item_data()
+                    .unwrap_or(crate::model::ListItemData {
+                        list_id: crate::model::ListId(1),
+                        kind: ListKind::Bullet,
+                        indent_level: 0,
+                        checked: None,
+                    });
+                let para = layout_paragraph(
+                    content,
+                    &block.style,
+                    sheet,
+                    config,
+                    max_width,
+                    zoom,
+                    shaper,
+                );
                 let height = para.height;
                 let marker = list_marker.map(str::to_string).unwrap_or_else(|| {
                     default_list_marker(item.kind, item.indent_level, 1, item.checked)
@@ -619,13 +657,8 @@ pub fn layout_block<S: TextShaper>(
                     kind: BlockLayoutKind::Table(t_layout),
                 }
             } else {
-                let raw_chrome = shaper.measure_custom_chrome(
-                    BlockShapeKind::Grid,
-                    kind,
-                    data,
-                    max_width,
-                    zoom,
-                );
+                let raw_chrome =
+                    shaper.measure_custom_chrome(BlockShapeKind::Grid, kind, data, max_width, zoom);
                 let chrome = if is_valid_custom_insets(raw_chrome) {
                     raw_chrome
                 } else {
@@ -759,8 +792,7 @@ fn layout_table<S: TextShaper>(
             let mut cy = 0.0f32;
             let mut prev_after = 0.0f32;
             for (bi, child) in cell.blocks.iter().enumerate() {
-                let layout =
-                    cache.get_or_layout(child, None, sheet, config, inner_w, zoom, shaper);
+                let layout = cache.get_or_layout(child, None, sheet, config, inner_w, zoom, shaper);
                 if bi > 0 {
                     cy += prev_after.max(layout.space_before_px);
                 }
@@ -874,15 +906,15 @@ fn resolve_column_widths(
     let mut ratio_sum = 0.0f32;
     let mut auto_count = 0usize;
 
-    for i in 0..col_count {
-        match specs.get(i).copied().unwrap_or(ColumnSpec::Auto) {
+    for (index, width) in widths.iter_mut().enumerate() {
+        match specs.get(index).copied().unwrap_or(ColumnSpec::Auto) {
             ColumnSpec::FixedPt(pt) => {
                 let px = pt_to_px(pt, zoom).max(32.0);
-                widths[i] = px;
+                *width = px;
                 fixed_sum += px;
             }
-            ColumnSpec::Ratio(r) => {
-                ratio_sum += r.max(0.05);
+            ColumnSpec::Ratio(ratio) => {
+                ratio_sum += ratio.max(0.05);
             }
             ColumnSpec::Auto => {
                 auto_count += 1;
@@ -892,14 +924,14 @@ fn resolve_column_widths(
 
     let remaining = (max_width - fixed_sum).max(col_count as f32 * 40.0);
     let total_weight = ratio_sum + auto_count as f32;
-    for i in 0..col_count {
-        match specs.get(i).copied().unwrap_or(ColumnSpec::Auto) {
+    for (index, width) in widths.iter_mut().enumerate() {
+        match specs.get(index).copied().unwrap_or(ColumnSpec::Auto) {
             ColumnSpec::FixedPt(_) => {}
-            ColumnSpec::Ratio(r) => {
-                widths[i] = (remaining * (r.max(0.05) / total_weight.max(0.01))).max(32.0);
+            ColumnSpec::Ratio(ratio) => {
+                *width = (remaining * (ratio.max(0.05) / total_weight.max(0.01))).max(32.0);
             }
             ColumnSpec::Auto => {
-                widths[i] = (remaining * (1.0 / total_weight.max(0.01))).max(32.0);
+                *width = (remaining * (1.0 / total_weight.max(0.01))).max(32.0);
             }
         }
     }

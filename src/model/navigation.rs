@@ -52,22 +52,12 @@ pub struct SearchMatch {
     pub block_id: BlockId,
     pub range: Range<usize>,
 }
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Default)]
 pub struct SearchState {
     pub query: String,
     pub options: SearchOptions,
     pub matches: Vec<SearchMatch>,
     pub active: Option<usize>,
-}
-impl Default for SearchState {
-    fn default() -> Self {
-        Self {
-            query: String::new(),
-            options: SearchOptions::default(),
-            matches: Vec::new(),
-            active: None,
-        }
-    }
 }
 impl SearchState {
     pub fn advance(&mut self, direction: NavigationDirection) -> Option<&SearchMatch> {

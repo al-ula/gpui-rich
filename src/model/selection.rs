@@ -51,6 +51,7 @@ pub enum Affinity {
     Downstream,
 }
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum DocumentSelection {
     Text {

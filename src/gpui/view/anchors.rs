@@ -1,10 +1,10 @@
 //! GPUI-side durable anchor resolution and command execution.
 use super::RichDocumentView;
-use gpui_kit::Context;
 use crate::model::{
     AnchorCommand, AnchorId, AnchorPosition, BlockId, BlockKind, BlockNode, BlockStyle,
     CommandOutcome, DocPos, Document, InlineContent, InlineStyle, Step, Transaction,
 };
+use gpui_kit::Context;
 
 /// Resolve a model bookmark to a fresh caret position. The caller passes the result to exact reveal.
 pub(super) fn resolve_anchor_position(

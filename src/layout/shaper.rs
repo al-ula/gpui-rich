@@ -92,7 +92,10 @@ pub struct ShapedSegment<B: GlyphBackend> {
 impl<B: GlyphBackend> ShapedSegment<B> {
     /// Looks up the x coordinate at a UTF-8 byte offset within this segment.
     pub fn x_at_byte(&self, local_byte: usize) -> f32 {
-        match self.x_for_byte.binary_search_by_key(&local_byte, |&(b, _)| b) {
+        match self
+            .x_for_byte
+            .binary_search_by_key(&local_byte, |&(b, _)| b)
+        {
             Ok(idx) => self.x_for_byte[idx].1,
             Err(0) => 0.0,
             Err(idx) if idx >= self.x_for_byte.len() => self.width,
@@ -120,19 +123,13 @@ pub struct InlineBoxMetrics {
 impl InlineBoxMetrics {
     /// Returns `true` when width and height are finite and nonnegative.
     pub fn is_valid(&self) -> bool {
-        self.width.is_finite()
-            && self.width >= 0.0
-            && self.height.is_finite()
-            && self.height >= 0.0
+        self.width.is_finite() && self.width >= 0.0 && self.height.is_finite() && self.height >= 0.0
     }
 }
 
 /// Returns `true` when both `width` and `height` are finite and nonnegative.
 pub fn is_valid_custom_size(size: Size) -> bool {
-    size.width.is_finite()
-        && size.width >= 0.0
-        && size.height.is_finite()
-        && size.height >= 0.0
+    size.width.is_finite() && size.width >= 0.0 && size.height.is_finite() && size.height >= 0.0
 }
 
 /// Returns `true` when all four chrome inset edges are finite and nonnegative.

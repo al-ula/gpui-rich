@@ -312,13 +312,17 @@ impl<B: GlyphBackend> VisualLine<B> {
                         let r = self.inline_box_rect(b);
                         (r.y, r.height.max(1.0))
                     }
-                    LineFragment::Tab(_) => {
-                        (self.baseline_y - self.ascent, (self.ascent + self.descent).max(1.0))
-                    }
+                    LineFragment::Tab(_) => (
+                        self.baseline_y - self.ascent,
+                        (self.ascent + self.descent).max(1.0),
+                    ),
                 };
             }
         }
-        (self.baseline_y - self.ascent, (self.ascent + self.descent).max(1.0))
+        (
+            self.baseline_y - self.ascent,
+            (self.ascent + self.descent).max(1.0),
+        )
     }
 }
 
@@ -483,10 +487,10 @@ impl<B: GlyphBackend> ParagraphLayout<B> {
             if offset < line.doc_range.end {
                 return idx;
             }
-            if offset == line.doc_range.end {
-                if is_last || !line.soft_wrapped || affinity == Affinity::Upstream {
-                    return idx;
-                }
+            if offset == line.doc_range.end
+                && (is_last || !line.soft_wrapped || affinity == Affinity::Upstream)
+            {
+                return idx;
             }
         }
         self.lines.len() - 1
@@ -503,7 +507,11 @@ impl<B: GlyphBackend> ParagraphLayout<B> {
         Rect::new(x, top, 2.0, height)
     }
 
-    pub fn selection_rects(&self, range: Range<usize>, include_trailing_newline: bool) -> Vec<Rect> {
+    pub fn selection_rects(
+        &self,
+        range: Range<usize>,
+        include_trailing_newline: bool,
+    ) -> Vec<Rect> {
         let mut rects = Vec::new();
         if range.is_empty() && !include_trailing_newline {
             return rects;
@@ -789,7 +797,8 @@ pub fn layout_paragraph<S: TextShaper>(
     break_points.dedup();
 
     // 3. Greedy line breaking with glyph slicing and emergency grapheme fallback.
-    let mut raw_lines: Vec<(Range<usize>, bool, Vec<LineFragment<S::Backend>>)> = Vec::new();
+    type RawVisualLine<B> = (Range<usize>, bool, Vec<LineFragment<B>>);
+    let mut raw_lines: Vec<RawVisualLine<S::Backend>> = Vec::new();
     let mut cur_frags: Vec<LineFragment<S::Backend>> = Vec::new();
     let mut cur_x = 0.0f32;
     let mut cur_line_start = 0usize;
@@ -1060,57 +1069,56 @@ fn itemize_and_shape<S: TextShaper>(
     let mut items = Vec::new();
     let mut pending_text: Vec<PendingRun> = Vec::new();
 
-    let flush_pending = |pending: &mut Vec<PendingRun>,
-                         out: &mut Vec<ShapedItem<S::Backend>>,
-                         shaper: &mut S| {
-        let (Some(first_run), Some(last_run)) = (pending.first(), pending.last()) else {
-            return;
+    let flush_pending =
+        |pending: &mut Vec<PendingRun>, out: &mut Vec<ShapedItem<S::Backend>>, shaper: &mut S| {
+            let (Some(first_run), Some(last_run)) = (pending.first(), pending.last()) else {
+                return;
+            };
+            let segment_start = first_run.doc_range.start;
+            let segment_end = last_run.doc_range.end;
+            let first = &first_run.resolved;
+            let bidi_level = first_run.bidi_level;
+            let font_size_px = pt_to_px(first.font_size_pt, zoom).max(1.0);
+            let baseline_shift_px = pt_to_px(first.baseline_shift_pt, zoom);
+
+            let run_specs: Vec<ShaperRunSpec> = pending
+                .iter()
+                .map(|run| {
+                    ShaperRunSpec::from_resolved(run.doc_range.len(), &run.resolved)
+                        .with_bidi_level(run.bidi_level)
+                })
+                .collect();
+            let decorations: Vec<DecorationSpan> = pending
+                .iter()
+                .filter(|run| {
+                    run.resolved.background.is_some()
+                        || run.resolved.underline.is_some()
+                        || run.resolved.strikethrough
+                        || run.resolved.inline_code
+                        || run.resolved.link.is_some()
+                })
+                .map(|run| DecorationSpan {
+                    doc_range: run.doc_range.clone(),
+                    background: run.resolved.background,
+                    underline: run.resolved.underline,
+                    strikethrough: run.resolved.strikethrough,
+                    inline_code: run.resolved.inline_code,
+                    link: run.resolved.link.clone(),
+                })
+                .collect();
+
+            let text_slice = content.text.get(segment_start..segment_end).unwrap_or("");
+            let segment = shaper.shape_segment(text_slice, font_size_px, &run_specs);
+            out.push(ShapedItem::Text {
+                doc_range: segment_start..segment_end,
+                font_size_px,
+                baseline_shift_px,
+                bidi_level,
+                segment,
+                decorations,
+            });
+            pending.clear();
         };
-        let segment_start = first_run.doc_range.start;
-        let segment_end = last_run.doc_range.end;
-        let first = &first_run.resolved;
-        let bidi_level = first_run.bidi_level;
-        let font_size_px = pt_to_px(first.font_size_pt, zoom).max(1.0);
-        let baseline_shift_px = pt_to_px(first.baseline_shift_pt, zoom);
-
-        let run_specs: Vec<ShaperRunSpec> = pending
-            .iter()
-            .map(|run| {
-                ShaperRunSpec::from_resolved(run.doc_range.len(), &run.resolved)
-                    .with_bidi_level(run.bidi_level)
-            })
-            .collect();
-        let decorations: Vec<DecorationSpan> = pending
-            .iter()
-            .filter(|run| {
-                run.resolved.background.is_some()
-                    || run.resolved.underline.is_some()
-                    || run.resolved.strikethrough
-                    || run.resolved.inline_code
-                    || run.resolved.link.is_some()
-            })
-            .map(|run| DecorationSpan {
-                doc_range: run.doc_range.clone(),
-                background: run.resolved.background,
-                underline: run.resolved.underline,
-                strikethrough: run.resolved.strikethrough,
-                inline_code: run.resolved.inline_code,
-                link: run.resolved.link.clone(),
-            })
-            .collect();
-
-        let text_slice = content.text.get(segment_start..segment_end).unwrap_or("");
-        let segment = shaper.shape_segment(text_slice, font_size_px, &run_specs);
-        out.push(ShapedItem::Text {
-            doc_range: segment_start..segment_end,
-            font_size_px,
-            baseline_shift_px,
-            bidi_level,
-            segment,
-            decorations,
-        });
-        pending.clear();
-    };
 
     for span in &content.spans {
         let resolved = span.style.resolve(base_text);
@@ -1143,7 +1151,9 @@ fn itemize_and_shape<S: TextShaper>(
                         doc_range: abs_idx..(abs_idx + ch_len),
                     });
                 } else if let Some(entry) = content.object_at(abs_idx) {
-                    let object = shaper.resolve_inline_object(&entry.object).unwrap_or_else(|| entry.object.clone());
+                    let object = shaper
+                        .resolve_inline_object(&entry.object)
+                        .unwrap_or_else(|| entry.object.clone());
                     let raw_metrics = shaper.measure_inline_object(&object, zoom);
                     let metrics = if raw_metrics.is_valid() {
                         raw_metrics

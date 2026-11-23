@@ -63,7 +63,7 @@ impl RichDocumentView {
                     return CommandOutcome::Cancelled;
                 }
                 CommandDecision::Replace(replacement) => {
-                    current_command = replacement;
+                    current_command = *replacement;
                     resolution = self.extensions.resolve_command(&current_command);
                 }
             }
@@ -112,7 +112,10 @@ impl RichDocumentView {
         if !matches!(
             current_command,
             RichCommand::InsertText(_)
-                | RichCommand::Delete { direction: MoveDirection::Backward, unit: MoveUnit::Grapheme }
+                | RichCommand::Delete {
+                    direction: MoveDirection::Backward,
+                    unit: MoveUnit::Grapheme
+                }
         ) {
             self.pending_input_rule_undo = None;
         }
@@ -234,7 +237,7 @@ impl RichDocumentView {
             RichCommand::SetSelection(selection) => {
                 self.ime_preedit = None;
                 self.history.break_coalescing();
-                if self.update_selection(selection.clone(), cx) {
+                if self.update_selection(selection.as_deref().cloned(), cx) {
                     self.reset_caret_blink(cx);
                     CommandOutcome::Executed
                 } else {
@@ -459,7 +462,9 @@ impl RichDocumentView {
             }
             RichCommand::Navigation(command) => self.execute_navigation_command_inner(command, cx),
             RichCommand::Grid(command) => self.execute_grid_command(command, cx),
-            RichCommand::Component(command) => components::execute_component_command(self, command, cx),
+            RichCommand::Component(command) => {
+                components::execute_component_command(self, command, cx)
+            }
             RichCommand::Structure(command) => self.execute_structure_command(command, cx),
             RichCommand::Anchor(command) => self.execute_anchor_command(command, cx),
             RichCommand::Extension(invocation) => self.execute_extension_command(invocation, cx),
@@ -623,10 +628,16 @@ impl RichDocumentView {
             }
             MoveUnit::Paragraph => {
                 let target = match direction {
-                    MoveDirection::Backward | MoveDirection::Up => crate::model::NavigationTarget::PreviousParagraph,
-                    MoveDirection::Forward | MoveDirection::Down => crate::model::NavigationTarget::NextParagraph,
+                    MoveDirection::Backward | MoveDirection::Up => {
+                        crate::model::NavigationTarget::PreviousParagraph
+                    }
+                    MoveDirection::Forward | MoveDirection::Down => {
+                        crate::model::NavigationTarget::NextParagraph
+                    }
                 };
-                let Some(position) = crate::model::navigate_target(&self.document, &target, Some(&focus)) else {
+                let Some(position) =
+                    crate::model::navigate_target(&self.document, &target, Some(&focus))
+                else {
                     return CommandOutcome::NoOp;
                 };
                 self.pending_reveal = Some(position.clone());
@@ -661,7 +672,11 @@ impl RichDocumentView {
         }
     }
 
-    pub(super) fn execute_insert_text_inner(&mut self, raw_text: &str, cx: &mut Context<Self>) -> CommandOutcome {
+    pub(super) fn execute_insert_text_inner(
+        &mut self,
+        raw_text: &str,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
         let normalized = raw_text.replace("\r\n", "\n").replace('\r', "\n");
         let Some((anchor, focus, stored_marks)) = self.active_text_selection() else {
             return CommandOutcome::NoOp;
@@ -1141,13 +1156,7 @@ impl RichDocumentView {
             next_style.indent_start_pt = 24.0 * (next_level as f32 + 1.0);
             let Some(transaction) = self.document.build_convert_block_transaction(
                 block_id,
-                BlockKind::list_item(
-                    item.list_id,
-                    item.kind,
-                    next_level,
-                    item.checked,
-                    content,
-                ),
+                BlockKind::list_item(item.list_id, item.kind, next_level, item.checked, content),
                 next_style,
                 selection_before.clone(),
                 selection_before,
@@ -1328,9 +1337,10 @@ impl RichDocumentView {
             let Some(inline) = block.kind.inline_content() else {
                 return CommandOutcome::NoOp;
             };
-            let base_style = block
-                .style
-                .resolved_base_text(&self.document.stylesheet, &self.document.config.default_style);
+            let base_style = block.style.resolved_base_text(
+                &self.document.stylesheet,
+                &self.document.config.default_style,
+            );
             let mut next_marks =
                 stored_marks.unwrap_or_else(|| inline.style_at_caret(focus.offset));
             let enabled = !next_marks.is_mark_active(mark, &base_style);
@@ -1355,9 +1365,10 @@ impl RichDocumentView {
             let Some(inline) = block.kind.inline_content() else {
                 continue;
             };
-            let base_style = block
-                .style
-                .resolved_base_text(&self.document.stylesheet, &self.document.config.default_style);
+            let base_style = block.style.resolved_base_text(
+                &self.document.stylesheet,
+                &self.document.config.default_style,
+            );
             let mapped = inline.mapped_spans_in_range(range, |style| {
                 style.set_mark(mark, target_enabled, &base_style);
             });
@@ -1720,7 +1731,9 @@ impl RichDocumentView {
                 )
             } else {
                 let indent = 24.0 * (f32::from(existing_indent) + 1.0);
-                let mut style = BlockStyle::default().with_indent(indent, 0.0).with_align(align);
+                let mut style = BlockStyle::default()
+                    .with_indent(indent, 0.0)
+                    .with_align(align);
                 style.space_after_pt = Some(4.0);
                 let checked = match target_kind {
                     ListKind::Checklist => Some(existing_checked.unwrap_or(false)),
@@ -1788,14 +1801,18 @@ impl RichDocumentView {
             };
         }
 
-        let component_step = clipboard::import_component_definitions(
-            &self.document.components, &mut fragment,
-        ).map(|components| Step::SetComponents { components });
+        let component_step =
+            clipboard::import_component_definitions(&self.document.components, &mut fragment)
+                .map(|components| Step::SetComponents { components });
         let rectangle = matches!(self.selection, Some(DocumentSelection::TableCells { .. }));
-        let in_table = rectangle || self.selection.as_ref().is_some_and(|selection| match selection {
-            DocumentSelection::Text { focus, .. } => table_cell_of(focus).is_some(),
-            _ => false,
-        });
+        let in_table = rectangle
+            || self
+                .selection
+                .as_ref()
+                .is_some_and(|selection| match selection {
+                    DocumentSelection::Text { focus, .. } => table_cell_of(focus).is_some(),
+                    _ => false,
+                });
         let single_table = match fragment.blocks.as_slice() {
             [ClipboardBlock::Table(table)] | [ClipboardBlock::CustomGrid { table, .. }] => {
                 Some(table)
@@ -1813,7 +1830,8 @@ impl RichDocumentView {
         }
         if rectangle {
             let plain = plain_fallback.map_or_else(|| fragment.to_plain_text(), ToOwned::to_owned);
-            return self.execute_grid_command(&crate::model::GridCommand::PasteTsv { text: plain }, cx);
+            return self
+                .execute_grid_command(&crate::model::GridCommand::PasteTsv { text: plain }, cx);
         }
 
         let Some((anchor, focus, _)) = self.active_text_selection() else {
@@ -1917,7 +1935,11 @@ impl RichDocumentView {
                     range: split_offset..current_inline.len(),
                 });
             }
-            let first_inline = first_pasted.kind.inline_content().cloned().unwrap_or_default();
+            let first_inline = first_pasted
+                .kind
+                .inline_content()
+                .cloned()
+                .unwrap_or_default();
             let first_len = first_inline.len();
             if !first_inline.is_empty() {
                 steps.push(Step::InsertContent {
@@ -1944,7 +1966,9 @@ impl RichDocumentView {
                         target,
                         index: start_index + 1,
                         block: BlockNode::new(
-                            tail_id, BlockKind::paragraph(trailing_after_caret), BlockStyle::default(),
+                            tail_id,
+                            BlockKind::paragraph(trailing_after_caret),
+                            BlockStyle::default(),
                         ),
                     });
                     caret_block_id = tail_id;
@@ -2107,7 +2131,7 @@ impl RichDocumentView {
                     return CommandOutcome::NoOp;
                 }
                 self.document.reserve_block_ids_up_to(next_block_id);
-                let change_set = self.apply_transaction(transaction, true, cx);
+                let change_set = self.apply_transaction(*transaction, true, cx);
                 if change_set.dirty_blocks.is_empty() && !change_set.structure_changed {
                     CommandOutcome::NoOp
                 } else {
@@ -2317,9 +2341,10 @@ impl RichDocumentView {
             let Some(inline) = block.kind.inline_content() else {
                 continue;
             };
-            let base_style = block
-                .style
-                .resolved_base_text(&self.document.stylesheet, &self.document.config.default_style);
+            let base_style = block.style.resolved_base_text(
+                &self.document.stylesheet,
+                &self.document.config.default_style,
+            );
             for span in &inline.spans {
                 if span.range.end <= range.start || span.range.start >= range.end {
                     continue;
@@ -2369,9 +2394,10 @@ impl RichDocumentView {
         let block_id = pos.leaf_block_id()?;
         let block = self.document.find_block(block_id)?;
         let inline = block.kind.inline_content()?;
-        let base_style = block
-            .style
-            .resolved_base_text(&self.document.stylesheet, &self.document.config.default_style);
+        let base_style = block.style.resolved_base_text(
+            &self.document.stylesheet,
+            &self.document.config.default_style,
+        );
         let local_style = if is_collapsed {
             stored_marks.unwrap_or_else(|| inline.style_at_caret(pos.offset))
         } else {
@@ -2395,9 +2421,10 @@ impl RichDocumentView {
             let Some(inline) = block.kind.inline_content() else {
                 return false;
             };
-            let base_style = block
-                .style
-                .resolved_base_text(&self.document.stylesheet, &self.document.config.default_style);
+            let base_style = block.style.resolved_base_text(
+                &self.document.stylesheet,
+                &self.document.config.default_style,
+            );
             let style = stored_marks.unwrap_or_else(|| inline.style_at_caret(focus.offset));
             return style.is_mark_active(mark, &base_style);
         }
@@ -2520,9 +2547,10 @@ impl RichDocumentView {
             let Some(inline) = block.kind.inline_content() else {
                 return CommandOutcome::NoOp;
             };
-            let base_style = block
-                .style
-                .resolved_base_text(&self.document.stylesheet, &self.document.config.default_style);
+            let base_style = block.style.resolved_base_text(
+                &self.document.stylesheet,
+                &self.document.config.default_style,
+            );
             let mut next_marks =
                 stored_marks.unwrap_or_else(|| inline.style_at_caret(focus.offset));
             let current_pt = next_marks.font_size_pt.unwrap_or(base_style.font_size_pt);
@@ -2547,9 +2575,10 @@ impl RichDocumentView {
             let Some(inline) = block.kind.inline_content() else {
                 continue;
             };
-            let base_style = block
-                .style
-                .resolved_base_text(&self.document.stylesheet, &self.document.config.default_style);
+            let base_style = block.style.resolved_base_text(
+                &self.document.stylesheet,
+                &self.document.config.default_style,
+            );
             let mapped = inline.mapped_spans_in_range(range, |style| {
                 let current_pt = style.font_size_pt.unwrap_or(base_style.font_size_pt);
                 style.font_size_pt = Some((current_pt + delta_pt).clamp(6.0, 96.0));
@@ -2598,9 +2627,10 @@ impl RichDocumentView {
             let block_id = focus.leaf_block_id()?;
             let block = self.document.find_block(block_id)?;
             let inline = block.kind.inline_content()?;
-            let base_style = block
-                .style
-                .resolved_base_text(&self.document.stylesheet, &self.document.config.default_style);
+            let base_style = block.style.resolved_base_text(
+                &self.document.stylesheet,
+                &self.document.config.default_style,
+            );
             let local = stored_marks.unwrap_or_else(|| inline.style_at_caret(focus.offset));
             return Some(vec![local.resolve(&base_style)]);
         }
@@ -2617,9 +2647,10 @@ impl RichDocumentView {
             let Some(inline) = block.kind.inline_content() else {
                 continue;
             };
-            let base_style = block
-                .style
-                .resolved_base_text(&self.document.stylesheet, &self.document.config.default_style);
+            let base_style = block.style.resolved_base_text(
+                &self.document.stylesheet,
+                &self.document.config.default_style,
+            );
             for span in &inline.spans {
                 if span.range.end <= range.start || span.range.start >= range.end {
                     continue;
@@ -2739,7 +2770,11 @@ impl RichDocumentView {
         }
     }
 
-    fn first_pos_in_table_cell(&self, table_id: BlockId, cell_coords: (usize, usize)) -> Option<DocPos> {
+    fn first_pos_in_table_cell(
+        &self,
+        table_id: BlockId,
+        cell_coords: (usize, usize),
+    ) -> Option<DocPos> {
         let table = self.document.find_block(table_id)?.kind.table_block()?;
         let (_, placements, occupancy) = table.resolve_grid();
         let placement_idx = occupancy
@@ -2797,7 +2832,9 @@ impl RichDocumentView {
                     Some(next)
                 } else {
                     let visible_leaves = self.document.collect_visible_leaf_blocks();
-                    let current_index = visible_leaves.iter().position(|block| block.id == leaf_id)?;
+                    let current_index = visible_leaves
+                        .iter()
+                        .position(|block| block.id == leaf_id)?;
                     let prev_leaf = visible_leaves.get(current_index.checked_sub(1)?)?;
                     let prev_len = prev_leaf
                         .kind
@@ -2819,7 +2856,9 @@ impl RichDocumentView {
                     Some(next)
                 } else {
                     let visible_leaves = self.document.collect_visible_leaf_blocks();
-                    let current_index = visible_leaves.iter().position(|block| block.id == leaf_id)?;
+                    let current_index = visible_leaves
+                        .iter()
+                        .position(|block| block.id == leaf_id)?;
                     let next_leaf = visible_leaves.get(current_index + 1)?;
                     self.document.doc_pos_for_block(next_leaf.id, 0)
                 }
@@ -2871,7 +2910,7 @@ impl RichDocumentView {
         self.pending_reveal = None;
         self.selection = next_selection;
         cx.emit(RichDocumentEvent::SelectionChanged {
-            selection: self.selection.clone(),
+            selection: self.selection.clone().map(Box::new),
         });
         cx.notify();
         true
@@ -2922,5 +2961,4 @@ impl RichDocumentView {
         let fragment = self.selected_fragment()?;
         Some(fragment.to_html_with(&clipboard::ComponentClipboardFormatter::new(self)))
     }
-
 }

@@ -1,6 +1,5 @@
 //! Component command execution and custom inline display resolution.
 use super::*;
-use gpui_kit::StatefulInteractiveElement;
 use crate::model::{
     CustomPayload, InlineContent, InlineObject, Transaction,
     components::{
@@ -8,6 +7,7 @@ use crate::model::{
         VARIABLE_KIND,
     },
 };
+use gpui_kit::StatefulInteractiveElement;
 
 pub(super) fn execute_component_command(
     view: &mut RichDocumentView,

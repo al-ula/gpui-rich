@@ -296,7 +296,7 @@ pub enum RichDocumentEvent {
     CodeBlockCopied { block_id: BlockId },
     /// The active selection or caret changed.
     SelectionChanged {
-        selection: Option<DocumentSelection>,
+        selection: Option<Box<DocumentSelection>>,
     },
     /// A [`Transaction`] mutated the underlying [`Document`].
     DocumentMutated { change_set: ChangeSet },
@@ -310,4 +310,3 @@ pub enum RichDocumentEvent {
         outcome: CommandOutcome,
     },
 }
-

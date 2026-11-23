@@ -1,6 +1,5 @@
 use gpui_rich::model::*;
 
-
 #[test]
 fn inline_utf8_utf16_and_object_sentinels() {
     let mut content = InlineContent::empty();
@@ -31,7 +30,10 @@ fn inline_utf8_utf16_and_object_sentinels() {
 fn transaction_undo_redo_roundtrip() {
     let mut doc = Document::new();
     let mut inline = InlineContent::plain("Hello world");
-    inline.push_object(InlineObject::FootnoteRef { index: 1 }, InlineStyle::default());
+    inline.push_object(
+        InlineObject::FootnoteRef { index: 1 },
+        InlineStyle::default(),
+    );
     let p_id = doc.add_paragraph(inline, BlockStyle::default());
     let original = doc.clone();
 
@@ -58,21 +60,38 @@ fn transaction_undo_redo_roundtrip() {
     }]));
     history.push_inverse(applied2.inverse);
 
-    let text = &doc.find_block(p_id).unwrap().kind.inline_content().unwrap().text;
+    let text = &doc
+        .find_block(p_id)
+        .unwrap()
+        .kind
+        .inline_content()
+        .unwrap()
+        .text;
     assert!(text.starts_with("Hello world"));
 
     // Undo both transactions and verify full round-trip equality (excluding block version counter).
     history.undo(&mut doc).unwrap();
     history.undo(&mut doc).unwrap();
 
-    let orig_inline = original.find_block(p_id).unwrap().kind.inline_content().unwrap();
+    let orig_inline = original
+        .find_block(p_id)
+        .unwrap()
+        .kind
+        .inline_content()
+        .unwrap();
     let cur_inline = doc.find_block(p_id).unwrap().kind.inline_content().unwrap();
     assert_eq!(orig_inline, cur_inline);
 
     // Redo restores the edits cleanly.
     history.redo(&mut doc).unwrap();
     history.redo(&mut doc).unwrap();
-    let cur_spans = &doc.find_block(p_id).unwrap().kind.inline_content().unwrap().spans;
+    let cur_spans = &doc
+        .find_block(p_id)
+        .unwrap()
+        .kind
+        .inline_content()
+        .unwrap()
+        .spans;
     assert_eq!(cur_spans[0].range, 0..5);
     assert_eq!(cur_spans[0].style.weight, Some(FontWeight::BOLD));
 }
@@ -81,7 +100,10 @@ fn transaction_undo_redo_roundtrip() {
 fn document_json_serialization_roundtrip() {
     let mut doc = Document::new();
     doc.add_heading(1, InlineContent::plain("Architecture"));
-    doc.add_paragraph(InlineContent::plain("Non-paginated flow."), BlockStyle::default());
+    doc.add_paragraph(
+        InlineContent::plain("Non-paginated flow."),
+        BlockStyle::default(),
+    );
 
     let json = doc.to_json_pretty().unwrap();
     let parsed = Document::from_json(&json).unwrap();
@@ -168,7 +190,10 @@ fn interaction_policy_masks_children_without_overwriting_siblings_or_child_choic
     policy.reading.enabled = false;
     for command in [&bold, &add_row, &copy_code] {
         assert_eq!(policy.check_command(command, CommandSource::User), rejected);
-        assert_eq!(policy.check_command(command, CommandSource::Programmatic), None);
+        assert_eq!(
+            policy.check_command(command, CommandSource::Programmatic),
+            None
+        );
     }
     assert_eq!(policy.check_command(&insert, CommandSource::User), None);
 
@@ -207,7 +232,10 @@ fn container_aware_split_merge_and_coalesced_history() {
     let split_tx = doc
         .build_split_block_transaction(
             &split_pos,
-            Some(DocumentSelection::caret(split_pos.clone(), Affinity::Downstream)),
+            Some(DocumentSelection::caret(
+                split_pos.clone(),
+                Affinity::Downstream,
+            )),
         )
         .unwrap();
     let applied_split = doc.apply(split_tx);
@@ -230,7 +258,10 @@ fn container_aware_split_merge_and_coalesced_history() {
     let merge_tx = doc
         .build_merge_with_previous_transaction(
             &merge_pos,
-            Some(DocumentSelection::caret(merge_pos.clone(), Affinity::Downstream)),
+            Some(DocumentSelection::caret(
+                merge_pos.clone(),
+                Affinity::Downstream,
+            )),
         )
         .unwrap();
     let applied_merge = doc.apply(merge_tx);
@@ -366,14 +397,18 @@ fn mark_toggling_and_rich_html_clipboard_roundtrip() {
     let heading_id = document.add_heading(2, InlineContent::plain("Overview"));
     let mut body = InlineContent::empty();
     body.push_text("Hello ", InlineStyle::default());
-    body.push_text("bold", InlineStyle::bold().with_underline(UnderlineKind::Solid));
+    body.push_text(
+        "bold",
+        InlineStyle::bold().with_underline(UnderlineKind::Solid),
+    );
     body.push_text(" ", InlineStyle::default());
     body.push_text("link", InlineStyle::default().with_link("https://gpui.rs"));
     body.push_object(
         InlineObject::custom::<BadgeSpec>(BadgeData { text: "v2".into() }),
         InlineStyle::default(),
     );
-    let paragraph_id = document.add_paragraph(body, BlockStyle::default().with_align(TextAlign::Center));
+    let paragraph_id =
+        document.add_paragraph(body, BlockStyle::default().with_align(TextAlign::Center));
     let custom_block_id = document.add_leaf_block::<CalloutLeafSpec>(CalloutLeafData {
         tone: "info".into(),
     });
@@ -436,11 +471,22 @@ fn mark_toggling_and_rich_html_clipboard_roundtrip() {
     let html = fragment.to_html();
     let reparsed = ClipboardFragment::from_html(&html);
     assert_eq!(reparsed.blocks.len(), 2);
-    assert!(matches!(reparsed.blocks[0], ClipboardBlock::Heading { level: 2, .. }));
+    assert!(matches!(
+        reparsed.blocks[0],
+        ClipboardBlock::Heading { level: 2, .. }
+    ));
     if let ClipboardBlock::Paragraph { content, align } = &reparsed.blocks[1] {
         assert_eq!(*align, TextAlign::Center);
-        assert!(content.style_at(7).is_mark_active(MarkKind::Bold, &base_style));
-        assert!(content.style_at(7).is_mark_active(MarkKind::Underline, &base_style));
+        assert!(
+            content
+                .style_at(7)
+                .is_mark_active(MarkKind::Bold, &base_style)
+        );
+        assert!(
+            content
+                .style_at(7)
+                .is_mark_active(MarkKind::Underline, &base_style)
+        );
         assert_eq!(
             content.style_at(12).link.as_ref().map(|l| l.href.as_str()),
             Some("https://gpui.rs")
@@ -485,7 +531,10 @@ fn mark_toggling_and_rich_html_clipboard_roundtrip() {
         viewer.check_command(&mutating_custom, CommandSource::User),
         Some(CommandOutcome::RejectedReadOnly)
     );
-    assert_eq!(viewer.check_command(&readonly_custom, CommandSource::User), None);
+    assert_eq!(
+        viewer.check_command(&readonly_custom, CommandSource::User),
+        None
+    );
 }
 
 #[test]
@@ -615,7 +664,12 @@ fn table_editing_merge_split_row_col_and_undo_roundtrip() {
         .unwrap();
     let applied = doc.apply(merge_tx);
     history.push_inverse(applied.inverse);
-    let merged = doc.find_block(table_id).unwrap().kind.table_block().unwrap();
+    let merged = doc
+        .find_block(table_id)
+        .unwrap()
+        .kind
+        .table_block()
+        .unwrap();
     assert_eq!(merged.rows[0].cells.len(), 1);
     assert_eq!(merged.rows[0].cells[0].colspan, 2);
     assert_eq!(merged.rows[0].cells[0].blocks.len(), 2);
@@ -626,7 +680,12 @@ fn table_editing_merge_split_row_col_and_undo_roundtrip() {
         .unwrap();
     let applied = doc.apply(insert_col_tx);
     history.push_inverse(applied.inverse);
-    let after_col = doc.find_block(table_id).unwrap().kind.table_block().unwrap();
+    let after_col = doc
+        .find_block(table_id)
+        .unwrap()
+        .kind
+        .table_block()
+        .unwrap();
     assert_eq!(after_col.grid_col_count(), 3);
     assert_eq!(after_col.rows[0].cells[0].colspan, 3);
     assert_eq!(after_col.rows[1].cells.len(), 3);
@@ -637,7 +696,12 @@ fn table_editing_merge_split_row_col_and_undo_roundtrip() {
         .unwrap();
     let applied = doc.apply(split_tx);
     history.push_inverse(applied.inverse);
-    let after_split = doc.find_block(table_id).unwrap().kind.table_block().unwrap();
+    let after_split = doc
+        .find_block(table_id)
+        .unwrap()
+        .kind
+        .table_block()
+        .unwrap();
     assert_eq!(after_split.rows[0].cells.len(), 3);
     assert_eq!(after_split.rows[0].cells[0].colspan, 1);
 
@@ -647,14 +711,24 @@ fn table_editing_merge_split_row_col_and_undo_roundtrip() {
         .unwrap();
     let applied = doc.apply(insert_row_tx);
     history.push_inverse(applied.inverse);
-    let after_row = doc.find_block(table_id).unwrap().kind.table_block().unwrap();
+    let after_row = doc
+        .find_block(table_id)
+        .unwrap()
+        .kind
+        .table_block()
+        .unwrap();
     assert_eq!(after_row.rows.len(), 3);
 
     // Undo all 4 operations restores exact 2x2 table.
     for _ in 0..4 {
         history.undo(&mut doc).unwrap();
     }
-    let restored = doc.find_block(table_id).unwrap().kind.table_block().unwrap();
+    let restored = doc
+        .find_block(table_id)
+        .unwrap()
+        .kind
+        .table_block()
+        .unwrap();
     assert_eq!(restored.rows.len(), 2);
     assert_eq!(restored.rows[0].cells.len(), 2);
     assert_eq!(restored.rows[0].cells[0].colspan, 1);
@@ -777,7 +851,10 @@ fn main() {}
     let html_id = FormatId::new("html");
     let decoded = registry.decode_as(&markdown_id, source_md).unwrap();
     assert_eq!(decoded.blocks.len(), 8);
-    assert_eq!(decoded.blocks[0].kind.heading_data().map(|h| h.level), Some(1));
+    assert_eq!(
+        decoded.blocks[0].kind.heading_data().map(|h| h.level),
+        Some(1)
+    );
     assert!(matches!(
         decoded.blocks[2].kind.list_item_data(),
         Some(ListItemData {
@@ -951,9 +1028,7 @@ fn custom_payload_typed_raw_roundtrip_and_custom_container_editing() {
     // Splitting a paragraph inside a custom Container updates container children and bumps ancestor version.
     let before_version = doc.find_block(container_id).unwrap().version;
     let split_pos = doc.doc_pos_for_block(child_id, 6).unwrap();
-    let split_tx = doc
-        .build_split_block_transaction(&split_pos, None)
-        .unwrap();
+    let split_tx = doc.build_split_block_transaction(&split_pos, None).unwrap();
     let applied = doc.apply(split_tx);
     assert!(doc.find_block(container_id).unwrap().version > before_version);
     assert!(applied.change_set.dirty_blocks.contains(&container_id));
@@ -1034,7 +1109,10 @@ fn custom_node_json_fidelity_error_classification_and_fallible_serialization() {
     );
     assert!(matches!(
         corrupt_callout.read_data::<CalloutSpec>(),
-        Err(NodeDataError::InvalidData { kind: "callout", .. })
+        Err(NodeDataError::InvalidData {
+            kind: "callout",
+            ..
+        })
     ));
     assert!(matches!(
         corrupt_callout.read_data::<CalloutLeafSpec>(),
@@ -1045,8 +1123,14 @@ fn custom_node_json_fidelity_error_classification_and_fallible_serialization() {
         })
     ));
     assert!(matches!(
-        reparsed.find_block(unknown_id).unwrap().read_data::<CalloutSpec>(),
-        Err(NodeDataError::KindMismatch { expected: "callout", .. })
+        reparsed
+            .find_block(unknown_id)
+            .unwrap()
+            .read_data::<CalloutSpec>(),
+        Err(NodeDataError::KindMismatch {
+            expected: "callout",
+            ..
+        })
     ));
 
     // Typed payload serialization failure propagates an error instead of writing null.
@@ -1058,9 +1142,7 @@ fn custom_node_json_fidelity_error_classification_and_fallible_serialization() {
         }
     }
     impl<'de> serde::Deserialize<'de> for FailingPayload {
-        fn deserialize<D: serde::Deserializer<'de>>(
-            _deserializer: D,
-        ) -> Result<Self, D::Error> {
+        fn deserialize<D: serde::Deserializer<'de>>(_deserializer: D) -> Result<Self, D::Error> {
             Ok(Self)
         }
     }
@@ -1126,11 +1208,20 @@ fn nested_payload_edits_preserve_identity_update_ancestors_reject_stale_and_undo
         InlineStyle::default(),
     );
     let child_id = doc.alloc_block_id();
-    let child = BlockNode::new(child_id, BlockKind::paragraph(leaf_inline), BlockStyle::default());
+    let child = BlockNode::new(
+        child_id,
+        BlockKind::paragraph(leaf_inline),
+        BlockStyle::default(),
+    );
     let inner_card_id = doc.alloc_block_id();
     let inner_card = BlockNode::new(
         inner_card_id,
-        BlockKind::container::<CardSpec>(CardData { title: "Inner v1".into() }, vec![child]),
+        BlockKind::container::<CardSpec>(
+            CardData {
+                title: "Inner v1".into(),
+            },
+            vec![child],
+        ),
         BlockStyle::default(),
     );
     let outer_quote_id = doc.add_blockquote(vec![inner_card]);
@@ -1142,7 +1233,9 @@ fn nested_payload_edits_preserve_identity_update_ancestors_reject_stale_and_undo
     // Payload-only block edit preserves children and block ID, bumps ancestors, is non-structural.
     let applied = doc.apply(Transaction::new(vec![Step::update_block_data::<CardSpec>(
         inner_card_id,
-        CardData { title: "Inner v2".into() },
+        CardData {
+            title: "Inner v2".into(),
+        },
     )]));
     history.push_inverse(applied.inverse);
     assert!(!applied.change_set.structure_changed);
@@ -1151,42 +1244,72 @@ fn nested_payload_edits_preserve_identity_update_ancestors_reject_stale_and_undo
     assert!(doc.find_block(inner_card_id).unwrap().version > inner_v0);
     assert!(doc.find_block(outer_quote_id).unwrap().version > outer_v0);
     assert_eq!(
-        doc.find_block(inner_card_id).unwrap().kind.children().unwrap()[0].id,
+        doc.find_block(inner_card_id)
+            .unwrap()
+            .kind
+            .children()
+            .unwrap()[0]
+            .id,
         child_id
     );
     assert_eq!(
-        doc.find_block(inner_card_id).unwrap().read_data::<CardSpec>().unwrap().title,
+        doc.find_block(inner_card_id)
+            .unwrap()
+            .read_data::<CardSpec>()
+            .unwrap()
+            .title,
         "Inner v2"
     );
 
     // Stale wrong-kind block update is rejected without dirtying or changing data.
-    let stale_block = doc.apply(Transaction::new(vec![Step::update_block_data::<OtherLeafSpec>(
+    let stale_block = doc.apply(Transaction::new(vec![Step::update_block_data::<
+        OtherLeafSpec,
+    >(
         inner_card_id,
-        CardData { title: "Corrupted".into() },
+        CardData {
+            title: "Corrupted".into(),
+        },
     )]));
     assert!(stale_block.change_set.dirty_blocks.is_empty());
     assert_eq!(
-        doc.find_block(inner_card_id).unwrap().read_data::<CardSpec>().unwrap().title,
+        doc.find_block(inner_card_id)
+            .unwrap()
+            .read_data::<CardSpec>()
+            .unwrap()
+            .title,
         "Inner v2"
     );
 
     // Checked inline payload update preserves object ID and bumps ancestors.
-    let inline_edit = doc.apply(Transaction::new(vec![Step::update_inline_data::<StatusSpec>(
-        child_id,
-        badge_id,
-        StatusData { label: "Done".into() },
-    )]));
+    let inline_edit = doc.apply(Transaction::new(vec![
+        Step::update_inline_data::<StatusSpec>(
+            child_id,
+            badge_id,
+            StatusData {
+                label: "Done".into(),
+            },
+        ),
+    ]));
     history.push_inverse(inline_edit.inverse);
     assert!(!inline_edit.change_set.structure_changed);
     assert!(inline_edit.change_set.dirty_blocks.contains(&child_id));
     assert!(inline_edit.change_set.dirty_blocks.contains(&inner_card_id));
-    assert!(inline_edit.change_set.dirty_blocks.contains(&outer_quote_id));
+    assert!(
+        inline_edit
+            .change_set
+            .dirty_blocks
+            .contains(&outer_quote_id)
+    );
 
     // Stale wrong-kind inline update does not overwrite the badge.
-    let stale_inline = doc.apply(Transaction::new(vec![Step::update_inline_data::<OtherInlineSpec>(
+    let stale_inline = doc.apply(Transaction::new(vec![Step::update_inline_data::<
+        OtherInlineSpec,
+    >(
         child_id,
         badge_id,
-        StatusData { label: "Wrong".into() },
+        StatusData {
+            label: "Wrong".into(),
+        },
     )]));
     assert!(stale_inline.change_set.dirty_blocks.is_empty());
     assert_eq!(
@@ -1208,7 +1331,11 @@ fn nested_payload_edits_preserve_identity_update_ancestors_reject_stale_and_undo
     history.undo(&mut doc).unwrap();
     history.undo(&mut doc).unwrap();
     assert_eq!(
-        doc.find_block(inner_card_id).unwrap().read_data::<CardSpec>().unwrap().title,
+        doc.find_block(inner_card_id)
+            .unwrap()
+            .read_data::<CardSpec>()
+            .unwrap()
+            .title,
         "Inner v1"
     );
     assert_eq!(
@@ -1260,7 +1387,12 @@ fn versioned_clipboard_preserves_custom_grid_open_edges_and_rejects_malformed() 
         }],
         border_style: TableBorderStyle::default(),
     };
-    doc.add_grid_block::<SheetGridSpec>(SheetMeta { sheet_name: "Q4".into() }, table);
+    doc.add_grid_block::<SheetGridSpec>(
+        SheetMeta {
+            sheet_name: "Q4".into(),
+        },
+        table,
+    );
     let after_id = doc.add_paragraph(InlineContent::plain("gamma delta"), BlockStyle::default());
 
     let selection = DocumentSelection::Text {
@@ -1285,13 +1417,19 @@ fn versioned_clipboard_preserves_custom_grid_open_edges_and_rejects_malformed() 
     // Destination materialization allocates fresh IDs and preserves custom grid data.
     let mut destination = Document::new();
     let nodes = decoded.to_block_nodes(&mut destination);
-    assert_eq!(nodes[1].read_data::<SheetGridSpec>().unwrap().sheet_name, "Q4");
+    assert_eq!(
+        nodes[1].read_data::<SheetGridSpec>().unwrap().sheet_name,
+        "Q4"
+    );
 
     // Unsupported version and broken UTF-8 span boundaries are rejected.
     let bad_version = encoded.replace("\"version\":1", "\"version\":99");
     assert!(matches!(
         ClipboardFragment::from_versioned_json(&bad_version),
-        Err(ClipboardFragmentError::UnsupportedVersion { found: 99, expected: 1 })
+        Err(ClipboardFragmentError::UnsupportedVersion {
+            found: 99,
+            expected: 1
+        })
     ));
     let valid_unicode = ClipboardFragment::from_blocks(vec![ClipboardBlock::Paragraph {
         content: InlineContent::plain("é"),
@@ -1311,7 +1449,10 @@ fn extension_command_wire_rejection_checked_decorations_and_ambiguous_codecs() {
     // Built-in commands round-trip; extension commands reject serialization; legacy Custom rejects deserialization.
     let builtin = RichCommand::InsertText("hi".into());
     let builtin_json = serde_json::to_string(&builtin).unwrap();
-    assert_eq!(serde_json::from_str::<RichCommand>(&builtin_json).unwrap(), builtin);
+    assert_eq!(
+        serde_json::from_str::<RichCommand>(&builtin_json).unwrap(),
+        builtin
+    );
 
     #[derive(Debug)]
     struct LocalCmd(#[allow(dead_code)] u32);
@@ -1363,9 +1504,15 @@ fn extension_command_wire_rejection_checked_decorations_and_ambiguous_codecs() {
     struct AltMarkdownCodec;
     impl DocumentCodec for AltMarkdownCodec {
         type Format = AltMarkdownFormat;
-        fn format_id(&self) -> &str { "alt-markdown" }
-        fn mime_types(&self) -> &[&str] { &["text/markdown"] }
-        fn file_extensions(&self) -> &[&str] { &["md"] }
+        fn format_id(&self) -> &str {
+            "alt-markdown"
+        }
+        fn mime_types(&self) -> &[&str] {
+            &["text/markdown"]
+        }
+        fn file_extensions(&self) -> &[&str] {
+            &["md"]
+        }
         fn encode(&self, _doc: &Document) -> Result<EncodedDocument<Self::Format>, CodecError> {
             Ok(EncodedDocument::from_raw(""))
         }

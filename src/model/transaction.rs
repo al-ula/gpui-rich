@@ -214,14 +214,26 @@ impl Document {
 
         let has_bookmarks = self.anchors.bookmarks().next().is_some();
         let original_block_order = (has_bookmarks
-            && tx.steps.iter().any(|step| matches!(
-                step,
-                Step::RemoveBlock { .. } | Step::RemoveBlockIn { .. } | Step::SetBlockKind { .. }
-            )))
-            .then(|| self.collect_leaf_blocks().into_iter().map(|block| block.id).collect::<Vec<_>>());
+            && tx.steps.iter().any(|step| {
+                matches!(
+                    step,
+                    Step::RemoveBlock { .. }
+                        | Step::RemoveBlockIn { .. }
+                        | Step::SetBlockKind { .. }
+                )
+            }))
+        .then(|| {
+            self.collect_leaf_blocks()
+                .into_iter()
+                .map(|block| block.id)
+                .collect::<Vec<_>>()
+        });
         let anchors_before = (has_bookmarks
-            || tx.steps.iter().any(|step| matches!(step, Step::SetAnchors { .. })))
-            .then(|| self.anchors.clone());
+            || tx
+                .steps
+                .iter()
+                .any(|step| matches!(step, Step::SetAnchors { .. })))
+        .then(|| self.anchors.clone());
 
         for step in tx.steps {
             let restore_inline_identity = matches!(&step, Step::RestoreInlineContent { .. });
@@ -301,7 +313,8 @@ impl Document {
                         None
                     };
                     if let Some((start, slice)) = removed {
-                        self.anchors.map_delete(block_id, start, start + slice.len());
+                        self.anchors
+                            .map_delete(block_id, start, start + slice.len());
                         change_set.mark_dirty(block_id);
                         self.bump_ancestors_of_block(block_id, &mut change_set);
                         inverse_steps.push(Step::RestoreInlineContent {
@@ -452,7 +465,9 @@ impl Document {
                     index,
                     block,
                 } => {
-                    let index = if target == ContainerTarget::Root && !crate::model::anchors::is_footnote_body(&block) {
+                    let index = if target == ContainerTarget::Root
+                        && !crate::model::anchors::is_footnote_body(&block)
+                    {
                         index.min(self.content_end_index())
                     } else {
                         index
@@ -537,16 +552,14 @@ impl Document {
                     object_id,
                     object,
                 } => {
-                    let previous = self
-                        .find_block_mut(block_id)
-                        .and_then(|block| {
-                            let prev = block
-                                .kind
-                                .inline_content_mut()?
-                                .update_object_checked(object_id, object)?;
-                            block.bump_version();
-                            Some(prev)
-                        });
+                    let previous = self.find_block_mut(block_id).and_then(|block| {
+                        let prev = block
+                            .kind
+                            .inline_content_mut()?
+                            .update_object_checked(object_id, object)?;
+                        block.bump_version();
+                        Some(prev)
+                    });
                     if let Some(previous_object) = previous {
                         change_set.mark_dirty(block_id);
                         self.bump_ancestors_of_block(block_id, &mut change_set);
@@ -580,36 +593,58 @@ impl Document {
                         change_set.structure_changed = true;
                     }
                 }
-                Step::MapSplitAnchors { block_id, offset, new_block_id } => {
+                Step::MapSplitAnchors {
+                    block_id,
+                    offset,
+                    new_block_id,
+                } => {
                     self.anchors.map_split(block_id, offset, new_block_id);
                 }
-                Step::MapMergeAnchors { block_id, offset, source_block_id, source_offset } => {
-                    self.anchors.map_merge_suffix(block_id, offset, source_block_id, source_offset);
+                Step::MapMergeAnchors {
+                    block_id,
+                    offset,
+                    source_block_id,
+                    source_offset,
+                } => {
+                    self.anchors
+                        .map_merge_suffix(block_id, offset, source_block_id, source_offset);
                 }
                 Step::SetComponents { components } => {
                     if self.components != components {
                         let previous = std::mem::replace(&mut self.components, components);
-                        let affected: Vec<_> = self.collect_leaf_blocks()
+                        let affected: Vec<_> = self
+                            .collect_leaf_blocks()
                             .into_iter()
-                            .filter(|block| block.kind.inline_content().is_some_and(|inline| {
-                                inline.objects.iter().any(|entry| {
-                                    let InlineObject::Custom { kind, data } = &entry.object else {
-                                        return false;
-                                    };
-                                    let Ok(payload) = data.as_json() else {
-                                        return false;
-                                    };
-                                    match kind.as_ref() {
-                                        crate::model::components::DROPDOWN_KIND => payload.get("definition_id")
-                                            .and_then(serde_json::Value::as_str)
-                                            .is_some_and(|id| previous.dropdowns.get(id) != self.components.dropdowns.get(id)),
-                                        crate::model::components::VARIABLE_KIND => payload.get("variable_id")
-                                            .and_then(serde_json::Value::as_str)
-                                            .is_some_and(|id| previous.variables.get(id) != self.components.variables.get(id)),
-                                        _ => false,
-                                    }
+                            .filter(|block| {
+                                block.kind.inline_content().is_some_and(|inline| {
+                                    inline.objects.iter().any(|entry| {
+                                        let InlineObject::Custom { kind, data } = &entry.object
+                                        else {
+                                            return false;
+                                        };
+                                        let Ok(payload) = data.as_json() else {
+                                            return false;
+                                        };
+                                        match kind.as_ref() {
+                                            crate::model::components::DROPDOWN_KIND => payload
+                                                .get("definition_id")
+                                                .and_then(serde_json::Value::as_str)
+                                                .is_some_and(|id| {
+                                                    previous.dropdowns.get(id)
+                                                        != self.components.dropdowns.get(id)
+                                                }),
+                                            crate::model::components::VARIABLE_KIND => payload
+                                                .get("variable_id")
+                                                .and_then(serde_json::Value::as_str)
+                                                .is_some_and(|id| {
+                                                    previous.variables.get(id)
+                                                        != self.components.variables.get(id)
+                                                }),
+                                            _ => false,
+                                        }
+                                    })
                                 })
-                            }))
+                            })
                             .map(|block| block.id)
                             .collect();
                         for block_id in affected {
@@ -620,15 +655,23 @@ impl Document {
                             self.bump_ancestors_of_block(block_id, &mut change_set);
                         }
                         change_set.structure_changed = true;
-                        inverse_steps.push(Step::SetComponents { components: previous });
+                        inverse_steps.push(Step::SetComponents {
+                            components: previous,
+                        });
                     }
                 }
-                Step::SetListNumbering { block_id, numbering } => {
+                Step::SetListNumbering {
+                    block_id,
+                    numbering,
+                } => {
                     let previous = self.ordered_lists.set(block_id, numbering);
                     if previous != numbering {
                         change_set.mark_dirty(block_id);
                         change_set.structure_changed = true;
-                        inverse_steps.push(Step::SetListNumbering { block_id, numbering: previous });
+                        inverse_steps.push(Step::SetListNumbering {
+                            block_id,
+                            numbering: previous,
+                        });
                     }
                 }
             }
@@ -638,7 +681,9 @@ impl Document {
             self.repair_bookmarks_after_removal(&order);
         }
         inverse_steps.reverse();
-        if let Some(anchors) = anchors_before && anchors != self.anchors {
+        if let Some(anchors) = anchors_before
+            && anchors != self.anchors
+        {
             inverse_steps.push(Step::SetAnchors { anchors });
         }
         AppliedTransaction {
@@ -654,28 +699,56 @@ impl Document {
     fn repair_bookmarks_after_removal(&mut self, order: &[BlockId]) {
         use crate::model::anchors::AnchorPosition;
 
-        let repairs: Vec<_> = self.anchors.bookmarks().filter_map(|bookmark| {
-            let position = bookmark.position;
-            let text = |id| self.find_block(id)?.kind.inline_content();
-            if let Some(inline) = text(position.block_id) {
-                let offset = inline.text.floor_char_boundary(position.offset.min(inline.len()));
-                return (offset != position.offset).then_some((
-                    bookmark.id,
-                    Some(AnchorPosition { block_id: position.block_id, offset }),
-                ));
-            }
-            let fallback = order.iter().position(|id| *id == position.block_id).and_then(|index| {
-                order[index + 1..].iter().find_map(|&id| {
-                    text(id).map(|_| AnchorPosition { block_id: id, offset: 0 })
-                }).or_else(|| order[..index].iter().rev().find_map(|&id| {
-                    text(id).map(|inline| AnchorPosition { block_id: id, offset: inline.len() })
-                }))
-            }).or_else(|| self.collect_leaf_blocks().first().map(|leaf| AnchorPosition {
-                block_id: leaf.id,
-                offset: 0,
-            }));
-            Some((bookmark.id, fallback))
-        }).collect();
+        let repairs: Vec<_> = self
+            .anchors
+            .bookmarks()
+            .filter_map(|bookmark| {
+                let position = bookmark.position;
+                let text = |id| self.find_block(id)?.kind.inline_content();
+                if let Some(inline) = text(position.block_id) {
+                    let offset = inline
+                        .text
+                        .floor_char_boundary(position.offset.min(inline.len()));
+                    return (offset != position.offset).then_some((
+                        bookmark.id,
+                        Some(AnchorPosition {
+                            block_id: position.block_id,
+                            offset,
+                        }),
+                    ));
+                }
+                let fallback = order
+                    .iter()
+                    .position(|id| *id == position.block_id)
+                    .and_then(|index| {
+                        order[index + 1..]
+                            .iter()
+                            .find_map(|&id| {
+                                text(id).map(|_| AnchorPosition {
+                                    block_id: id,
+                                    offset: 0,
+                                })
+                            })
+                            .or_else(|| {
+                                order[..index].iter().rev().find_map(|&id| {
+                                    text(id).map(|inline| AnchorPosition {
+                                        block_id: id,
+                                        offset: inline.len(),
+                                    })
+                                })
+                            })
+                    })
+                    .or_else(|| {
+                        self.collect_leaf_blocks()
+                            .first()
+                            .map(|leaf| AnchorPosition {
+                                block_id: leaf.id,
+                                offset: 0,
+                            })
+                    });
+                Some((bookmark.id, fallback))
+            })
+            .collect();
         for (id, fallback) in repairs {
             if let Some(position) = fallback {
                 self.anchors.set_bookmark_position(id, position);
@@ -941,12 +1014,10 @@ impl Document {
             offset: 0,
         };
 
-        Some(
-            Transaction::new(steps).with_selections(
-                selection_before,
-                Some(DocumentSelection::caret(next_pos, Affinity::Downstream)),
-            ),
-        )
+        Some(Transaction::new(steps).with_selections(
+            selection_before,
+            Some(DocumentSelection::caret(next_pos, Affinity::Downstream)),
+        ))
     }
 
     /// Builds a container-aware transaction merging the block at `pos` into its preceding sibling
@@ -979,10 +1050,7 @@ impl Document {
                     next_style,
                 )
             } else {
-                (
-                    BlockKind::paragraph(content.clone()),
-                    BlockStyle::default(),
-                )
+                (BlockKind::paragraph(content.clone()), BlockStyle::default())
             };
             return self.build_convert_block_transaction(
                 leaf_id,
@@ -1035,12 +1103,10 @@ impl Document {
         });
 
         let next_pos = self.doc_pos_for_block(prev_block.id, join_offset)?;
-        Some(
-            Transaction::new(steps).with_selections(
-                selection_before,
-                Some(DocumentSelection::caret(next_pos, Affinity::Downstream)),
-            ),
-        )
+        Some(Transaction::new(steps).with_selections(
+            selection_before,
+            Some(DocumentSelection::caret(next_pos, Affinity::Downstream)),
+        ))
     }
 
     /// Builds a container-aware transaction merging the next sibling into the block at `pos`
@@ -1079,12 +1145,10 @@ impl Document {
             index: block_index + 1,
         });
 
-        Some(
-            Transaction::new(steps).with_selections(
-                selection_before,
-                Some(DocumentSelection::caret(pos.clone(), Affinity::Downstream)),
-            ),
-        )
+        Some(Transaction::new(steps).with_selections(
+            selection_before,
+            Some(DocumentSelection::caret(pos.clone(), Affinity::Downstream)),
+        ))
     }
 
     /// Builds a transaction converting `block_id` to `new_kind` and `new_style`.
@@ -1206,9 +1270,7 @@ impl Document {
         );
 
         let selection_after = first_new_para_id
-            .and_then(|para_id| {
-                self.table_cell_doc_pos(table_id, insert_at, 0, para_id, 0)
-            })
+            .and_then(|para_id| self.table_cell_doc_pos(table_id, insert_at, 0, para_id, 0))
             .map(|pos| DocumentSelection::caret(pos, Affinity::Downstream));
 
         Some(
@@ -1474,9 +1536,13 @@ impl Document {
         next_table.column_kinds = std::mem::take(&mut next_table.column_kinds)
             .into_iter()
             .filter_map(|(column, kind)| {
-                if column < start_col { Some((column, kind)) }
-                else if column >= end_col { Some((column - (end_col - start_col), kind)) }
-                else { None }
+                if column < start_col {
+                    Some((column, kind))
+                } else if column >= end_col {
+                    Some((column - (end_col - start_col), kind))
+                } else {
+                    None
+                }
             })
             .collect();
 
@@ -1697,10 +1763,9 @@ impl Document {
             return None;
         };
         let (_, placements, _) = table.resolve_grid();
-        let target = placements
-            .iter()
-            .copied()
-            .find(|placement| placement.row_index == row_index && placement.cell_index == cell_index)?;
+        let target = placements.iter().copied().find(|placement| {
+            placement.row_index == row_index && placement.cell_index == cell_index
+        })?;
         if target.colspan <= 1 && target.rowspan <= 1 {
             return None;
         }
@@ -1955,7 +2020,7 @@ impl History {
         if can_coalesce && let Some(previous) = self.undo_stack.last_mut() {
             // Execute the newer inverse first so undoing reverses edits in strict LIFO order.
             let mut combined_steps = inverse.steps;
-            combined_steps.extend(previous.inverse.steps.drain(..));
+            combined_steps.append(&mut previous.inverse.steps);
             previous.inverse.steps = combined_steps;
             if inverse.selection_before.is_some() {
                 previous.inverse.selection_before = inverse.selection_before;

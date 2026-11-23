@@ -231,9 +231,15 @@ pub enum CodecError {
         candidates: Vec<FormatId>,
     },
     /// Input could not be parsed by the codec.
-    Parse { format_id: FormatId, message: String },
+    Parse {
+        format_id: FormatId,
+        message: String,
+    },
     /// Document could not be serialized by the codec.
-    Serialize { format_id: FormatId, message: String },
+    Serialize {
+        format_id: FormatId,
+        message: String,
+    },
 }
 
 impl CodecError {
@@ -258,16 +264,25 @@ impl fmt::Display for CodecError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::DuplicateFormatId { format_id } => {
-                write!(formatter, "duplicate document codec format ID '{format_id}'")
+                write!(
+                    formatter,
+                    "duplicate document codec format ID '{format_id}'"
+                )
             }
             Self::UnknownFormatId { format_id } => {
                 write!(formatter, "unknown document codec format ID '{format_id}'")
             }
             Self::UnknownMimeType { mime_type } => {
-                write!(formatter, "no document codec registered for MIME type '{mime_type}'")
+                write!(
+                    formatter,
+                    "no document codec registered for MIME type '{mime_type}'"
+                )
             }
             Self::UnknownFileExtension { extension } => {
-                write!(formatter, "no document codec registered for file extension '{extension}'")
+                write!(
+                    formatter,
+                    "no document codec registered for file extension '{extension}'"
+                )
             }
             Self::AmbiguousMimeType {
                 mime_type,
@@ -294,10 +309,16 @@ impl fmt::Display for CodecError {
                     .join(", ")
             ),
             Self::Parse { format_id, message } => {
-                write!(formatter, "codec '{format_id}' failed to parse input: {message}")
+                write!(
+                    formatter,
+                    "codec '{format_id}' failed to parse input: {message}"
+                )
             }
             Self::Serialize { format_id, message } => {
-                write!(formatter, "codec '{format_id}' failed to serialize document: {message}")
+                write!(
+                    formatter,
+                    "codec '{format_id}' failed to serialize document: {message}"
+                )
             }
         }
     }
@@ -505,11 +526,7 @@ impl CodecRegistry {
     }
 
     /// Decodes raw `input` using the codec registered for `format_id`.
-    pub fn decode_as(
-        &self,
-        format_id: &FormatId,
-        input: &str,
-    ) -> Result<Document, CodecError> {
+    pub fn decode_as(&self, format_id: &FormatId, input: &str) -> Result<Document, CodecError> {
         let codec = self.get(format_id)?;
         codec.decode_raw(input)
     }
@@ -894,9 +911,7 @@ fn encode_markdown_inline(content: &InlineContent) -> String {
                 && let Some(entry) = content.object_at(abs_idx)
             {
                 match &entry.object {
-                    InlineObject::Image {
-                        asset_id, alt, ..
-                    } => {
+                    InlineObject::Image { asset_id, alt, .. } => {
                         inner.push_str(&format!("![{alt}]({asset_id})"));
                     }
                     InlineObject::SmartChip { label, .. } => {
@@ -919,7 +934,10 @@ fn encode_markdown_inline(content: &InlineContent) -> String {
         if style.inline_code == Some(true) {
             formatted = format!("`{formatted}`");
         } else {
-            if style.weight.is_some_and(|weight| weight >= FontWeight::BOLD) {
+            if style
+                .weight
+                .is_some_and(|weight| weight >= FontWeight::BOLD)
+            {
                 formatted = format!("**{formatted}**");
             }
             if style.italic == Some(true) {
@@ -1472,10 +1490,7 @@ fn parse_markdown_inline_into(input: &str, active_style: &InlineStyle, output: &
             && let Ok(index) = rest[2..(2 + close_rel)].parse::<u32>()
         {
             flush_plain(&mut plain_buffer, output);
-            output.push_object(
-                InlineObject::FootnoteRef { index },
-                active_style.clone(),
-            );
+            output.push_object(InlineObject::FootnoteRef { index }, active_style.clone());
             cursor += close_rel + 3;
             continue;
         }
@@ -1579,7 +1594,11 @@ fn parse_md_link_or_image(input: &str, open_len: usize) -> Option<(&str, &str, u
 
 fn parse_inline_html_tag(input: &str) -> Option<(&str, usize, InlineStyle)> {
     for (open, close, overlay) in [
-        ("<u>", "</u>", InlineStyle::default().with_underline(UnderlineKind::Solid)),
+        (
+            "<u>",
+            "</u>",
+            InlineStyle::default().with_underline(UnderlineKind::Solid),
+        ),
         (
             "<sup>",
             "</sup>",

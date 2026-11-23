@@ -201,7 +201,11 @@ impl ClipboardFragment {
                 align: TextAlign::Left,
             })
             .collect();
-        Self { blocks, start_open: false, end_open: false }
+        Self {
+            blocks,
+            start_open: false,
+            end_open: false,
+        }
     }
 
     /// Serializes this fragment as plain UTF-8 text (TSV for tables) with default custom fallbacks.
@@ -265,7 +269,11 @@ impl ClipboardFragment {
     }
     /// Builds a structured fragment from already-normalized blocks.
     pub fn from_blocks(blocks: Vec<ClipboardBlock>) -> Self {
-        Self { blocks, start_open: false, end_open: false }
+        Self {
+            blocks,
+            start_open: false,
+            end_open: false,
+        }
     }
 
     /// Whether both edges can merge into surrounding text without paragraph boundaries.
@@ -416,20 +424,27 @@ impl Document {
                 let mut col_min = anchor_cell.1.min(focus_cell.1).min(col_count - 1);
                 let mut col_max = anchor_cell.1.max(focus_cell.1).min(col_count - 1);
                 loop {
-                    let previous = (row_min, row_max, col_min, col_max);
-                    for row in row_min..=row_max {
-                        for col in col_min..=col_max {
-                            let Some(placement_index) = occupancy[row][col] else {
+                    let (start_row, end_row, start_col, end_col) =
+                        (row_min, row_max, col_min, col_max);
+                    for occupancy_row in occupancy.get(start_row..=end_row).into_iter().flatten() {
+                        for &placement_index in occupancy_row
+                            .get(start_col..=end_col)
+                            .into_iter()
+                            .flatten()
+                            .flatten()
+                        {
+                            let Some(placement) = placements.get(placement_index) else {
                                 continue;
                             };
-                            let placement = placements[placement_index];
                             row_min = row_min.min(placement.row_index);
                             row_max = row_max.max(placement.row_index + placement.rowspan - 1);
                             col_min = col_min.min(placement.visual_col);
                             col_max = col_max.max(placement.visual_col + placement.colspan - 1);
                         }
                     }
-                    if previous == (row_min, row_max, col_min, col_max) {
+                    if (start_row, end_row, start_col, end_col)
+                        == (row_min, row_max, col_min, col_max)
+                    {
                         break;
                     }
                 }
@@ -446,16 +461,26 @@ impl Document {
                         cells.push(ClipboardTableCell {
                             colspan: cell.colspan,
                             rowspan: cell.rowspan,
-                            blocks: cell.blocks.iter().map(block_node_to_clipboard_block).collect(),
+                            blocks: cell
+                                .blocks
+                                .iter()
+                                .map(block_node_to_clipboard_block)
+                                .collect(),
                         });
                     }
-                    rows.push(ClipboardTableRow { is_header: row.is_header, cells });
+                    rows.push(ClipboardTableRow {
+                        is_header: row.is_header,
+                        cells,
+                    });
                 }
                 Some(ClipboardFragment {
                     blocks: vec![ClipboardBlock::Table(ClipboardTable {
                         rows,
-                        column_kinds: table.column_kinds.range(col_min..=col_max)
-                            .map(|(&column, &kind)| (column - col_min, kind)).collect(),
+                        column_kinds: table
+                            .column_kinds
+                            .range(col_min..=col_max)
+                            .map(|(&column, &kind)| (column - col_min, kind))
+                            .collect(),
                     })],
                     start_open: false,
                     end_open: false,
@@ -552,8 +577,9 @@ impl Document {
                 }
                 let mut blocks = Vec::new();
                 for index in start_index..=end_index {
-                    for (_, _, structure) in
-                        full_structures.iter().filter(|(start, _, _)| *start == index)
+                    for (_, _, structure) in full_structures
+                        .iter()
+                        .filter(|(start, _, _)| *start == index)
                     {
                         blocks.push(structure.clone());
                     }
@@ -642,7 +668,11 @@ impl Document {
                     } else {
                         end_offset > 0 && end_offset < end_len
                     };
-                    Some(ClipboardFragment { blocks, start_open, end_open })
+                    Some(ClipboardFragment {
+                        blocks,
+                        start_open,
+                        end_open,
+                    })
                 }
             }
         }
@@ -702,10 +732,8 @@ fn block_node_to_clipboard_block(block: &BlockNode) -> ClipboardBlock {
             data,
             children,
         } => {
-            let mapped: Vec<ClipboardBlock> = children
-                .iter()
-                .map(block_node_to_clipboard_block)
-                .collect();
+            let mapped: Vec<ClipboardBlock> =
+                children.iter().map(block_node_to_clipboard_block).collect();
             if kind.as_ref() == block_kinds::BLOCKQUOTE {
                 ClipboardBlock::Blockquote(mapped)
             } else {
@@ -803,7 +831,10 @@ fn extract_partial_node(
             } else {
                 inline.len()
             };
-            Some(clipboard_text_block(block, inline.slice(slice_start..slice_end)))
+            Some(clipboard_text_block(
+                block,
+                inline.slice(slice_start..slice_end),
+            ))
         }
         BlockKind::Container {
             kind,
@@ -852,8 +883,7 @@ fn extract_partial_node(
                 let mut cells = Vec::new();
                 for cell in &row.cells {
                     let cell_start = *cursor;
-                    let cell_count: usize =
-                        cell.blocks.iter().map(block_text_leaf_count).sum();
+                    let cell_count: usize = cell.blocks.iter().map(block_text_leaf_count).sum();
                     if whole_cells {
                         if cell_count > 0
                             && cell_start <= end_index
@@ -862,7 +892,11 @@ fn extract_partial_node(
                             cells.push(ClipboardTableCell {
                                 colspan: cell.colspan,
                                 rowspan: cell.rowspan,
-                                blocks: cell.blocks.iter().map(block_node_to_clipboard_block).collect(),
+                                blocks: cell
+                                    .blocks
+                                    .iter()
+                                    .map(block_node_to_clipboard_block)
+                                    .collect(),
                             });
                         }
                         *cursor += cell_count;
@@ -1009,13 +1043,7 @@ fn clipboard_block_to_node(
             style.space_after_pt = Some(4.0);
             BlockNode::new(
                 id,
-                BlockKind::list_item(
-                    list_id,
-                    *kind,
-                    *indent_level,
-                    *checked,
-                    content.clone(),
-                ),
+                BlockKind::list_item(list_id, *kind, *indent_level, *checked, content.clone()),
                 style,
             )
         }
@@ -1241,10 +1269,7 @@ fn table_to_plain_text(table: &ClipboardTable, formatter: &dyn ClipboardCustomFo
         .join("\n")
 }
 
-fn block_to_plain_text(
-    block: &ClipboardBlock,
-    formatter: &dyn ClipboardCustomFormatter,
-) -> String {
+fn block_to_plain_text(block: &ClipboardBlock, formatter: &dyn ClipboardCustomFormatter) -> String {
     match block {
         ClipboardBlock::Paragraph { content, .. }
         | ClipboardBlock::Heading { content, .. }
@@ -1431,11 +1456,17 @@ mod clipboard_tests {
         };
         assert_eq!(table.rows.len(), 2);
         assert_eq!(
-            block_to_plain_text(&table.rows[0].cells[0].blocks[0], &DefaultClipboardFormatter),
+            block_to_plain_text(
+                &table.rows[0].cells[0].blocks[0],
+                &DefaultClipboardFormatter
+            ),
             "B"
         );
         assert_eq!(
-            block_to_plain_text(&table.rows[1].cells[0].blocks[0], &DefaultClipboardFormatter),
+            block_to_plain_text(
+                &table.rows[1].cells[0].blocks[0],
+                &DefaultClipboardFormatter
+            ),
             "C"
         );
         let expanded = document
@@ -1499,8 +1530,7 @@ mod clipboard_tests {
             BlockKind::table(table),
             BlockStyle::default(),
         ));
-        let after_id =
-            document.add_paragraph(InlineContent::plain("after"), BlockStyle::default());
+        let after_id = document.add_paragraph(InlineContent::plain("after"), BlockStyle::default());
         let selection = DocumentSelection::Text {
             anchor: document.doc_pos_for_block(before_id, 0).unwrap(),
             focus: document.doc_pos_for_block(after_id, 5).unwrap(),
@@ -1520,8 +1550,7 @@ mod clipboard_tests {
     #[test]
     fn selection_ending_at_next_block_start_keeps_the_boundary_closed() {
         let mut document = Document::new();
-        let first_id =
-            document.add_paragraph(InlineContent::plain("first"), BlockStyle::default());
+        let first_id = document.add_paragraph(InlineContent::plain("first"), BlockStyle::default());
         let second_id =
             document.add_paragraph(InlineContent::plain("second"), BlockStyle::default());
         let selection = DocumentSelection::Text {
@@ -1587,7 +1616,13 @@ mod clipboard_tests {
         let ClipboardBlock::Blockquote(children) = &fragment.blocks[0] else {
             panic!("expected a trimmed blockquote");
         };
-        assert_eq!(block_to_plain_text(&children[0], &DefaultClipboardFormatter), "rst");
-        assert_eq!(block_to_plain_text(&children[1], &DefaultClipboardFormatter), "sec");
+        assert_eq!(
+            block_to_plain_text(&children[0], &DefaultClipboardFormatter),
+            "rst"
+        );
+        assert_eq!(
+            block_to_plain_text(&children[1], &DefaultClipboardFormatter),
+            "sec"
+        );
     }
 }

@@ -8,8 +8,8 @@
 //! * Failures now return structured [`ImageAssetError`] values classifying missing assets,
 //!   provider failures, and decode failures while retaining their underlying causes.
 
-use gpui_kit::{Image, ImageFormat, RenderImage, SvgRenderer};
 use crate::model::ImageAssetId;
+use gpui_kit::{Image, ImageFormat, RenderImage, SvgRenderer};
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt;
@@ -117,13 +117,21 @@ impl ImageAssetError {
 impl fmt::Display for ImageAssetError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::NotFound { asset_id, .. } => write!(formatter, "image asset not found: {asset_id}"),
+            Self::NotFound { asset_id, .. } => {
+                write!(formatter, "image asset not found: {asset_id}")
+            }
             Self::Provider {
                 asset_id, message, ..
-            } => write!(formatter, "failed to load image asset '{asset_id}': {message}"),
+            } => write!(
+                formatter,
+                "failed to load image asset '{asset_id}': {message}"
+            ),
             Self::Decode {
                 asset_id, message, ..
-            } => write!(formatter, "failed to decode image asset '{asset_id}': {message}"),
+            } => write!(
+                formatter,
+                "failed to decode image asset '{asset_id}': {message}"
+            ),
         }
     }
 }

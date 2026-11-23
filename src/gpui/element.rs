@@ -2,23 +2,15 @@
 
 use crate::gpui::asset::{ImageAssetError, LoadedAsset};
 use crate::gpui::extension::{
-    BlockCallbackResult, CustomRenderOutput, DirectPaintCallback, ErasedBlockRenderer,
-    ErasedInlineRenderer, ExtensionDiagnostic, ExtensionNodeTarget, ExtensionRegistry,
-    InlineCallbackResult,
+    BlockCallbackResult, CustomRenderOutput, DirectPaintCallback, ErasedBlockRenderContext,
+    ErasedBlockRenderer, ErasedInlineRenderContext, ErasedInlineRenderer, ExtensionDiagnostic,
+    ExtensionNodeTarget, ExtensionRegistry, InlineCallbackResult,
 };
 use crate::gpui::shaper::{GpuiGlyphBackend, GpuiShaper, rgba_to_hsla};
 use crate::gpui::theme::RichTheme;
 use crate::gpui::view::{
     ActiveSmartChipPopover, ImageResizeCorner, ImePreedit, RichDocumentView,
     image_resize_handle_rects,
-};
-use gpui_kit::{
-    AnyElement, App, AvailableSpace, BorderStyle, Bounds, BoxShadow, ClipboardItem, ContentMask,
-    Corners, CursorStyle, Edges, Element, ElementId, ElementInputHandler, Entity, FocusHandle,
-    GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, InteractiveElement,
-    IntoElement, LayoutId, Length, MouseButton, ParentElement, Pixels, Point, SharedString,
-    StatefulInteractiveElement, StrikethroughStyle, Style, Styled, TextRun, UnderlineStyle, Window,
-    div, fill, outline, point, px, quad, size,
 };
 use crate::layout::{
     BlockLayout, BlockLayoutKind, HorizontalMetrics, InlineBoxFragment, Insets, LineFragment,
@@ -29,6 +21,14 @@ use crate::model::{
     Affinity, BlockId, BlockShapeKind, ChipKind, CustomPayload, DecorationContext,
     DecorationWriter, DocumentSelection, ImageAssetId, InlineDecoration, InlineObject,
     InlineObjectId, OverlayDecorationKind, RgbaColor, SharedStr, UnderlineKind,
+};
+use gpui_kit::{
+    AnyElement, App, AvailableSpace, BorderStyle, Bounds, BoxShadow, ClipboardItem, ContentMask,
+    Corners, CursorStyle, Edges, Element, ElementId, ElementInputHandler, Entity, FocusHandle,
+    GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, InteractiveElement,
+    IntoElement, LayoutId, Length, MouseButton, ParentElement, Pixels, Point, SharedString,
+    StatefulInteractiveElement, StrikethroughStyle, Style, Styled, TextRun, UnderlineStyle, Window,
+    div, fill, outline, point, px, quad, size,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -185,8 +185,8 @@ impl Element for RichDocumentElement {
         cx: &mut App,
     ) -> (LayoutId, Self::RequestLayoutState) {
         let mut style = Style::default();
-        style.size.width = Length::Definite(gpui_kit::relative(1.0).into());
-        style.size.height = Length::Definite(gpui_kit::relative(1.0).into());
+        style.size.width = Length::Definite(gpui_kit::relative(1.0));
+        style.size.height = Length::Definite(gpui_kit::relative(1.0));
         (window.request_layout(style, [], cx), ())
     }
 
@@ -252,7 +252,12 @@ impl Element for RichDocumentElement {
                 if viewport_width <= 1.0 || viewport_height <= 1.0 {
                     view.pending_reveal = Some(pos);
                 } else if let Some(rect) = view.flow.measure_caret_rect(
-                    &view.document, &pos, Affinity::Downstream, viewport_width, view.zoom, &mut shaper,
+                    &view.document,
+                    &pos,
+                    Affinity::Downstream,
+                    viewport_width,
+                    view.zoom,
+                    &mut shaper,
                 ) {
                     let max_y = (view.flow.total_height() - viewport_height).max(0.0);
                     if rect.x < view.scroll_x {
@@ -305,7 +310,8 @@ impl Element for RichDocumentElement {
                         continue;
                     };
                     let mut writer = DecorationWriter::new(block);
-                    view.navigation.write_decorations(leaf.block_id, &mut writer);
+                    view.navigation
+                        .write_decorations(leaf.block_id, &mut writer);
                     let context = DecorationContext {
                         document: &view.document,
                         block,
@@ -329,8 +335,10 @@ impl Element for RichDocumentElement {
                                 .paragraph
                                 .selection_rects(inline_decoration.range(), false)
                             {
-                                decoration_highlights
-                                    .push((rect.translate(leaf.origin_x, leaf.origin_y), background));
+                                decoration_highlights.push((
+                                    rect.translate(leaf.origin_x, leaf.origin_y),
+                                    background,
+                                ));
                             }
                         }
                     }
@@ -630,14 +638,16 @@ impl Element for RichDocumentElement {
             }
             let node_bounds = rect_to_bounds(custom_block.canvas_rect);
             match custom_block.renderer.render(
-                custom_block.shape,
-                custom_block.block_id,
-                &custom_block.kind,
-                &custom_block.data,
-                node_bounds,
-                custom_block.chrome,
-                zoom,
-                &theme,
+                ErasedBlockRenderContext {
+                    shape: custom_block.shape,
+                    block_id: custom_block.block_id,
+                    kind: &custom_block.kind,
+                    data: &custom_block.data,
+                    bounds: node_bounds,
+                    chrome: custom_block.chrome,
+                    zoom,
+                    theme: &theme,
+                },
                 window,
                 cx,
             ) {
@@ -678,14 +688,16 @@ impl Element for RichDocumentElement {
         for custom_block in foreground_custom_blocks {
             let node_bounds = rect_to_bounds(custom_block.canvas_rect);
             match custom_block.renderer.render(
-                custom_block.shape,
-                custom_block.block_id,
-                &custom_block.kind,
-                &custom_block.data,
-                node_bounds,
-                custom_block.chrome,
-                zoom,
-                &theme,
+                ErasedBlockRenderContext {
+                    shape: custom_block.shape,
+                    block_id: custom_block.block_id,
+                    kind: &custom_block.kind,
+                    data: &custom_block.data,
+                    bounds: node_bounds,
+                    chrome: custom_block.chrome,
+                    zoom,
+                    theme: &theme,
+                },
                 window,
                 cx,
             ) {
@@ -721,18 +733,21 @@ impl Element for RichDocumentElement {
         for custom_inline in pending_custom_inlines {
             let node_bounds = rect_to_bounds(custom_inline.canvas_rect);
             match custom_inline.renderer.render(
-                custom_inline.block_id,
-                custom_inline.object_id,
-                &custom_inline.kind,
-                &custom_inline.data,
-                node_bounds,
-                zoom,
-                &theme,
+                ErasedInlineRenderContext {
+                    block_id: custom_inline.block_id,
+                    object_id: custom_inline.object_id,
+                    kind: &custom_inline.kind,
+                    data: &custom_inline.data,
+                    bounds: node_bounds,
+                    zoom,
+                    theme: &theme,
+                },
                 window,
                 cx,
             ) {
                 InlineCallbackResult::Ok(Some(output)) => {
-                    handled_custom_inlines.insert((custom_inline.block_id, custom_inline.object_id));
+                    handled_custom_inlines
+                        .insert((custom_inline.block_id, custom_inline.object_id));
                     match output {
                         CustomRenderOutput::Element(mut element) => {
                             let available = size(
@@ -768,11 +783,14 @@ impl Element for RichDocumentElement {
         let popover_element = pending_chip_popover.map(|(popover, anchor_rect)| {
             let popover_w = 224.0f32;
             let dropdown = crate::gpui::view::components::build_dropdown_options(
-                &popover, self.view.clone(), &theme, cx,
+                &popover,
+                self.view.clone(),
+                &theme,
+                cx,
             );
-            let popover_h = dropdown.as_ref().map_or(84.0, |(_, count)| {
-                (14.0 + *count as f32 * 29.0).min(240.0)
-            });
+            let popover_h = dropdown
+                .as_ref()
+                .map_or(84.0, |(_, count)| (14.0 + *count as f32 * 29.0).min(240.0));
             let anchor_bounds = rect_to_bounds(anchor_rect);
             let anchor_left: f32 = anchor_bounds.origin.x.into();
             let anchor_bottom: f32 = (anchor_bounds.origin.y + anchor_bounds.size.height).into();
@@ -788,7 +806,15 @@ impl Element for RichDocumentElement {
                 (anchor_top - popover_h - 6.0).max(origin_y + 8.0)
             };
             let mut element = dropdown.map_or_else(
-                || build_smart_chip_popover_element(&popover, &theme, self.view.clone(), popover_w, popover_h),
+                || {
+                    build_smart_chip_popover_element(
+                        &popover,
+                        &theme,
+                        self.view.clone(),
+                        popover_w,
+                        popover_h,
+                    )
+                },
                 |(menu, _)| menu,
             );
             let available = size(
@@ -1019,22 +1045,10 @@ impl Element for RichDocumentElement {
                 ));
             }
             if let Some(selected_img) = &prepaint.selected_image_overlay {
-                paint_selected_image_handles(
-                    selected_img,
-                    theme,
-                    &canvas_to_window,
-                    window,
-                    cx,
-                );
+                paint_selected_image_handles(selected_img, theme, &canvas_to_window, window, cx);
             }
             if let Some(preedit_overlay) = &prepaint.preedit_overlay {
-                paint_ime_preedit(
-                    preedit_overlay,
-                    theme,
-                    &canvas_to_window,
-                    window,
-                    cx,
-                );
+                paint_ime_preedit(preedit_overlay, theme, &canvas_to_window, window, cx);
             } else if let Some(caret) = prepaint.caret_rect {
                 let top_left = canvas_to_window(caret.x.round(), caret.y.round());
                 window.paint_quad(fill(
@@ -1056,7 +1070,10 @@ impl Element for RichDocumentElement {
                 let progress = (prepaint.scroll_y / max_scroll).clamp(0.0, 1.0);
                 let thumb_y = origin_y + track_padding + progress * (track_height - thumb_height);
                 let thumb_bounds = Bounds::new(
-                    point(px(origin_x + viewport_width - thumb_width - 4.0), px(thumb_y)),
+                    point(
+                        px(origin_x + viewport_width - thumb_width - 4.0),
+                        px(thumb_y),
+                    ),
                     size(px(thumb_width), px(thumb_height)),
                 );
                 window.paint_quad(quad(
@@ -1080,7 +1097,10 @@ impl Element for RichDocumentElement {
                 let progress = (prepaint.scroll_x / max_scroll_x).clamp(0.0, 1.0);
                 let thumb_x = origin_x + track_padding + progress * (track_width - thumb_width);
                 let thumb_bounds = Bounds::new(
-                    point(px(thumb_x), px(origin_y + viewport_height - thumb_height - 4.0)),
+                    point(
+                        px(thumb_x),
+                        px(origin_y + viewport_height - thumb_height - 4.0),
+                    ),
                     size(px(thumb_width), px(thumb_height)),
                 );
                 window.paint_quad(quad(
@@ -1095,4 +1115,3 @@ impl Element for RichDocumentElement {
         });
     }
 }
-

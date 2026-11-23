@@ -46,7 +46,10 @@ impl DecorationProvider for RustSyntaxDecorationProvider {
         let text = content.text.as_str();
         let mut start: Option<usize> = None;
 
-        for (index, character) in text.char_indices().chain(std::iter::once((text.len(), ' '))) {
+        for (index, character) in text
+            .char_indices()
+            .chain(std::iter::once((text.len(), ' ')))
+        {
             let is_ident = character.is_ascii_alphanumeric() || character == '_';
             match (start, is_ident) {
                 (None, true) => start = Some(index),
@@ -66,13 +69,12 @@ impl DecorationProvider for RustSyntaxDecorationProvider {
                             .chars()
                             .next()
                             .is_some_and(|first| first.is_ascii_uppercase())
-                        {
-                            if let Err(error) = writer.push_inline(
+                            && let Err(error) = writer.push_inline(
                                 BlockByteRange::from_usize_range(word_start..index),
                                 InlineDecorationStyle::new().with_foreground(type_color),
-                            ) {
-                                eprintln!("docs_viewer: syntax decoration error: {error}");
-                            }
+                            )
+                        {
+                            eprintln!("docs_viewer: syntax decoration error: {error}");
                         }
                     }
                     start = None;
@@ -123,9 +125,21 @@ impl BlockRenderer for CalloutBlockRenderer {
         _cx: &mut App,
     ) -> Option<CustomRenderOutput> {
         let is_dark = context.theme.is_dark();
-        let card_bg = if is_dark { rgb(0x162235) } else { rgb(0xedf5ff) };
-        let card_border = if is_dark { rgb(0x388bfd) } else { rgb(0x8ab4f8) };
-        let title_color = if is_dark { rgb(0x79c0ff) } else { rgb(0x0b57d0) };
+        let card_bg = if is_dark {
+            rgb(0x162235)
+        } else {
+            rgb(0xedf5ff)
+        };
+        let card_border = if is_dark {
+            rgb(0x388bfd)
+        } else {
+            rgb(0x8ab4f8)
+        };
+        let title_color = if is_dark {
+            rgb(0x79c0ff)
+        } else {
+            rgb(0x0b57d0)
+        };
 
         let element = div()
             .size_full()
@@ -171,12 +185,7 @@ struct StatusBadgeRenderer;
 impl InlineRenderer for StatusBadgeRenderer {
     type Spec = StatusBadgeSpec;
 
-    fn measure(
-        &self,
-        data: &StatusBadgeData,
-        zoom: f32,
-        _window: &Window,
-    ) -> InlineBoxMetrics {
+    fn measure(&self, data: &StatusBadgeData, zoom: f32, _window: &Window) -> InlineBoxMetrics {
         let font_px = pt_to_px(9.0, zoom);
         InlineBoxMetrics {
             width: (data.label.chars().count().max(3) as f32) * font_px * 0.62
@@ -193,9 +202,21 @@ impl InlineRenderer for StatusBadgeRenderer {
         _cx: &mut App,
     ) -> Option<CustomRenderOutput> {
         let is_dark = context.theme.is_dark();
-        let badge_bg = if is_dark { rgb(0x1b3a28) } else { rgb(0xdcfce7) };
-        let badge_border = if is_dark { rgb(0x3fb950) } else { rgb(0x86efac) };
-        let badge_text = if is_dark { rgb(0x7ee787) } else { rgb(0x166534) };
+        let badge_bg = if is_dark {
+            rgb(0x1b3a28)
+        } else {
+            rgb(0xdcfce7)
+        };
+        let badge_border = if is_dark {
+            rgb(0x3fb950)
+        } else {
+            rgb(0x86efac)
+        };
+        let badge_text = if is_dark {
+            rgb(0x7ee787)
+        } else {
+            rgb(0x166534)
+        };
 
         let element = div()
             .size_full()
@@ -252,7 +273,7 @@ impl DisplayUnit {
         }
     }
 
-    fn from_pt(self, pt: f32) -> f32 {
+    fn convert_from_pt(self, pt: f32) -> f32 {
         match self {
             Self::Pt => pt,
             Self::Px => pt * (4.0 / 3.0),
@@ -273,7 +294,7 @@ impl DisplayUnit {
     }
 
     fn format_value(self, pt: f32) -> String {
-        let converted = self.from_pt(pt);
+        let converted = self.convert_from_pt(pt);
         match self {
             Self::Pt | Self::Px => format!("{converted:.0}{}", self.suffix()),
             Self::In | Self::Cm => format!("{converted:.2}{}", self.suffix()),
@@ -325,11 +346,7 @@ impl DocsViewerApp {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let document = build_sample_document();
         let assets = MemoryAssetProvider::new();
-        assets.insert_encoded(
-            "diagram-1",
-            ImageFormat::Svg,
-            SAMPLE_DIAGRAM_SVG.as_bytes(),
-        );
+        assets.insert_encoded("diagram-1", ImageFormat::Svg, SAMPLE_DIAGRAM_SVG.as_bytes());
         let document_view = cx.new(|cx| {
             let mut view = RichDocumentView::new(document, cx)
                 .with_asset_provider(assets)
@@ -405,7 +422,11 @@ impl DocsViewerApp {
     fn apply_margins(&mut self, next_margins: Edges, cx: &mut Context<Self>) {
         let clamped = next_margins.clamped_non_negative();
         if matches!(
-            self.document_view.read(cx).document.config.horizontal_layout,
+            self.document_view
+                .read(cx)
+                .document
+                .config
+                .horizontal_layout,
             HorizontalLayout::Paper(_)
         ) {
             self.last_paper_spec.margins_pt = clamped;
@@ -478,7 +499,8 @@ impl Render for DocsViewerApp {
             HorizontalLayout::Paper(spec) => Some(spec),
             HorizontalLayout::Fill => None,
         };
-        let margins_button_label = format!("Margins: {} ▾", Self::margin_preset_label(active_margins));
+        let margins_button_label =
+            format!("Margins: {} ▾", Self::margin_preset_label(active_margins));
         let zoom_label = format!("{}%", (zoom * 100.0).round() as i32);
         let toolbar_bg = if dark { rgb(0x161b22) } else { rgb(0xf8f9fa) };
         let toolbar_border = if dark { rgb(0x30363d) } else { rgb(0xd0d7de) };
@@ -740,22 +762,27 @@ impl Render for DocsViewerApp {
                     .child(self.status_message.clone()),
             )
             .child(
-                Self::toolbar_button("toggle-theme", if dark { "Light" } else { "Dark" }, dark, dark)
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _event, _window, cx| {
-                            this.dark_mode = !this.dark_mode;
-                            let next_theme = if this.dark_mode {
-                                RichTheme::dark()
-                            } else {
-                                RichTheme::light()
-                            };
-                            this.document_view.update(cx, |view, cx| {
-                                view.set_theme(next_theme, cx);
-                            });
-                            cx.notify();
-                        }),
-                    ),
+                Self::toolbar_button(
+                    "toggle-theme",
+                    if dark { "Light" } else { "Dark" },
+                    dark,
+                    dark,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        this.dark_mode = !this.dark_mode;
+                        let next_theme = if this.dark_mode {
+                            RichTheme::dark()
+                        } else {
+                            RichTheme::light()
+                        };
+                        this.document_view.update(cx, |view, cx| {
+                            view.set_theme(next_theme, cx);
+                        });
+                        cx.notify();
+                    }),
+                ),
             )
             .child(
                 Self::toolbar_button("toggle-debug", "Debug Baselines", debug_active, dark)
@@ -1124,13 +1151,15 @@ impl Render for DocsViewerApp {
                     Self::toolbar_button("fmt-export-md", "Copy MD", false, dark).on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _event, _window, cx| {
-                            let exported = this.document_view.read(cx).export_document(&MarkdownCodec);
+                            let exported =
+                                this.document_view.read(cx).export_document(&MarkdownCodec);
                             match exported {
                                 Ok(markdown) => {
                                     cx.write_to_clipboard(ClipboardItem::new_string(
                                         markdown.into_string(),
                                     ));
-                                    this.status_message = SharedString::from("Exported Markdown to clipboard");
+                                    this.status_message =
+                                        SharedString::from("Exported Markdown to clipboard");
                                 }
                                 Err(error) => {
                                     this.status_message = format!("Export failed: {error}").into();
@@ -1258,8 +1287,14 @@ impl Render for DocsViewerApp {
                         .py(px(5.0))
                         .rounded(px(4.0))
                         .bg(if is_selected { selected_bg } else { menu_bg })
-                        .hover(move |style| style.bg(if is_selected { selected_bg } else { hover_bg }))
-                        .text_color(if is_selected { selected_text } else { title_color })
+                        .hover(move |style| {
+                            style.bg(if is_selected { selected_bg } else { hover_bg })
+                        })
+                        .text_color(if is_selected {
+                            selected_text
+                        } else {
+                            title_color
+                        })
                         .text_size(px(12.0))
                         .font_family(preview_family)
                         .cursor_pointer()
@@ -1309,8 +1344,14 @@ impl Render for DocsViewerApp {
                         .py(px(5.0))
                         .rounded(px(4.0))
                         .bg(if is_selected { selected_bg } else { menu_bg })
-                        .hover(move |style| style.bg(if is_selected { selected_bg } else { hover_bg }))
-                        .text_color(if is_selected { selected_text } else { title_color })
+                        .hover(move |style| {
+                            style.bg(if is_selected { selected_bg } else { hover_bg })
+                        })
+                        .text_color(if is_selected {
+                            selected_text
+                        } else {
+                            title_color
+                        })
                         .text_size(px(12.0))
                         .font_family(preview_family)
                         .overflow_hidden()
@@ -1494,8 +1535,14 @@ impl Render for DocsViewerApp {
                         .py(px(5.0))
                         .rounded(px(4.0))
                         .bg(if is_selected { selected_bg } else { menu_bg })
-                        .hover(move |style| style.bg(if is_selected { selected_bg } else { hover_bg }))
-                        .text_color(if is_selected { selected_text } else { title_color })
+                        .hover(move |style| {
+                            style.bg(if is_selected { selected_bg } else { hover_bg })
+                        })
+                        .text_color(if is_selected {
+                            selected_text
+                        } else {
+                            title_color
+                        })
                         .text_size(px(12.0))
                         .cursor_pointer()
                         .on_mouse_down(
@@ -1510,7 +1557,11 @@ impl Render for DocsViewerApp {
                         .child(
                             div()
                                 .text_size(px(11.0))
-                                .text_color(if is_selected { selected_text } else { muted_color })
+                                .text_color(if is_selected {
+                                    selected_text
+                                } else {
+                                    muted_color
+                                })
                                 .child(detail),
                         ),
                 );
@@ -1744,7 +1795,10 @@ fn build_sample_document() -> Document {
     );
 
     // Section 1: Mixed typography, baseline alignment, inline objects, and decorations.
-    document.add_heading(1, InlineContent::plain("1. Mixed-Baseline Typography & Inline Objects"));
+    document.add_heading(
+        1,
+        InlineContent::plain("1. Mixed-Baseline Typography & Inline Objects"),
+    );
 
     let mut mixed = InlineContent::empty();
     mixed.push_text("A single visual line aligns ", InlineStyle::default());
@@ -1752,10 +1806,7 @@ fn build_sample_document() -> Document {
     mixed.push_text(", ", InlineStyle::default());
     mixed.push_text("italic", InlineStyle::italic());
     mixed.push_text(", and ", InlineStyle::default());
-    mixed.push_text(
-        "serif",
-        InlineStyle::default().with_font_family("serif"),
-    );
+    mixed.push_text("serif", InlineStyle::default().with_font_family("serif"));
     mixed.push_text(" next to ", InlineStyle::default());
     mixed.push_text(
         "22pt display text",
@@ -1774,11 +1825,17 @@ fn build_sample_document() -> Document {
         "2",
         InlineStyle::default().with_baseline_shift(BaselineShift::Subscript),
     );
-    mixed.push_text("O on one shared typographic baseline.", InlineStyle::default());
+    mixed.push_text(
+        "O on one shared typographic baseline.",
+        InlineStyle::default(),
+    );
     document.add_paragraph(mixed, BlockStyle::default());
 
     let mut chips = InlineContent::empty();
-    chips.push_text("Inline atomic embeds use U+FFFC sentinels: ", InlineStyle::default());
+    chips.push_text(
+        "Inline atomic embeds use U+FFFC sentinels: ",
+        InlineStyle::default(),
+    );
     chips.push_object(
         InlineObject::SmartChip {
             kind: ChipKind::Person,
@@ -1815,23 +1872,36 @@ fn build_sample_document() -> Document {
     chips.push_text(", ", InlineStyle::default());
     chips.push_text(
         "wavy spellcheck",
-        InlineStyle::default().with_underline(UnderlineKind::Wavy(RgbaColor::rgb(0xcf, 0x22, 0x2e))),
+        InlineStyle::default()
+            .with_underline(UnderlineKind::Wavy(RgbaColor::rgb(0xcf, 0x22, 0x2e))),
     );
     chips.push_text(", ", InlineStyle::default());
-    chips.push_text("strikethrough", InlineStyle::default().with_strikethrough(true));
+    chips.push_text(
+        "strikethrough",
+        InlineStyle::default().with_strikethrough(true),
+    );
     chips.push_text(", ", InlineStyle::default());
-    chips.push_text("clickable links", InlineStyle::default().with_link("https://gpui.rs"));
+    chips.push_text(
+        "clickable links",
+        InlineStyle::default().with_link("https://gpui.rs"),
+    );
     chips.push_text(", and ", InlineStyle::default());
     chips.push_text(
         "internal doc URIs",
         InlineStyle::default().with_link("doc://architecture/phase-2"),
     );
-    chips.push_object(InlineObject::FootnoteRef { index: 1 }, InlineStyle::default());
+    chips.push_object(
+        InlineObject::FootnoteRef { index: 1 },
+        InlineStyle::default(),
+    );
     chips.push_text(".", InlineStyle::default());
     document.add_paragraph(chips, BlockStyle::default());
 
     let mut inline_img = InlineContent::empty();
-    inline_img.push_text("Inline image placeholder anchored to baseline: ", InlineStyle::default());
+    inline_img.push_text(
+        "Inline image placeholder anchored to baseline: ",
+        InlineStyle::default(),
+    );
     inline_img.push_object(
         InlineObject::Image {
             asset_id: ImageAssetId::new("diagram-1"),
@@ -1842,7 +1912,10 @@ fn build_sample_document() -> Document {
         },
         InlineStyle::default(),
     );
-    inline_img.push_text(" flowing cleanly with surrounding text.", InlineStyle::default());
+    inline_img.push_text(
+        " flowing cleanly with surrounding text.",
+        InlineStyle::default(),
+    );
     document.add_paragraph(inline_img, BlockStyle::default());
 
     // Section 2: Alignment, lists, blockquotes, and code blocks.
@@ -1876,7 +1949,9 @@ fn build_sample_document() -> Document {
         ListKind::Bullet,
         1,
         None,
-        InlineContent::plain("Click the triangle chevron next to any heading to collapse or expand its section."),
+        InlineContent::plain(
+            "Click the triangle chevron next to any heading to collapse or expand its section.",
+        ),
     );
 
     let ordered_list = ListId(2);
@@ -1994,7 +2069,11 @@ fn build_sample_document() -> Document {
                 InlineStyle::default()
             },
         );
-        let para = BlockNode::new(para_id, BlockKind::paragraph(content), BlockStyle::default());
+        let para = BlockNode::new(
+            para_id,
+            BlockKind::paragraph(content),
+            BlockStyle::default(),
+        );
         TableCell::simple(cell_id, vec![para])
     };
 
@@ -2056,8 +2135,12 @@ fn build_sample_document() -> Document {
         border_style: TableBorderStyle::default(),
     };
     document.push_block(
-        BlockNode::new(table_id, BlockKind::table(table_block), BlockStyle::default())
-            .with_width_mode(BlockWidth::Wide),
+        BlockNode::new(
+            table_id,
+            BlockKind::table(table_block),
+            BlockStyle::default(),
+        )
+        .with_width_mode(BlockWidth::Wide),
     );
 
     document

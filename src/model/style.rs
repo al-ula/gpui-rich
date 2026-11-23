@@ -225,7 +225,7 @@ impl InlineStyle {
             }
         });
 
-        let background = self.background.or_else(|| {
+        let background = self.background.or({
             if inline_code {
                 Some(RgbaColor::INLINE_CODE_BG)
             } else {

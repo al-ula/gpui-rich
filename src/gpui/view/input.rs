@@ -151,9 +151,9 @@ impl RichDocumentView {
             Some((block_id, object_id, entry.object.clone()))
         });
 
-        self.pending_footnote = clicked_object.as_ref().and_then(|(_, _, object)| {
-            crate::model::footnote_reference_id(object)
-        });
+        self.pending_footnote = clicked_object
+            .as_ref()
+            .and_then(|(_, _, object)| crate::model::footnote_reference_id(object));
         self.pending_chip = None;
         match clicked_object {
             Some((block_id, object_id, InlineObject::Image { .. }))
@@ -244,7 +244,10 @@ impl RichDocumentView {
             DocumentSelection::caret(hit.pos, hit.affinity)
         };
         self.dragging = true;
-        self.dispatch_command(RichCommand::SetSelection(Some(next_selection)), cx);
+        self.dispatch_command(
+            RichCommand::SetSelection(Some(Box::new(next_selection))),
+            cx,
+        );
         cx.notify();
     }
 
@@ -355,19 +358,18 @@ impl RichDocumentView {
                 None
             };
 
-            let next_divider = if self.policy.can_resize_table_columns()
-                && next_image_handle.is_none()
-            {
-                self.flow.hit_test_table_column_border(
-                    canvas_point,
-                    &self.document,
-                    viewport_width,
-                    self.zoom,
-                    5.0,
-                )
-            } else {
-                None
-            };
+            let next_divider =
+                if self.policy.can_resize_table_columns() && next_image_handle.is_none() {
+                    self.flow.hit_test_table_column_border(
+                        canvas_point,
+                        &self.document,
+                        viewport_width,
+                        self.zoom,
+                        5.0,
+                    )
+                } else {
+                    None
+                };
 
             let hovered_chip = hit.as_ref().is_some_and(|result| {
                 if !self.policy.can_activate_smart_chips() {
@@ -385,7 +387,9 @@ impl RichDocumentView {
                     .and_then(|inline| inline.object_by_id(object_id))
                     .is_some_and(|entry| match &entry.object {
                         InlineObject::SmartChip { .. } => true,
-                        InlineObject::Custom { kind, .. } => kind.as_ref() == crate::model::DROPDOWN_KIND,
+                        InlineObject::Custom { kind, .. } => {
+                            kind.as_ref() == crate::model::DROPDOWN_KIND
+                        }
                         _ => false,
                     })
             });
@@ -416,7 +420,10 @@ impl RichDocumentView {
         if let Some(anchor) = self.drag_anchor_pos.clone() {
             let next_selection =
                 selection_from_drag_positions(&self.document, anchor, hit.pos, hit.affinity);
-            self.dispatch_command(RichCommand::SetSelection(Some(next_selection)), cx);
+            self.dispatch_command(
+                RichCommand::SetSelection(Some(Box::new(next_selection))),
+                cx,
+            );
         }
     }
 
@@ -496,8 +503,13 @@ impl RichDocumentView {
         } else {
             self.pending_link = None;
         }
-        if let Some(id) = self.pending_footnote.take() && !self.drag_moved {
-            self.dispatch_command(RichCommand::Anchor(crate::model::AnchorCommand::RevealFootnote { id }), cx);
+        if let Some(id) = self.pending_footnote.take()
+            && !self.drag_moved
+        {
+            self.dispatch_command(
+                RichCommand::Anchor(crate::model::AnchorCommand::RevealFootnote { id }),
+                cx,
+            );
         }
         self.drag_moved = false;
     }
@@ -558,7 +570,11 @@ impl RichDocumentView {
             return start..end;
         };
         let preedit_start = preedit.replace_range.start.min(committed_len);
-        let preedit_end_committed = preedit.replace_range.end.min(committed_len).max(preedit_start);
+        let preedit_end_committed = preedit
+            .replace_range
+            .end
+            .min(committed_len)
+            .max(preedit_start);
         let preedit_end_effective = preedit_start + preedit.text.len();
 
         let map_point = |offset: usize, is_end: bool| -> usize {
@@ -718,9 +734,7 @@ impl EntityInputHandler for RichDocumentView {
                 let eff_end = utf16_to_utf8_offset(&effective_text, u16_range.end).max(eff_start);
                 Some(Self::map_effective_range_to_committed(
                     eff_start..eff_end,
-                    existing_preedit
-                        .as_ref()
-                        .filter(|p| p.block_id == block_id),
+                    existing_preedit.as_ref().filter(|p| p.block_id == block_id),
                     committed.len(),
                 ))
             } else {
@@ -751,7 +765,11 @@ impl EntityInputHandler for RichDocumentView {
         if had_preedit {
             self.history.break_coalescing();
         }
-        if new_text.is_empty() && self.selection.as_ref().is_none_or(DocumentSelection::is_collapsed)
+        if new_text.is_empty()
+            && self
+                .selection
+                .as_ref()
+                .is_none_or(DocumentSelection::is_collapsed)
         {
             cx.notify();
             return;
@@ -869,7 +887,10 @@ impl EntityInputHandler for RichDocumentView {
                 px(origin_x + canvas_rect.x - self.scroll_x),
                 px(origin_y + canvas_rect.y - self.scroll_y),
             ),
-            size(px(canvas_rect.width.max(2.0)), px(canvas_rect.height.max(14.0))),
+            size(
+                px(canvas_rect.width.max(2.0)),
+                px(canvas_rect.height.max(14.0)),
+            ),
         ))
     }
 
@@ -923,19 +944,23 @@ impl EntityInputHandler for RichDocumentView {
                 .doc_pos_for_block(block_id, committed_range.end),
         ) {
             self.dispatch_command(
-                RichCommand::SetSelection(Some(DocumentSelection::Text {
+                RichCommand::SetSelection(Some(Box::new(DocumentSelection::Text {
                     anchor,
                     focus,
                     affinity: Affinity::Downstream,
                     goal_x: None,
                     stored_marks: None,
-                })),
+                }))),
                 cx,
             );
         }
     }
 
-    fn text_length_utf16(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> Option<usize> {
+    fn text_length_utf16(
+        &mut self,
+        _window: &mut Window,
+        _cx: &mut Context<Self>,
+    ) -> Option<usize> {
         let (_, _, effective_text) = self.ime_active_block_text()?;
         Some(effective_text.encode_utf16().count())
     }
@@ -1084,8 +1109,10 @@ fn selection_from_drag_positions(
     focus: DocPos,
     affinity: Affinity,
 ) -> DocumentSelection {
-    if let (Some((anchor_table, anchor_row, anchor_cell_idx)), Some((focus_table, focus_row, focus_cell_idx))) =
-        (table_cell_of(&anchor), table_cell_of(&focus))
+    if let (
+        Some((anchor_table, anchor_row, anchor_cell_idx)),
+        Some((focus_table, focus_row, focus_cell_idx)),
+    ) = (table_cell_of(&anchor), table_cell_of(&focus))
         && anchor_table == focus_table
         && (anchor_row, anchor_cell_idx) != (focus_row, focus_cell_idx)
     {
@@ -1165,4 +1192,3 @@ pub(super) fn last_text_pos_in_nodes(nodes: &[BlockNode]) -> Option<(BlockId, us
     }
     None
 }
-

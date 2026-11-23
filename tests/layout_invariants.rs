@@ -1,7 +1,6 @@
 use gpui_rich::layout::*;
 use gpui_rich::model::*;
 
-
 #[test]
 fn mixed_font_sizes_and_superscript_share_baseline() {
     let mut shaper = MockShaper;
@@ -88,15 +87,22 @@ fn fenwick_height_index_collapsible_headings_and_scroll_anchor() {
         InlineContent::plain("First body paragraph with enough text to wrap onto multiple lines inside a narrow column."),
         BlockStyle::default(),
     );
-    let p2 = doc.add_paragraph(InlineContent::plain("Second paragraph."), BlockStyle::default());
+    let p2 = doc.add_paragraph(
+        InlineContent::plain("Second paragraph."),
+        BlockStyle::default(),
+    );
     let h2 = doc.add_heading(1, InlineContent::plain("Section Two"));
-    let p3 = doc.add_paragraph(InlineContent::plain("Third paragraph below."), BlockStyle::default());
+    let p3 = doc.add_paragraph(
+        InlineContent::plain("Third paragraph below."),
+        BlockStyle::default(),
+    );
 
     let mut flow = FlowLayout::<MockBackend>::default();
     let mut shaper = MockShaper;
     flow.sync_document(&doc, 400.0, 1.0);
 
-    let visible_before = flow.layout_visible_blocks(&doc, 0.0, 400.0, 600.0, 50.0, 1.0, &mut shaper);
+    let visible_before =
+        flow.layout_visible_blocks(&doc, 0.0, 400.0, 600.0, 50.0, 1.0, &mut shaper);
     assert_eq!(visible_before.len(), 5);
     let h2_y_before = flow.block_y_by_id(h2).unwrap();
     let p3_y_before = flow.block_y_by_id(p3).unwrap();
@@ -213,15 +219,7 @@ fn vertical_navigation_preserves_goal_x_across_short_middle_block() {
 
     // Moving down again using the preserved goal_x restores column alignment in the third block.
     let (third_pos, _, third_goal_x) = flow
-        .cached_vertical_move(
-            &mid_pos,
-            mid_aff,
-            Some(goal_x),
-            1,
-            &doc,
-            900.0,
-            1.0,
-        )
+        .cached_vertical_move(&mid_pos, mid_aff, Some(goal_x), 1, &doc, 900.0, 1.0)
         .unwrap();
     assert_eq!(third_pos.leaf_block_id(), Some(third_id));
     assert!((third_goal_x - goal_x).abs() < 0.01);
@@ -341,7 +339,10 @@ fn custom_block_and_inline_object_measure_via_shaper() {
         BlockLayoutKind::CustomLeaf { kind, .. } if kind.as_ref() == "callout_leaf"
     ));
 
-    let container = visible.iter().find(|entry| entry.id == container_id).unwrap();
+    let container = visible
+        .iter()
+        .find(|entry| entry.id == container_id)
+        .unwrap();
     assert!(matches!(
         &container.layout.kind,
         BlockLayoutKind::CustomContainer { kind, children, chrome, .. }
@@ -410,7 +411,10 @@ fn invalid_custom_metrics_fall_back_and_large_table_culls_offscreen_leaves() {
 
     let mut doc = Document::new();
     let mut inline = InlineContent::empty();
-    inline.push_object(InlineObject::custom::<BadInlineSpec>(()), InlineStyle::default());
+    inline.push_object(
+        InlineObject::custom::<BadInlineSpec>(()),
+        InlineStyle::default(),
+    );
     doc.add_paragraph(inline, BlockStyle::default());
     let leaf_id = doc.add_leaf_block::<BadLeafSpec>(());
 
@@ -454,8 +458,15 @@ fn invalid_custom_metrics_fall_back_and_large_table_culls_offscreen_leaves() {
 
     let mut table_flow = FlowLayout::<MockBackend>::default();
     let mut mock_shaper = MockShaper;
-    let table_visible =
-        table_flow.layout_visible_blocks(&table_doc, 0.0, 600.0, 200.0, 40.0, 1.0, &mut mock_shaper);
+    let table_visible = table_flow.layout_visible_blocks(
+        &table_doc,
+        0.0,
+        600.0,
+        200.0,
+        40.0,
+        1.0,
+        &mut mock_shaper,
+    );
     let culled = collect_visible_leaf_paragraphs_in_y_range(&table_visible, -40.0, 240.0);
     assert!(!culled.is_empty());
     assert!(culled.len() < 20);
@@ -475,7 +486,8 @@ fn asymmetric_document_margins_control_paper_and_fill_geometry() {
 
     let mut flow = FlowLayout::<MockBackend>::default();
     let mut shaper = MockShaper;
-    let visible_paper = flow.layout_visible_blocks(&document, 0.0, 1200.0, 800.0, 100.0, 1.0, &mut shaper);
+    let visible_paper =
+        flow.layout_visible_blocks(&document, 0.0, 1200.0, 800.0, 100.0, 1.0, &mut shaper);
     let paper_metrics = resolve_horizontal_metrics(1200.0, &document.config, 1.0);
     let sheet = paper_metrics.paper_sheet.expect("paper sheet present");
     let expected_left = pt_to_px(36.0, 1.0);
@@ -485,8 +497,7 @@ fn asymmetric_document_margins_control_paper_and_fill_geometry() {
 
     assert!((paper_metrics.column_x - (sheet.x + expected_left)).abs() < 0.1);
     assert!(
-        (paper_metrics.column_width - (sheet.width - expected_left - expected_right)).abs()
-            < 0.1
+        (paper_metrics.column_width - (sheet.width - expected_left - expected_right)).abs() < 0.1
     );
     assert!((flow.block_y(0) - (sheet.top_y + expected_top)).abs() < 0.1);
     let content_height = visible_paper[0].layout.height;
@@ -496,7 +507,8 @@ fn asymmetric_document_margins_control_paper_and_fill_geometry() {
 
     document.config.horizontal_layout = HorizontalLayout::Fill;
     document.config.set_active_margins_pt(asymmetric);
-    let visible_fill = flow.layout_visible_blocks(&document, 0.0, 1000.0, 800.0, 100.0, 1.0, &mut shaper);
+    let visible_fill =
+        flow.layout_visible_blocks(&document, 0.0, 1000.0, 800.0, 100.0, 1.0, &mut shaper);
     let fill_metrics = resolve_horizontal_metrics(1000.0, &document.config, 1.0);
     assert!(fill_metrics.paper_sheet.is_none());
     assert!((fill_metrics.column_x - expected_left).abs() < 0.1);

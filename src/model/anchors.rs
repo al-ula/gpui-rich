@@ -63,7 +63,9 @@ pub fn footnote_reference(id: AnchorId) -> crate::model::inline::InlineObject {
     )
 }
 
-pub fn footnote_body_kind(children: Vec<crate::model::block::BlockNode>) -> crate::model::block::BlockKind {
+pub fn footnote_body_kind(
+    children: Vec<crate::model::block::BlockNode>,
+) -> crate::model::block::BlockKind {
     crate::model::block::BlockKind::raw_container(
         FOOTNOTE_BODY_KIND,
         crate::model::payload::CustomPayload::empty(),
@@ -396,8 +398,14 @@ mod tests {
         let b = s.add_footnote_block(BlockId(11));
         let mut doc = crate::model::block::Document::new();
         let mut text = crate::model::inline::InlineContent::empty();
-        text.push_object(footnote_reference(b), crate::model::style::InlineStyle::default());
-        text.push_object(footnote_reference(a), crate::model::style::InlineStyle::default());
+        text.push_object(
+            footnote_reference(b),
+            crate::model::style::InlineStyle::default(),
+        );
+        text.push_object(
+            footnote_reference(a),
+            crate::model::style::InlineStyle::default(),
+        );
         doc.add_paragraph(text, crate::model::style::BlockStyle::default());
         assert_eq!(
             s.numbered_document_notes(&doc)

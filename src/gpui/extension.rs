@@ -79,7 +79,6 @@
 //! ```
 
 use crate::gpui::theme::RichTheme;
-use gpui_kit::{AnyElement, App, Bounds, Pixels, Window};
 use crate::layout::{InlineBoxMetrics, Insets, Size, pt_to_px};
 use crate::model::{
     BlockId, BlockShape, BlockShapeKind, BlockSpec, ClipboardCustomFormatter, CommandEffectKind,
@@ -88,6 +87,7 @@ use crate::model::{
     InlineObjectId, InlineSpec, InlineVAlign, ListId, PLACEHOLDER_KIND, ReadOnly, RichCommand,
     SharedStr, Transaction, VARIABLE_KIND, block_kinds,
 };
+use gpui_kit::{AnyElement, App, Bounds, Pixels, Window};
 use std::any::TypeId;
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -485,6 +485,27 @@ pub(crate) enum InlineCallbackResult<T> {
     Invalid(ExtensionDiagnosticKind),
 }
 
+pub(crate) struct ErasedBlockRenderContext<'a> {
+    pub(crate) shape: BlockShapeKind,
+    pub(crate) block_id: BlockId,
+    pub(crate) kind: &'a str,
+    pub(crate) data: &'a CustomPayload,
+    pub(crate) bounds: Bounds<Pixels>,
+    pub(crate) chrome: Insets,
+    pub(crate) zoom: f32,
+    pub(crate) theme: &'a RichTheme,
+}
+
+pub(crate) struct ErasedInlineRenderContext<'a> {
+    pub(crate) block_id: BlockId,
+    pub(crate) object_id: InlineObjectId,
+    pub(crate) kind: &'a str,
+    pub(crate) data: &'a CustomPayload,
+    pub(crate) bounds: Bounds<Pixels>,
+    pub(crate) zoom: f32,
+    pub(crate) theme: &'a RichTheme,
+}
+
 pub(crate) trait ErasedBlockRenderer {
     fn clear_cache(&self);
     fn measure_leaf(
@@ -504,14 +525,7 @@ pub(crate) trait ErasedBlockRenderer {
     ) -> BlockCallbackResult<Insets>;
     fn render(
         &self,
-        shape: BlockShapeKind,
-        block_id: BlockId,
-        kind: &str,
-        data: &CustomPayload,
-        bounds: Bounds<Pixels>,
-        chrome: Insets,
-        zoom: f32,
-        theme: &RichTheme,
+        context: ErasedBlockRenderContext<'_>,
         window: &mut Window,
         cx: &mut App,
     ) -> BlockCallbackResult<Option<CustomRenderOutput>>;
@@ -557,10 +571,9 @@ impl<R: BlockRenderer> ErasedBlockRenderer for BlockRendererAdapter<R> {
         if let Err(detail) = self.check_shape(BlockShapeKind::Leaf) {
             return BlockCallbackResult::Invalid(detail);
         }
-        match self
-            .cache
-            .with_resolved(data, |typed| self.renderer.measure_leaf(typed, max_width, zoom, window))
-        {
+        match self.cache.with_resolved(data, |typed| {
+            self.renderer.measure_leaf(typed, max_width, zoom, window)
+        }) {
             Ok(size) => BlockCallbackResult::Ok(size),
             Err(message) => {
                 BlockCallbackResult::Invalid(ExtensionDiagnosticKind::InvalidPayload { message })
@@ -579,10 +592,9 @@ impl<R: BlockRenderer> ErasedBlockRenderer for BlockRendererAdapter<R> {
         if let Err(detail) = self.check_shape(shape) {
             return BlockCallbackResult::Invalid(detail);
         }
-        match self
-            .cache
-            .with_resolved(data, |typed| self.renderer.measure_chrome(typed, max_width, zoom, window))
-        {
+        match self.cache.with_resolved(data, |typed| {
+            self.renderer.measure_chrome(typed, max_width, zoom, window)
+        }) {
             Ok(insets) => BlockCallbackResult::Ok(insets),
             Err(message) => {
                 BlockCallbackResult::Invalid(ExtensionDiagnosticKind::InvalidPayload { message })
@@ -592,30 +604,23 @@ impl<R: BlockRenderer> ErasedBlockRenderer for BlockRendererAdapter<R> {
 
     fn render(
         &self,
-        shape: BlockShapeKind,
-        block_id: BlockId,
-        kind: &str,
-        data: &CustomPayload,
-        bounds: Bounds<Pixels>,
-        chrome: Insets,
-        zoom: f32,
-        theme: &RichTheme,
+        context: ErasedBlockRenderContext<'_>,
         window: &mut Window,
         cx: &mut App,
     ) -> BlockCallbackResult<Option<CustomRenderOutput>> {
-        if let Err(detail) = self.check_shape(shape) {
+        if let Err(detail) = self.check_shape(context.shape) {
             return BlockCallbackResult::Invalid(detail);
         }
-        match self.cache.with_resolved(data, |typed| {
+        match self.cache.with_resolved(context.data, |typed| {
             self.renderer.render(
                 BlockRenderContext {
-                    block_id,
-                    kind,
+                    block_id: context.block_id,
+                    kind: context.kind,
                     data: typed,
-                    bounds,
-                    chrome,
-                    zoom,
-                    theme,
+                    bounds: context.bounds,
+                    chrome: context.chrome,
+                    zoom: context.zoom,
+                    theme: context.theme,
                 },
                 window,
                 cx,
@@ -653,13 +658,7 @@ pub(crate) trait ErasedInlineRenderer {
     ) -> InlineCallbackResult<InlineBoxMetrics>;
     fn render(
         &self,
-        block_id: BlockId,
-        object_id: InlineObjectId,
-        kind: &str,
-        data: &CustomPayload,
-        bounds: Bounds<Pixels>,
-        zoom: f32,
-        theme: &RichTheme,
+        context: ErasedInlineRenderContext<'_>,
         window: &mut Window,
         cx: &mut App,
     ) -> InlineCallbackResult<Option<CustomRenderOutput>>;
@@ -705,26 +704,20 @@ impl<R: InlineRenderer> ErasedInlineRenderer for InlineRendererAdapter<R> {
 
     fn render(
         &self,
-        block_id: BlockId,
-        object_id: InlineObjectId,
-        kind: &str,
-        data: &CustomPayload,
-        bounds: Bounds<Pixels>,
-        zoom: f32,
-        theme: &RichTheme,
+        context: ErasedInlineRenderContext<'_>,
         window: &mut Window,
         cx: &mut App,
     ) -> InlineCallbackResult<Option<CustomRenderOutput>> {
-        match self.cache.with_resolved(data, |typed| {
+        match self.cache.with_resolved(context.data, |typed| {
             self.renderer.render(
                 InlineRenderContext {
-                    block_id,
-                    object_id,
-                    kind,
+                    block_id: context.block_id,
+                    object_id: context.object_id,
+                    kind: context.kind,
                     data: typed,
-                    bounds,
-                    zoom,
-                    theme,
+                    bounds: context.bounds,
+                    zoom: context.zoom,
+                    theme: context.theme,
                 },
                 window,
                 cx,
@@ -753,7 +746,7 @@ impl<R: InlineRenderer> ErasedInlineRenderer for InlineRendererAdapter<R> {
 pub(crate) enum CommandExecutionResult {
     Read(ReadCommandOutcome),
     Edit {
-        transaction: Option<Transaction>,
+        transaction: Option<Box<Transaction>>,
         next_block_id: u64,
     },
     Unregistered,
@@ -1031,7 +1024,7 @@ impl ExtensionRegistry {
             }
             RegisteredCommandHandler::Edit(handler) => {
                 let mut context = EditCommandContext::new(document, selection);
-                let transaction = handler(invocation, &mut context);
+                let transaction = handler(invocation, &mut context).map(Box::new);
                 CommandExecutionResult::Edit {
                     transaction,
                     next_block_id: context.next_block_id(),

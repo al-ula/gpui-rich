@@ -110,7 +110,10 @@ impl StructureCommand {
     }
 }
 
-fn ordered_item(document: &Document, block_id: BlockId) -> Option<crate::model::block::ListItemData> {
+fn ordered_item(
+    document: &Document,
+    block_id: BlockId,
+) -> Option<crate::model::block::ListItemData> {
     let item = document.find_block(block_id)?.kind.list_item_data()?;
     matches!(item.kind, ListKind::Ordered(_)).then_some(item)
 }

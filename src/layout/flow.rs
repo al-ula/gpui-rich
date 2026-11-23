@@ -47,7 +47,7 @@ impl HeightIndex {
         let mut i = idx + 1;
         while i < self.tree.len() {
             self.tree[i] += delta;
-            i += i & i.wrapping_neg();
+            i += i.isolate_lowest_one();
         }
     }
 
@@ -57,7 +57,7 @@ impl HeightIndex {
         let mut sum = 0.0f32;
         while i > 0 {
             sum += self.tree[i];
-            i -= i & i.wrapping_neg();
+            i -= i.isolate_lowest_one();
         }
         sum
     }
@@ -259,7 +259,9 @@ pub fn compute_list_markers(doc: &Document) -> Vec<Option<String>> {
         if let Some(item) = block.kind.list_item_data() {
             // Reset deeper sub-list counters whenever a parent level increments.
             counters.retain(|&(lid, lvl), _| lid != item.list_id || lvl <= item.indent_level);
-            let entry = counters.entry((item.list_id, item.indent_level)).or_insert(0);
+            let entry = counters
+                .entry((item.list_id, item.indent_level))
+                .or_insert(0);
             *entry += 1;
             markers[idx] = Some(default_list_marker(
                 item.kind,
@@ -391,17 +393,11 @@ impl<B: GlyphBackend> FlowLayout<B> {
                     space_after: cached.space_after_px,
                     measured: true,
                 });
-            } else if !geometry_changed
-                && let Some(prev) = prev_metrics.get(&block.id)
-            {
+            } else if !geometry_changed && let Some(prev) = prev_metrics.get(&block.id) {
                 self.metrics.push(*prev);
             } else {
-                self.metrics.push(estimate_block_metrics(
-                    block,
-                    &doc.stylesheet,
-                    max_w,
-                    zoom,
-                ));
+                self.metrics
+                    .push(estimate_block_metrics(block, &doc.stylesheet, max_w, zoom));
             }
         }
 
@@ -438,6 +434,7 @@ impl<B: GlyphBackend> FlowLayout<B> {
 
     /// Ensures all blocks inside `[scroll_y - overscan, scroll_y + viewport_h + overscan]`
     /// are measured and returns them in visual top-to-bottom order.
+    #[allow(clippy::too_many_arguments)]
     pub fn layout_visible_blocks<S: TextShaper<Backend = B>>(
         &mut self,
         doc: &Document,
@@ -562,7 +559,11 @@ impl<B: GlyphBackend> FlowLayout<B> {
         self.update_slot_and_prev_neighbor(idx);
         let (paragraph, origin) =
             find_leaf_paragraph(&layout, leaf_id, Point::new(block_x, self.block_y(idx)))?;
-        Some(paragraph.caret_rect(pos.offset, affinity).translate(origin.x, origin.y))
+        Some(
+            paragraph
+                .caret_rect(pos.offset, affinity)
+                .translate(origin.x, origin.y),
+        )
     }
 
     pub fn hit_test_canvas<S: TextShaper<Backend = B>>(
@@ -820,13 +821,18 @@ impl<B: GlyphBackend> FlowLayout<B> {
                 if let Some((table, origin)) = visible_blocks.iter().find_map(|visible| {
                     find_table_layout(&visible.layout, *table_id, Point::new(visible.x, visible.y))
                 }) {
-                    let (mut top, mut bottom, mut left, mut right) = (row_min, row_max, col_min, col_max);
+                    let (mut top, mut bottom, mut left, mut right) =
+                        (row_min, row_max, col_min, col_max);
                     loop {
                         let previous = (top, bottom, left, right);
                         for cell in &table.cells {
                             let last_row = cell.row + usize::from(cell.rowspan.max(1)) - 1;
                             let last_col = cell.col + usize::from(cell.colspan.max(1)) - 1;
-                            if last_row >= top && cell.row <= bottom && last_col >= left && cell.col <= right {
+                            if last_row >= top
+                                && cell.row <= bottom
+                                && last_col >= left
+                                && cell.col <= right
+                            {
                                 top = top.min(cell.row);
                                 bottom = bottom.max(last_row);
                                 left = left.min(cell.col);
@@ -837,9 +843,16 @@ impl<B: GlyphBackend> FlowLayout<B> {
                             break;
                         }
                     }
-                    rects.extend(table.cells.iter().filter(|cell| {
-                        (top..=bottom).contains(&cell.row) && (left..=right).contains(&cell.col)
-                    }).map(|cell| cell.rect.translate(origin.x, origin.y)));
+                    rects.extend(
+                        table
+                            .cells
+                            .iter()
+                            .filter(|cell| {
+                                (top..=bottom).contains(&cell.row)
+                                    && (left..=right).contains(&cell.col)
+                            })
+                            .map(|cell| cell.rect.translate(origin.x, origin.y)),
+                    );
                 }
             }
         }
@@ -966,7 +979,9 @@ impl<B: GlyphBackend> FlowLayout<B> {
         if let Some(layout) = self.cache.get_latest(top_id) {
             let mut leaf_paragraphs = Vec::new();
             collect_leaf_paragraphs(&layout, block_x, block_y, &mut leaf_paragraphs);
-            if let Some(current_leaf) = leaf_paragraphs.into_iter().find(|leaf| leaf.block_id == leaf_id)
+            if let Some(current_leaf) = leaf_paragraphs
+                .into_iter()
+                .find(|leaf| leaf.block_id == leaf_id)
                 && let Some((next_offset, next_affinity)) = current_leaf.paragraph.vertical_step(
                     pos.offset,
                     affinity,
@@ -982,7 +997,9 @@ impl<B: GlyphBackend> FlowLayout<B> {
 
         // 2. Cross into the previous or next visible leaf block.
         let visible_leaves = doc.collect_visible_leaf_blocks();
-        let current_leaf_index = visible_leaves.iter().position(|block| block.id == leaf_id)?;
+        let current_leaf_index = visible_leaves
+            .iter()
+            .position(|block| block.id == leaf_id)?;
         let target_leaf_index = if delta_lines < 0 {
             current_leaf_index.checked_sub(1)?
         } else {
@@ -1300,12 +1317,7 @@ fn collect_leaf_paragraphs<'layout, B: GlyphBackend>(
     }
     if let Some(children) = layout.children() {
         for child in children {
-            collect_leaf_paragraphs(
-                &child.layout,
-                origin_x + child.x,
-                origin_y + child.y,
-                out,
-            );
+            collect_leaf_paragraphs(&child.layout, origin_x + child.x, origin_y + child.y, out);
         }
     } else if let Some(table) = layout.table_layout() {
         let content_origin = layout.content_origin();
@@ -1329,19 +1341,30 @@ fn find_leaf_paragraph<B: GlyphBackend>(
 ) -> Option<(&ParagraphLayout<B>, Point)> {
     let content = layout.content_origin();
     if layout.id == id {
-        return Some((layout.paragraph()?, Point::new(origin.x + content.x, origin.y + content.y)));
+        return Some((
+            layout.paragraph()?,
+            Point::new(origin.x + content.x, origin.y + content.y),
+        ));
     }
     if let Some(children) = layout.children() {
         return children.iter().find_map(|child| {
-            find_leaf_paragraph(&child.layout, id, Point::new(origin.x + child.x, origin.y + child.y))
+            find_leaf_paragraph(
+                &child.layout,
+                id,
+                Point::new(origin.x + child.x, origin.y + child.y),
+            )
         });
     }
     layout.table_layout()?.cells.iter().find_map(|cell| {
         cell.children.iter().find_map(|child| {
-            find_leaf_paragraph(&child.layout, id, Point::new(
-                origin.x + content.x + cell.rect.x + child.x,
-                origin.y + content.y + cell.rect.y + child.y,
-            ))
+            find_leaf_paragraph(
+                &child.layout,
+                id,
+                Point::new(
+                    origin.x + content.x + cell.rect.x + child.x,
+                    origin.y + content.y + cell.rect.y + child.y,
+                ),
+            )
         })
     })
 }
@@ -1353,7 +1376,11 @@ fn find_table_layout<B: GlyphBackend>(
 ) -> Option<(&crate::layout::block::TableLayout<B>, Point)> {
     if let Some(children) = layout.children() {
         return children.iter().find_map(|child| {
-            find_table_layout(&child.layout, id, Point::new(origin.x + child.x, origin.y + child.y))
+            find_table_layout(
+                &child.layout,
+                id,
+                Point::new(origin.x + child.x, origin.y + child.y),
+            )
         });
     }
     let table = layout.table_layout()?;
@@ -1364,9 +1391,14 @@ fn find_table_layout<B: GlyphBackend>(
     }
     table.cells.iter().find_map(|cell| {
         cell.children.iter().find_map(|child| {
-            find_table_layout(&child.layout, id, Point::new(
-                origin.x + cell.rect.x + child.x, origin.y + cell.rect.y + child.y,
-            ))
+            find_table_layout(
+                &child.layout,
+                id,
+                Point::new(
+                    origin.x + cell.rect.x + child.x,
+                    origin.y + cell.rect.y + child.y,
+                ),
+            )
         })
     })
 }
@@ -1560,9 +1592,7 @@ fn estimate_block_metrics(
                 lines * base_line
             }
         }
-        BlockKind::Container { children, .. } => {
-            (children.len().max(1) as f32) * base_line * 1.4
-        }
+        BlockKind::Container { children, .. } => (children.len().max(1) as f32) * base_line * 1.4,
         BlockKind::Grid { table, .. } => (table.rows.len().max(1) as f32) * pt_to_px(30.0, zoom),
         BlockKind::Leaf { .. } => {
             if block.kind.is_horizontal_rule() {

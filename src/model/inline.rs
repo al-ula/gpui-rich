@@ -807,7 +807,10 @@ mod tests {
         destination.insert_content(destination.len(), &copied);
         let copied_id = destination.objects[1].id;
         assert_ne!(copied_id, existing_id);
-        assert_eq!(destination.object_by_id(existing_id).unwrap().byte_offset, 0);
+        assert_eq!(
+            destination.object_by_id(existing_id).unwrap().byte_offset,
+            0
+        );
         assert_eq!(destination.object_by_id(copied_id).unwrap().byte_offset, 3);
 
         let mut restored = InlineContent::empty();

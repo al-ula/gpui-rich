@@ -69,8 +69,8 @@ impl RichDocumentView {
             NavigationCommand::Find { query, options } => {
                 self.navigation.search = SearchState {
                     query: query.clone(),
-                    options: options.clone(),
-                    matches: find_matches(&self.document, query, options.clone()),
+                    options: *options,
+                    matches: find_matches(&self.document, query, *options),
                     active: None,
                 };
                 self.navigation.index_matches();
@@ -219,7 +219,7 @@ impl RichDocumentView {
         self.navigation.search.matches = find_matches(
             &self.document,
             &self.navigation.search.query,
-            self.navigation.search.options.clone(),
+            self.navigation.search.options,
         );
         self.navigation.search.active = None;
         self.navigation.index_matches();
@@ -230,7 +230,7 @@ fn position_is_visible(document: &Document, pos: &DocPos) -> bool {
     let Some(top_id) = pos.top_level_block_id() else {
         return false;
     };
-    document.top_level_index(top_id).is_some_and(|index| {
-        document.top_level_visibility().nth(index).unwrap_or(false)
-    })
+    document
+        .top_level_index(top_id)
+        .is_some_and(|index| document.top_level_visibility().nth(index).unwrap_or(false))
 }

@@ -21,7 +21,11 @@ impl RichDocumentView {
         CommandOutcome::Executed
     }
 
-    pub(super) fn execute_insert_table_row(&mut self, after: bool, cx: &mut Context<Self>) -> CommandOutcome {
+    pub(super) fn execute_insert_table_row(
+        &mut self,
+        after: bool,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
         self.ime_preedit = None;
         self.history.break_coalescing();
         let Some(context) = self.active_table_context() else {
@@ -202,10 +206,12 @@ impl RichDocumentView {
         let Some(context) = self.active_table_context() else {
             return CommandOutcome::NoOp;
         };
-        match self
-            .document
-            .next_table_cell_pos(context.table_id, context.row, context.cell_index, forward)
-        {
+        match self.document.next_table_cell_pos(
+            context.table_id,
+            context.row,
+            context.cell_index,
+            forward,
+        ) {
             Some(crate::model::TableCellStep::MoveTo(pos)) => {
                 let next_selection = DocumentSelection::caret(pos, Affinity::Downstream);
                 self.update_selection(Some(next_selection), cx);
@@ -225,7 +231,6 @@ impl RichDocumentView {
             _ => CommandOutcome::NoOp,
         }
     }
-
 }
 
 impl RichDocumentView {

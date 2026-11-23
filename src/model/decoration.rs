@@ -72,13 +72,19 @@ impl fmt::Display for DecorationError {
         match self {
             Self::NonTextBlock => formatter.write_str("block does not contain inline text"),
             Self::OutOfBounds { offset, len } => {
-                write!(formatter, "byte offset {offset} out of bounds for length {len}")
+                write!(
+                    formatter,
+                    "byte offset {offset} out of bounds for length {len}"
+                )
             }
             Self::InvalidOrder { start, end } => {
                 write!(formatter, "invalid byte range order: {start}..{end}")
             }
             Self::InvalidUtf8Boundary { offset } => {
-                write!(formatter, "byte offset {offset} is not a UTF-8 character boundary")
+                write!(
+                    formatter,
+                    "byte offset {offset} is not a UTF-8 character boundary"
+                )
             }
         }
     }
