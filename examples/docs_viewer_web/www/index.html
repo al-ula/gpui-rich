@@ -1,0 +1,219 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>gpui-rich - Web Viewer</title>
+    <style>
+      * {
+        margin: 0;
+        padding: 0;
+        box-sizing: border-box;
+      }
+
+      html,
+      body {
+        width: 100%;
+        height: 100%;
+        overflow: hidden;
+        background: #ffffff;
+        color: #1f2328;
+        font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial,
+          sans-serif;
+      }
+
+      body > canvas {
+        position: fixed;
+        inset: 0;
+        display: block;
+        width: 100%;
+        height: 100%;
+      }
+
+      #loading {
+        position: fixed;
+        inset: 0;
+        z-index: 10;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 14px;
+        background: #ffffff;
+        padding: 24px;
+        text-align: center;
+      }
+
+      .spinner {
+        width: 36px;
+        height: 36px;
+        border: 3px solid #d0d7de;
+        border-top-color: #0b57d0;
+        border-radius: 50%;
+        animation: spin 0.9s linear infinite;
+      }
+
+      #loading-status {
+        font-size: 14px;
+        color: #59636e;
+        max-width: 520px;
+        line-height: 1.5;
+      }
+
+      #loading-status.error {
+        color: #cf222e;
+      }
+
+      @keyframes spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <div id="loading">
+      <div class="spinner" id="loading-spinner"></div>
+      <p id="loading-status">Loading fonts and WebAssembly module...</p>
+    </div>
+
+    <script type="module">
+      import init, { start } from "./pkg/docs_viewer_web.js";
+
+      const FONT_SOURCES = [
+        {
+          local: "./fonts/IBMPlexSans-Regular.ttf",
+          cdn: "https://cdn.jsdelivr.net/gh/IBM/plex@master/packages/plex-sans/fonts/complete/ttf/IBMPlexSans-Regular.ttf",
+          required: true,
+        },
+        {
+          local: "./fonts/IBMPlexSans-SemiBold.ttf",
+          cdn: "https://cdn.jsdelivr.net/gh/IBM/plex@master/packages/plex-sans/fonts/complete/ttf/IBMPlexSans-SemiBold.ttf",
+        },
+        {
+          local: "./fonts/IBMPlexSans-Bold.ttf",
+          cdn: "https://cdn.jsdelivr.net/gh/IBM/plex@master/packages/plex-sans/fonts/complete/ttf/IBMPlexSans-Bold.ttf",
+        },
+        {
+          local: "./fonts/IBMPlexSans-Italic.ttf",
+          cdn: "https://cdn.jsdelivr.net/gh/IBM/plex@master/packages/plex-sans/fonts/complete/ttf/IBMPlexSans-Italic.ttf",
+        },
+        {
+          local: "./fonts/IBMPlexSans-BoldItalic.ttf",
+          cdn: "https://cdn.jsdelivr.net/gh/IBM/plex@master/packages/plex-sans/fonts/complete/ttf/IBMPlexSans-BoldItalic.ttf",
+        },
+        {
+          local: "./fonts/IBMPlexSerif-Regular.ttf",
+          cdn: "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/ibmplexserif/IBMPlexSerif-Regular.ttf",
+        },
+        {
+          local: "./fonts/IBMPlexSerif-Bold.ttf",
+          cdn: "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/ibmplexserif/IBMPlexSerif-Bold.ttf",
+        },
+        {
+          local: "./fonts/IBMPlexSerif-Italic.ttf",
+          cdn: "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/ibmplexserif/IBMPlexSerif-Italic.ttf",
+        },
+        {
+          local: "./fonts/IBMPlexSerif-BoldItalic.ttf",
+          cdn: "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/ibmplexserif/IBMPlexSerif-BoldItalic.ttf",
+        },
+        {
+          local: "./fonts/IBMPlexMono-Regular.ttf",
+          cdn: "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/ibmplexmono/IBMPlexMono-Regular.ttf",
+        },
+        {
+          local: "./fonts/IBMPlexMono-Bold.ttf",
+          cdn: "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/ibmplexmono/IBMPlexMono-Bold.ttf",
+        },
+        {
+          local: "./fonts/IBMPlexMono-Italic.ttf",
+          cdn: "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/ibmplexmono/IBMPlexMono-Italic.ttf",
+        },
+        {
+          local: "./fonts/NotoSansHebrew.ttf",
+          cdn: "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/notosanshebrew/NotoSansHebrew%5Bwdth%2Cwght%5D.ttf",
+        },
+        {
+          local: "./fonts/NotoSansArabic.ttf",
+          cdn: "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/notosansarabic/NotoSansArabic%5Bwdth%2Cwght%5D.ttf",
+        },
+        {
+          local: "./fonts/NotoSansSymbols2-Regular.ttf",
+          cdn: "https://cdn.jsdelivr.net/gh/google/fonts@main/ofl/notosanssymbols2/NotoSansSymbols2-Regular.ttf",
+        },
+      ];
+
+      const statusElement = document.getElementById("loading-status");
+      const spinnerElement = document.getElementById("loading-spinner");
+
+      function showError(message) {
+        if (spinnerElement) {
+          spinnerElement.style.display = "none";
+        }
+        if (statusElement) {
+          statusElement.textContent = message;
+          statusElement.classList.add("error");
+        }
+      }
+
+      async function tryFetchFont(url) {
+        try {
+          const response = await fetch(url);
+          if (!response.ok) {
+            return null;
+          }
+          const contentType = response.headers.get("content-type") || "";
+          if (contentType.includes("text/html")) {
+            return null;
+          }
+          return new Uint8Array(await response.arrayBuffer());
+        } catch (_error) {
+          return null;
+        }
+      }
+
+      async function fetchAllFonts() {
+        const [primary, ...rest] = FONT_SOURCES;
+        const localPrimary = await tryFetchFont(primary.local);
+        const useLocal = localPrimary !== null;
+
+        const primaryBytes = localPrimary ?? (await tryFetchFont(primary.cdn));
+        if (!primaryBytes) {
+          throw new Error(`Could not load required font: ${primary.local}`);
+        }
+
+        const otherBytes = await Promise.all(
+          rest.map(async (source) => {
+            const urls = useLocal ? [source.local, source.cdn] : [source.cdn];
+            for (const url of urls) {
+              const bytes = await tryFetchFont(url);
+              if (bytes) {
+                return bytes;
+              }
+            }
+            console.warn(`Optional font unavailable: ${source.local}`);
+            return null;
+          }),
+        );
+
+        return [primaryBytes, ...otherBytes.filter((bytes) => bytes !== null)];
+      }
+
+      async function boot() {
+        try {
+          const [_, fontBuffers] = await Promise.all([init(), fetchAllFonts()]);
+          if (statusElement) {
+            statusElement.textContent = "Initializing WebGPU / WebGL2 renderer...";
+          }
+          start(fontBuffers);
+        } catch (error) {
+          console.error("Failed to start gpui-rich web viewer:", error);
+          showError(`Failed to start gpui-rich web viewer: ${error?.message || error}`);
+        }
+      }
+
+      boot();
+    </script>
+  </body>
+</html>

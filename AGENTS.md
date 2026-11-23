@@ -7,7 +7,8 @@ This crate implements a non-paginated, Google Docs-style rich text renderer on G
 * `src/model.rs` + `src/model/` (pure Rust, zero GPUI dependency): Hierarchical `BlockNode` tree with stable `BlockId` and `version`, `InlineContent` with normalized contiguous `StyleSpan`s and `\u{FFFC}` sentinels for inline atomic objects, `DocPos` + `Affinity` addressing, `DocumentSelection`, `RichCommand` / `CommandOutcome`, `Transaction` / `Step` mutations with `History` undo/redo, clipboard/HTML codecs, and structural/table edits (`src/model/edit/{structure,table}.rs`).
 * `src/layout.rs` + `src/layout/` (pure Rust, zero GPUI dependency): Generic over `GlyphBackend` and `TextShaper` so headless tests run via `MockShaper` without a GPU window (`cargo test --no-default-features -j 4`). Owns mixed-baseline line composition, UAX #14 wrapping, glyph slicing, tab stops, justification, recursive table/blockquote layout, incremental `LayoutCache`, Fenwick tree `HeightIndex`, collapsible headings, `HorizontalLayout::Fill` vs infinite-length `Paper(PaperSpec)`, and `(BlockId, local_y_offset)` scroll anchoring.
 * `src/gpui.rs` + `src/gpui/` (gated on the default-on `gpui` feature using `gpui-kit 0.10`, `default-features = false`, optional `gpui-fast` feature): `GpuiShaper` over `WindowTextSystem::shape_line`, unified `RichDocumentElement` (`src/gpui/element.rs` + `src/gpui/element/paint.rs`) painting 6 strict z-order layers, and command-driven `RichDocumentView` (`src/gpui/view.rs` + `src/gpui/view/*.rs`, routing all interactions and editing operations through `RichCommand` + `dispatch_command` and `gpui_kit::actions!` scoped to `"RichDocument"`).
-* `examples/docs_viewer.rs`: Interactive showcase application (`cargo run --example docs_viewer`).
+* `examples/docs_viewer.rs`: Interactive desktop showcase application (`cargo run --example docs_viewer`).
+* `examples/docs_viewer_web/`: Standalone WebAssembly showcase crate (`./build.sh --serve`) sharing `DocsViewerApp` with `examples/docs_viewer.rs`.
 
 ### Dependency Note (Linux + `gpui-kit`)
 
@@ -33,3 +34,4 @@ On Linux, `gpui-kit` transitively uses `yeslogic-fontconfig-sys`, which queries 
 * Always limit parallel Cargo jobs (for example, `cargo test --no-default-features -j 4`, `cargo check --all-targets -j 4`, `cargo check --all-targets --features gpui-fast -j 4`, `cargo build -j 4`).
 * Keep `src/model` and `src/layout` strictly free of `gpui-kit` imports so `cargo test --no-default-features -j 4` compiles and passes without GPUI.
 * Be conservative when writing tests: create tests only for critical architectural invariants or essential safety contracts. Avoid trivial, redundant, or fixture-heavy tests.
+* Use a headless browser against `examples/docs_viewer_web/` for real-use testing. Prefer built-in harness browser tools when available, otherwise fall back to an installed browser (for example, headless Chromium via Chrome DevTools Protocol).

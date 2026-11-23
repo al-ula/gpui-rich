@@ -1,14 +1,13 @@
 //! Demo GPUI application showcasing the non-paginated `gpui-rich` renderer.
 
 use gpui_kit::{
-    App, AppContext, Bounds, ClipboardItem, Context, Entity, ImageFormat, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Render, SharedString, StatefulInteractiveElement,
-    Styled, Subscription, Window, WindowBounds, WindowOptions, div, px, rgb, size,
+    App, AppContext, ClipboardItem, Context, Entity, ImageFormat, InteractiveElement, IntoElement,
+    MouseButton, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
+    Subscription, Window, div, px, rgb,
 };
 use gpui_rich::gpui::{
     BlockRenderContext, BlockRenderer, CustomRenderOutput, InlineRenderContext, InlineRenderer,
     MemoryAssetProvider, RichDocumentEvent, RichDocumentView, RichTheme,
-    register_default_keybindings,
 };
 use gpui_rich::layout::{InlineBoxMetrics, Insets, pt_to_px};
 use gpui_rich::model::{
@@ -310,7 +309,7 @@ impl DisplayUnit {
     }
 }
 
-struct DocsViewerApp {
+pub struct DocsViewerApp {
     document_view: Entity<RichDocumentView>,
     _event_subscription: Subscription,
     last_paper_spec: PaperSpec,
@@ -323,7 +322,7 @@ struct DocsViewerApp {
 }
 
 impl DocsViewerApp {
-    fn new(cx: &mut Context<Self>) -> Self {
+    pub fn new(cx: &mut Context<Self>) -> Self {
         let document = build_sample_document();
         let assets = MemoryAssetProvider::new();
         assets.insert_encoded(
@@ -2064,7 +2063,11 @@ fn build_sample_document() -> Document {
     document
 }
 
+#[cfg(not(target_family = "wasm"))]
 fn main() {
+    use gpui_kit::{Bounds, WindowBounds, WindowOptions, size};
+    use gpui_rich::gpui::register_default_keybindings;
+
     gpui_kit::application().run(|cx: &mut App| {
         gpui_kit::init(cx);
         register_default_keybindings(cx);
