@@ -9,7 +9,13 @@ use crate::model::style::{BlockStyle, InlineStyle, NamedStyle, SharedStr, StyleI
 use smallvec::SmallVec;
 use std::ops::Range;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(not(target_family = "wasm"))]
+/// Monotonic timestamp type used for [`History`] coalescing windows.
+pub type HistoryInstant = std::time::Instant;
+#[cfg(target_family = "wasm")]
+/// Monotonic timestamp type used for [`History`] coalescing windows on WebAssembly.
+pub type HistoryInstant = web_time::Instant;
 
 /// Atomic, reversible document mutation step.
 #[derive(Clone, Debug, PartialEq)]
@@ -1884,7 +1890,7 @@ pub enum HistoryMergeGroup {
 struct HistoryEntry {
     inverse: Transaction,
     group: HistoryMergeGroup,
-    timestamp: Instant,
+    timestamp: HistoryInstant,
 }
 
 const DEFAULT_COALESCE_WINDOW: Duration = Duration::from_millis(500);
@@ -1921,12 +1927,12 @@ impl History {
 
     /// Pushes an atomic (non-coalescing) inverse transaction onto the undo stack.
     pub fn push_inverse(&mut self, inverse: Transaction) {
-        self.push_inverse_grouped_at(inverse, HistoryMergeGroup::Atomic, Instant::now());
+        self.push_inverse_grouped_at(inverse, HistoryMergeGroup::Atomic, HistoryInstant::now());
     }
 
     /// Pushes an inverse transaction with coalescing metadata using the current clock time.
     pub fn push_inverse_grouped(&mut self, inverse: Transaction, group: HistoryMergeGroup) {
-        self.push_inverse_grouped_at(inverse, group, Instant::now());
+        self.push_inverse_grouped_at(inverse, group, HistoryInstant::now());
     }
 
     /// Pushes an inverse transaction at an explicit `timestamp` (deterministic for unit tests).
@@ -1934,7 +1940,7 @@ impl History {
         &mut self,
         inverse: Transaction,
         group: HistoryMergeGroup,
-        timestamp: Instant,
+        timestamp: HistoryInstant,
     ) {
         self.redo_stack.clear();
 
@@ -1982,7 +1988,7 @@ impl History {
         self.undo_stack.push(HistoryEntry {
             inverse: applied.inverse,
             group: HistoryMergeGroup::Atomic,
-            timestamp: Instant::now(),
+            timestamp: HistoryInstant::now(),
         });
         Some((applied.change_set, target_sel))
     }

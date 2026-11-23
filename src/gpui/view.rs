@@ -101,6 +101,8 @@ pub struct RichDocumentView {
     asset_cache: HashMap<ImageAssetId, LoadedAsset>,
     asset_tasks: HashMap<ImageAssetId, Task<()>>,
     _copy_feedback_task: Task<()>,
+    _paste_task: Task<()>,
+    document_revision: u64,
     was_focused: bool,
     blink_epoch: usize,
     _blink_task: Task<()>,
@@ -159,6 +161,8 @@ impl RichDocumentView {
             asset_cache: HashMap::new(),
             asset_tasks: HashMap::new(),
             _copy_feedback_task: Task::ready(()),
+            _paste_task: Task::ready(()),
+            document_revision: 0,
             was_focused: false,
             blink_epoch: 0,
             _blink_task: Task::ready(()),
@@ -347,6 +351,49 @@ impl RichDocumentView {
         }
     }
 
+    fn handle_paste_action(
+        &mut self,
+        plain_text_only: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.policy.editing.enabled {
+            return;
+        }
+        if let Some(item) = cx.read_from_clipboard() {
+            self.ime_preedit = None;
+            self.paste_clipboard_item(&item, plain_text_only, cx);
+            return;
+        }
+        // Web browsers expose clipboard reads asynchronously behind user activation.
+        let read = cx.read_from_clipboard_async();
+        let target_revision = self.document_revision;
+        let target_selection = self.selection.clone();
+        self._paste_task = cx.spawn_in(window, async move |weak_view, cx| match read.await {
+            Ok(Some(item)) => {
+                if weak_view
+                    .update_in(cx, |view, window, cx| {
+                        if view.policy.editing.enabled
+                            && view.focus_handle.is_focused(window)
+                            && view.document_revision == target_revision
+                            && view.selection == target_selection
+                        {
+                            view.ime_preedit = None;
+                            view.paste_clipboard_item(&item, plain_text_only, cx);
+                        }
+                    })
+                    .is_err()
+                {
+                    // View was dropped before the asynchronous clipboard read completed.
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                eprintln!("rich-gpui: failed to read clipboard for paste: {error}");
+            }
+        });
+    }
+
     /// Encodes the current [`Document`] using a format-typed [`DocumentCodec`].
     pub fn export_document<C: DocumentCodec>(
         &self,
@@ -366,6 +413,8 @@ impl RichDocumentView {
     /// Replaces the displayed [`Document`], resetting selection, undo history, and layout cache.
     pub fn replace_document(&mut self, document: Document, cx: &mut Context<Self>) {
         self.document = document;
+        self.document_revision = self.document_revision.wrapping_add(1);
+        self._paste_task = Task::ready(());
         self.history = History::default();
         self.flow.cache.clear();
         self.extensions.clear_resolved_caches();
@@ -867,15 +916,11 @@ impl Render for RichDocumentView {
                     );
                 }
             }))
-            .on_action(cx.listener(|this, _: &Paste, _window, cx| {
-                if let Some(item) = cx.read_from_clipboard() {
-                    this.paste_clipboard_item(&item, false, cx);
-                }
+            .on_action(cx.listener(|this, _: &Paste, window, cx| {
+                this.handle_paste_action(false, window, cx);
             }))
-            .on_action(cx.listener(|this, _: &PastePlainText, _window, cx| {
-                if let Some(item) = cx.read_from_clipboard() {
-                    this.paste_clipboard_item(&item, true, cx);
-                }
+            .on_action(cx.listener(|this, _: &PastePlainText, window, cx| {
+                this.handle_paste_action(true, window, cx);
             }))
             .on_action(cx.listener(|this, _: &SelectAll, _window, cx| {
                 this.dispatch_command(RichCommand::SelectAll, cx);

@@ -689,6 +689,14 @@ impl EntityInputHandler for RichDocumentView {
         self.dispatch_command(RichCommand::InsertText(preedit.text), cx);
     }
 
+    fn paste(&mut self, item: ClipboardItem, _window: &mut Window, cx: &mut Context<Self>) {
+        if !self.policy.editing.enabled {
+            return;
+        }
+        self.ime_preedit = None;
+        self.paste_clipboard_item(&item, false, cx);
+    }
+
     fn replace_text_in_range(
         &mut self,
         range_utf16: Option<Range<usize>>,

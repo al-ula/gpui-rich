@@ -42,3 +42,6 @@ unicode-segmentation.workspace = true
 [[test]]
 name = "extension_type_safety"
 required-features = ["gpui"]
+
+[target.'cfg(target_family = "wasm")'.dependencies]
+web-time = "1.1.0"

@@ -2878,6 +2878,7 @@ impl RichDocumentView {
     }
 
     fn notify_transaction_applied(&mut self, change_set: ChangeSet, cx: &mut Context<Self>) {
+        self.document_revision = self.document_revision.wrapping_add(1);
         self.refresh_search_matches();
         for (_, middleware) in &mut self.middleware {
             middleware.after_transaction(&change_set, &self.document, self.selection.as_ref());

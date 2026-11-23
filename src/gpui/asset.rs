@@ -290,6 +290,9 @@ impl AssetProvider for MemoryAssetProvider {
 }
 
 /// Local filesystem [`AssetProvider`] resolving `asset_id` relative to a base directory.
+///
+/// Browser and WebAssembly environments do not provide direct filesystem access; use
+/// [`MemoryAssetProvider`] or a custom [`AssetProvider`] on `wasm32` targets.
 pub struct FileAssetProvider {
     base_dir: PathBuf,
 }

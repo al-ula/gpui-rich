@@ -163,6 +163,7 @@ fn resolve_sans_uncached(installed: &[String], window: &Window) -> SharedString 
         |lower| lower.contains("sans") && !lower.contains("mono"),
         window,
     )
+    .or_else(|| find_best_installed(&[], installed, |_| true, window))
     .unwrap_or(system_default)
 }
 
@@ -247,7 +248,11 @@ pub fn resolve_font_family(requested: &str, window: &Window) -> SharedString {
         resolve_sans_uncached(&installed, window)
     };
 
-    if let Ok(mut guard) = font_cache().write() {
+    // Skip caching when the font database is empty (for example, on WebAssembly before
+    // bundled fonts are registered via `text_system().add_fonts(...)`).
+    if !installed.is_empty()
+        && let Ok(mut guard) = font_cache().write()
+    {
         guard.insert(cache_key, resolved.clone());
     }
     resolved
