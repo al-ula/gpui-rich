@@ -5,13 +5,13 @@ use gpui_kit::{
     IntoElement, MouseButton, ParentElement, Render, SharedString, StatefulInteractiveElement,
     Styled, Subscription, Window, WindowBounds, WindowOptions, div, px, rgb, size,
 };
-use rich_gpui::{
+use gpui_rich::gpui::{
     BlockRenderContext, BlockRenderer, CustomRenderOutput, InlineRenderContext, InlineRenderer,
     MemoryAssetProvider, RichDocumentEvent, RichDocumentView, RichTheme,
     register_default_keybindings,
 };
-use rich_layout::{InlineBoxMetrics, Insets, pt_to_px};
-use rich_model::{
+use gpui_rich::layout::{InlineBoxMetrics, Insets, pt_to_px};
+use gpui_rich::model::{
     BaselineShift, BlockByteRange, BlockKind, BlockNode, BlockSpec, BlockStyle, BlockWidth,
     ChipKind, ColumnSpec, DecorationContext, DecorationProvider, DecorationWriter, Document, Edges,
     FontWeight, HorizontalLayout, ImageAssetId, InlineContent, InlineDecorationStyle, InlineObject,
@@ -778,7 +778,7 @@ impl Render for DocsViewerApp {
             .bg(root_bg)
             .child(toolbar);
 
-        let mut active_font_selection: Option<SelectionValue<rich_model::SharedStr>> = None;
+        let mut active_font_selection: Option<SelectionValue<gpui_rich::model::SharedStr>> = None;
 
         if policy.editing.enabled {
             let (
@@ -1250,7 +1250,7 @@ impl Render for DocsViewerApp {
                         || (value == ".SystemUIFont" && active.eq_ignore_ascii_case("sans-serif"))
                 });
                 let font_value = value.to_owned();
-                let preview_family = rich_gpui::resolve_font_family(value, window);
+                let preview_family = gpui_rich::gpui::resolve_font_family(value, window);
                 list = list.child(
                     div()
                         .id(("font-generic", index))

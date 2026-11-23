@@ -2,11 +2,11 @@
 
 ## Architecture Invariants
 
-This workspace implements a non-paginated, Google Docs-style rich text renderer on GPUI designed to grow cleanly into a full editor. Preserve these crate boundaries:
+This workspace implements a non-paginated, Google Docs-style rich text renderer on GPUI designed to grow cleanly into a full editor. Preserve these module and feature boundaries inside `gpui-rich`:
 
-* `crates/rich-model` (pure Rust, zero GPUI dependency): Hierarchical `BlockNode` tree with stable `BlockId` and `version`, `InlineContent` with normalized contiguous `StyleSpan`s and `\u{FFFC}` sentinels for inline atomic objects, `DocPos` + `Affinity` addressing, `DocumentSelection`, `RichCommand` / `CommandOutcome`, and `Transaction` / `Step` mutations with `History` undo/redo.
-* `crates/rich-layout` (pure Rust, zero GPUI dependency): Generic over `GlyphBackend` and `TextShaper` so headless tests run via `MockShaper` without a GPU window. Owns mixed-baseline line composition, UAX #14 wrapping, glyph slicing, tab stops, justification, recursive table/blockquote layout, incremental `LayoutCache`, Fenwick tree `HeightIndex`, collapsible headings, `HorizontalLayout::Fill` vs infinite-length `Paper(PaperSpec)`, and `(BlockId, local_y_offset)` scroll anchoring.
-* `crates/rich-gpui` (`gpui-kit 0.10`, `default-features = false`, optional `gpui-fast` feature): `GpuiShaper` over `WindowTextSystem::shape_line`, unified `RichDocumentElement` painting 6 strict z-order layers, and command-driven `RichDocumentView` (all interactions and Phase 2 editing operations route through `RichCommand` + `dispatch_command` and `gpui_kit::actions!` scoped to `"RichDocument"`).
+* `src/model.rs` + `src/model/` (pure Rust, zero GPUI dependency): Hierarchical `BlockNode` tree with stable `BlockId` and `version`, `InlineContent` with normalized contiguous `StyleSpan`s and `\u{FFFC}` sentinels for inline atomic objects, `DocPos` + `Affinity` addressing, `DocumentSelection`, `RichCommand` / `CommandOutcome`, `Transaction` / `Step` mutations with `History` undo/redo, clipboard/HTML codecs, and structural/table edits (`src/model/edit/{structure,table}.rs`).
+* `src/layout.rs` + `src/layout/` (pure Rust, zero GPUI dependency): Generic over `GlyphBackend` and `TextShaper` so headless tests run via `MockShaper` without a GPU window (`cargo test --no-default-features -j 4`). Owns mixed-baseline line composition, UAX #14 wrapping, glyph slicing, tab stops, justification, recursive table/blockquote layout, incremental `LayoutCache`, Fenwick tree `HeightIndex`, collapsible headings, `HorizontalLayout::Fill` vs infinite-length `Paper(PaperSpec)`, and `(BlockId, local_y_offset)` scroll anchoring.
+* `src/gpui.rs` + `src/gpui/` (gated on the default-on `gpui` feature using `gpui-kit 0.10`, `default-features = false`, optional `gpui-fast` feature): `GpuiShaper` over `WindowTextSystem::shape_line`, unified `RichDocumentElement` (`src/gpui/element.rs` + `src/gpui/element/paint.rs`) painting 6 strict z-order layers, and command-driven `RichDocumentView` (`src/gpui/view.rs` + `src/gpui/view/*.rs`, routing all interactions and editing operations through `RichCommand` + `dispatch_command` and `gpui_kit::actions!` scoped to `"RichDocument"`).
 * `examples/docs_viewer`: Interactive showcase application.
 
 ### Dependency Note (Linux + `gpui-kit`)
@@ -30,5 +30,6 @@ On Linux, `gpui-kit` transitively uses `yeslogic-fontconfig-sys`, which queries 
 
 ## Testing & Build Strategy
 
-* Always limit parallel Cargo jobs (for example, `cargo check --workspace -j 4`, `cargo build -j 4`, `cargo test -p rich-model -p rich-layout -j 4`).
+* Always limit parallel Cargo jobs (for example, `cargo test --no-default-features -j 4`, `cargo check --workspace -j 4`, `cargo check --workspace --features gpui-fast -j 4`, `cargo build -j 4`).
+* Keep `src/model` and `src/layout` strictly free of `gpui-kit` imports so `cargo test --no-default-features -j 4` compiles and passes without GPUI.
 * Be conservative when writing tests: create tests only for critical architectural invariants or essential safety contracts. Avoid trivial, redundant, or fixture-heavy tests.

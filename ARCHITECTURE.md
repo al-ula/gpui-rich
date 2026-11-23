@@ -1,6 +1,6 @@
 # `gpui-rich` Architecture & Progress
 
-Current baseline: `master` with `rich-gpui` targeting `gpui-kit 0.10` (`default-features = false`, optional `gpui-fast` feature).
+Current baseline: `master` with single crate `gpui-rich` (`model`, `layout`, and feature-gated `gpui` targeting `gpui-kit 0.10`, `default-features = false`, optional `gpui-fast` feature).
 
 ---
 
@@ -12,33 +12,33 @@ Current baseline: `master` with `rich-gpui` targeting `gpui-kit 0.10` (`default-
 
 | Area | Implemented Design | Key Files |
 | :--- | :--- | :--- |
-| **Horizontal Canvas Modes** | Separate `HorizontalLayout::Fill` (edge-to-edge responsive reflow) and `HorizontalLayout::Paper(PaperSpec)` (continuous infinite-length paper sheet with fixed typographic width, centered on a neutral desk backdrop, horizontal scroll when narrower or zoomed in). | `crates/rich-model/src/style.rs`, `crates/rich-layout/src/flow.rs`, `crates/rich-gpui/src/element.rs` |
-| **Text Shaping** | Run-segmented line composer over GPUI's native `WindowTextSystem::shape_line`, decoupled behind `GlyphBackend` (`Font` + `Glyph`) and `TextShaper`. Headless tests use `MockShaper`, while GPUI uses `GpuiShaper` with native OS font fallback, emoji, and `OnceLock`-cached monospace font resolution. | `crates/rich-layout/src/shaper.rs`, `crates/rich-gpui/src/shaper.rs` |
-| **Document Model** | Hierarchical `BlockNode` tree with monotonic `BlockId` + `version`, normalized contiguous `StyleSpan`s, `\u{FFFC}` atomic inline object sentinels, cached UTF-8/UTF-16 offsets, `DocPos` + `Affinity`, `DocumentSelection` (`Text` & `TableCells`), `RichCommand` / `CommandOutcome`, and `Transaction` / `Step` + `History` undo/redo. | `crates/rich-model/src/block.rs`, `crates/rich-model/src/inline.rs`, `crates/rich-model/src/selection.rs`, `crates/rich-model/src/command.rs`, `crates/rich-model/src/transaction.rs` |
-| **Command Pipeline** | Every viewer and editor interaction flows through `RichCommand` dispatched at `RichDocumentView::dispatch_command_with_source`, backed by `gpui_kit::actions!` (`rich_document::*`), `"RichDocument"` key context, `register_default_keybindings`, `InteractionPolicy` + `CommandSource` gating, `CommandMiddleware`, `EventEmitter<RichDocumentEvent>`, and `Transaction` + coalesced `History`. | `crates/rich-model/src/command.rs`, `crates/rich-gpui/src/view.rs` |
-| **Mixed-Baseline Line Composer** | Batches uniform `(font_size, baseline_shift, bidi_level)` runs, wraps with `unicode-linebreak` (UAX #14) plus UAX #29 emergency grapheme breaking, slices shaped glyph runs, resolves tab stops, computes shared baselines for mixed sizes/sub/sup/inline boxes, and applies Left/Center/Right/Justify alignment. | `crates/rich-layout/src/line.rs` |
-| **Virtualization & Flow** | Incremental `LayoutCache` keyed by `(BlockId, version, quantized_width, quantized_zoom)`, Fenwick tree `HeightIndex` (`O(log N)` prefix sum, updates, and `index_at_y`), margin collapsing, collapsible headings, and `(BlockId, local_y_offset)` scroll anchoring. | `crates/rich-layout/src/block.rs`, `crates/rich-layout/src/flow.rs` |
-| **GPUI Canvas & Interaction** | Single unified `RichDocumentElement` (`gpui_kit::Element`) painting 6 strict z-order layers (`paint_quad`, `paint_shadows`, `paint_glyph`, `paint_emoji`, `paint_underline`, `paint_strikethrough`), hosted by `RichDocumentView` with vertical + horizontal scrolling, anchored zoom, clickable links, and recursive selection/copy. Compatible with `gpui-kit` apps (both default `gpui-pre` and `gpui-fast` backends). | `crates/rich-gpui/src/element.rs`, `crates/rich-gpui/src/view.rs` |
+| **Horizontal Canvas Modes** | Separate `HorizontalLayout::Fill` (edge-to-edge responsive reflow) and `HorizontalLayout::Paper(PaperSpec)` (continuous infinite-length paper sheet with fixed typographic width, centered on a neutral desk backdrop, horizontal scroll when narrower or zoomed in). | `src/model/style.rs`, `src/layout/flow.rs`, `src/gpui/element.rs` |
+| **Text Shaping** | Run-segmented line composer over GPUI's native `WindowTextSystem::shape_line`, decoupled behind `GlyphBackend` (`Font` + `Glyph`) and `TextShaper`. Headless tests use `MockShaper`, while GPUI uses `GpuiShaper` with native OS font fallback, emoji, and `OnceLock`-cached monospace font resolution. | `src/layout/shaper.rs`, `src/gpui/shaper.rs` |
+| **Document Model** | Hierarchical `BlockNode` tree with monotonic `BlockId` + `version`, normalized contiguous `StyleSpan`s, `\u{FFFC}` atomic inline object sentinels, cached UTF-8/UTF-16 offsets, `DocPos` + `Affinity`, `DocumentSelection` (`Text` & `TableCells`), `RichCommand` / `CommandOutcome`, and `Transaction` / `Step` + `History` undo/redo. | `src/model/block.rs`, `src/model/inline.rs`, `src/model/selection.rs`, `src/model/command.rs`, `src/model/transaction.rs` |
+| **Command Pipeline** | Every viewer and editor interaction flows through `RichCommand` dispatched at `RichDocumentView::dispatch_command_with_source`, backed by `gpui_kit::actions!` (`rich_document::*`), `"RichDocument"` key context, `register_default_keybindings`, `InteractionPolicy` + `CommandSource` gating, `CommandMiddleware`, `EventEmitter<RichDocumentEvent>`, and `Transaction` + coalesced `History`. | `src/model/command.rs`, `src/gpui/view.rs`, `src/gpui/view/commands.rs` |
+| **Mixed-Baseline Line Composer** | Batches uniform `(font_size, baseline_shift, bidi_level)` runs, wraps with `unicode-linebreak` (UAX #14) plus UAX #29 emergency grapheme breaking, slices shaped glyph runs, resolves tab stops, computes shared baselines for mixed sizes/sub/sup/inline boxes, and applies Left/Center/Right/Justify alignment. | `src/layout/line.rs` |
+| **Virtualization & Flow** | Incremental `LayoutCache` keyed by `(BlockId, version, quantized_width, quantized_zoom)`, Fenwick tree `HeightIndex` (`O(log N)` prefix sum, updates, and `index_at_y`), margin collapsing, collapsible headings, and `(BlockId, local_y_offset)` scroll anchoring. | `src/layout/block.rs`, `src/layout/flow.rs` |
+| **GPUI Canvas & Interaction** | Single unified `RichDocumentElement` (`gpui_kit::Element`) painting 6 strict z-order layers (`paint_quad`, `paint_shadows`, `paint_glyph`, `paint_emoji`, `paint_underline`, `paint_strikethrough`), hosted by `RichDocumentView` with vertical + horizontal scrolling, anchored zoom, clickable links, and recursive selection/copy. Compatible with `gpui-kit` apps (both default `gpui-pre` and `gpui-fast` backends). | `src/gpui/element.rs`, `src/gpui/element/paint.rs`, `src/gpui/view.rs` |
 
 ### System Data Flow
 
 ```mermaid
 flowchart TD
-    subgraph Model["crates/rich-model (pure Rust)"]
+    subgraph Model["src/model (pure Rust)"]
         Doc["Document Tree (BlockNode, BlockId, version)"]
         Inline["InlineContent (UTF-8 + StyleSpans + U+FFFC Objects)"]
         Sel["Addressing (DocPos, Affinity, Text & TableCells Selection)"]
         Tx["Transactions & History (Step, ChangeSet, Undo/Redo)"]
     end
 
-    subgraph Layout["crates/rich-layout (pure Rust)"]
+    subgraph Layout["src/layout (pure Rust)"]
         Shaper["GlyphBackend + TextShaper (GpuiShaper / MockShaper)"]
         Line["Line Composer (UAX #14, Glyph Slicing, Shared Baseline, Tabs, Justify)"]
         Cache["Incremental LayoutCache + Recursive Block/Table Layout"]
         Flow["FlowLayout (Fill / Infinite Paper, Fenwick HeightIndex, Scroll Anchor)"]
     end
 
-    subgraph Render["crates/rich-gpui (gpui-kit 0.10)"]
+    subgraph Render["src/gpui (feature = gpui, gpui-kit 0.10)"]
         View["RichDocumentView (Scroll X/Y, Zoom, Selection, Links, Copy)"]
         Elem["RichDocumentElement (request_layout / prepaint / 6-Layer paint)"]
     end
@@ -78,7 +78,7 @@ flowchart TD
 `gpui-rich` owns core document commands and GPUI actions while keeping keymap policy, chrome, and app-level workflows decoupled for the consuming `gpui-kit` application:
 
 * **Owned by `gpui-rich`**:
-  * Unified `RichCommand` enum (`crates/rich-model/src/command.rs`) with stable dot-namespaced `command_id()` values, `is_document_mutation()` guards, and `CommandSource` (`User` vs `Programmatic`).
+  * Unified `RichCommand` enum (`src/model/command.rs`) with stable dot-namespaced `command_id()` values, `is_document_mutation()` guards, and `CommandSource` (`User` vs `Programmatic`).
   * `InteractionPolicy` groups per-view runtime switches under `reading` and `editing`, with nested `editing.formatting` and `editing.tables` groups. Parent switches mask their children without resetting them. Start from `viewer()`, `static_preview()`, or `editable()` and customize the switches.
   * `RichDocumentView::dispatch_command` is the execution seam backed by `Transaction` and coalesced `History`. User commands respect the feature switches after middleware. Programmatic commands bypass the interaction policy and still run through middleware, transactions, layout synchronization, and host events.
   * Three-layer editing input model:
@@ -87,7 +87,7 @@ flowchart TD
     * `History` coalescing groups sequential typing bursts into single undo entries so Undo reverts words or typing bursts cleanly.
 * **Owned by the consuming host app**:
   * Application chrome (toolbars, menus, outline sidebar, slash menus, command palette) built with `gpui-kit` / `gpui-component` and dispatching `RichCommand` or GPUI actions.
-  * Keymap customization (either calling `register_default_keybindings(cx)` for defaults, or binding custom app keymaps / Vim modes directly to `rich_gpui::*` actions or `dispatch_command`).
+  * Keymap customization (either calling `register_default_keybindings(cx)` for defaults, or binding custom app keymaps / Vim modes directly to `gpui_rich::gpui::*` actions or `dispatch_command`).
   * App-level commands (Save, Export, File Open, Comments, AI actions) composed over `RichCommand` and `Transaction`.
 
 Use `with_policy` when constructing a view or `set_policy` to change it live. For example, a host can expose Markdown-oriented editing controls without arbitrary styles, rich paste, or table authoring:
@@ -110,10 +110,10 @@ The policy controls interactions, not what renders or what a codec accepts. A ho
 
 ### `gpui-kit` Integration
 
-* `crates/rich-model` and `crates/rich-layout` remain pure Rust with zero GPUI or `gpui-kit` dependencies.
-* `crates/rich-gpui` depends on `gpui-kit = { version = "0.10", default-features = false }` (pulling GPUI core and `gpui-base` while keeping `gpui-component` and `gpui-kit-assets` optional for the host app) and exposes a `gpui-fast` feature forwarding `gpui-kit/gpui-fast`.
-* Actions use `gpui_kit::actions!` so `rich-gpui` works identically under both default `gpui-pre` and `gpui-fast` backends.
-* **Native Code Blocks & Reference Architecture**: `BlockKind::CodeBlock` stays native to `rich-layout` and `RichDocumentElement` so documents retain unified cross-block selection, a single `Transaction`/`History` undo stack, pure-Rust layout virtualization, and minimal `gpui-kit` feature requirements. Syntax highlighting attaches via `DecorationProvider` on Layer 4. `gpui-kit`'s editor implementation (`gpui-base/src/input/` for IME, caret blinking, navigation, selection, gutters, and decorations, and `gpui-component/src/highlighter/` for `syntect`/`tree-sitter` highlighting) serves as an architectural reference for Phase 2 editing and code block enhancements.
+* `src/model` and `src/layout` remain pure Rust with zero GPUI or `gpui-kit` dependencies (`cargo test --no-default-features -j 4`).
+* The default-enabled `gpui` feature depends on `gpui-kit = { version = "0.10", default-features = false }` (pulling GPUI core and `gpui-base` while keeping `gpui-component` and `gpui-kit-assets` optional for the host app) and exposes a `gpui-fast` feature forwarding `gpui-kit/gpui-fast`, guarded by a compile-time `gpui_kit::GPUI_FAST` check.
+* Actions use `gpui_kit::actions!` so `gpui-rich` works identically under both default `gpui-pre` and `gpui-fast` backends.
+* **Native Code Blocks & Reference Architecture**: `BlockKind::CodeBlock` stays native to `layout` and `RichDocumentElement` so documents retain unified cross-block selection, a single `Transaction`/`History` undo stack, pure-Rust layout virtualization, and minimal `gpui-kit` feature requirements. Syntax highlighting attaches via `DecorationProvider` on Layer 4. `gpui-kit`'s editor implementation (`gpui-base/src/input/` for IME, caret blinking, navigation, selection, gutters, and decorations, and `gpui-component/src/highlighter/` for `syntect`/`tree-sitter` highlighting) serves as an architectural reference for Phase 2 editing and code block enhancements.
 
 ### Extensibility Architecture (3 Core Seams)
 
@@ -186,8 +186,8 @@ The policy controls interactions, not what renders or what a codec accepts. A ho
 
 All existing non-editing command variants have handlers. Fix dispatch and navigation behavior before expanding the command API.
 
-1. **Separate table navigation from row insertion.** In `rich-gpui/src/view.rs`, make `NavigateTableCell` move the selection or return `NoOp` at a boundary; it must never insert a row. Route Tab and Shift+Tab to table navigation when the selection is in a table, and to `Indent`/`Outdent` otherwise. Resolve forward Tab at the last cell in editable mode to the existing `InsertTableRow` command so middleware, events, and undo see an edit. Verify read-only Tab and Shift+Tab move between cells, boundary navigation does not change rows or history, and editable Tab at the last cell appends one row that Undo removes.
+1. **Separate table navigation from row insertion.** In `src/gpui/view/table.rs`, make `NavigateTableCell` move the selection or return `NoOp` at a boundary; it must never insert a row. Route Tab and Shift+Tab to table navigation when the selection is in a table, and to `Indent`/`Outdent` otherwise. Resolve forward Tab at the last cell in editable mode to the existing `InsertTableRow` command so middleware, events, and undo see an edit. Verify read-only Tab and Shift+Tab move between cells, boundary navigation does not change rows or history, and editable Tab at the last cell appends one row that Undo removes.
 2. **Dispatch smart-chip activation.** Add a non-mutating `RichCommand` carrying `BlockId` and `InlineObjectId`. Resolve the object from the document at dispatch time and gate activation on `InteractionPolicy::can_activate_smart_chips`. Route mouse activation through that command; preserve the existing popover toggle, activation event, and drag behavior. Verify that middleware can cancel activation and that static preview neither opens the popover nor emits `SmartChipActivated`.
-3. **Match paragraph navigation to its name.** In `rich-model/src/navigation.rs`, make `PreviousParagraph` and `NextParagraph` target paragraph blocks, not every block with inline text. Check the `MoveCaret` caller that shares these targets. Add a focused model regression covering both directions with headings, code blocks, and folded content between visible paragraphs; run `cargo test -p rich-model paragraph_navigation -j 4`. Exercise the table and chip scenarios above in `docs_viewer`.
+3. **Match paragraph navigation to its name.** In `src/model/navigation.rs`, make `PreviousParagraph` and `NextParagraph` target paragraph blocks, not every block with inline text. Check the `MoveCaret` caller that shares these targets. Add a focused model regression covering both directions with headings, code blocks, and folded content between visible paragraphs; run `cargo test --no-default-features paragraph_navigation -j 4`. Exercise the table and chip scenarios above in `docs_viewer`.
 
 **Optional reader affordances:** Add Page Up / Page Down actions using the viewport height and existing `ScrollBy` command; no new model command needed. If a host adds a find bar, use an empty `Find` query to clear the highlights and report `Executed` when that changes search state. Keep the find UI and its shortcuts host-owned.

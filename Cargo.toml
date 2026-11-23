@@ -1,9 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/rich-model",
-    "crates/rich-layout",
-    "crates/rich-gpui",
+    ".",
     "examples/docs_viewer",
 ]
 
@@ -20,6 +18,27 @@ smallvec = { version = "1", features = ["serde"] }
 unicode-linebreak = "0.1"
 unicode-segmentation = "1"
 
-rich-model = { path = "crates/rich-model" }
-rich-layout = { path = "crates/rich-layout" }
-rich-gpui = { path = "crates/rich-gpui" }
+[package]
+name = "gpui-rich"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = ["gpui"]
+gpui = ["dep:gpui-kit"]
+gpui-fast = ["gpui", "gpui-kit/gpui-fast"]
+
+[dependencies]
+gpui-kit = { workspace = true, optional = true }
+regex = "1"
+serde.workspace = true
+serde_json.workspace = true
+smallvec.workspace = true
+unicode-bidi = "0.3.18"
+unicode-linebreak.workspace = true
+unicode-segmentation.workspace = true
+
+[[test]]
+name = "extension_type_safety"
+required-features = ["gpui"]

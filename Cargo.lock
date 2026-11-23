@@ -1295,9 +1295,7 @@ name = "docs_viewer"
 version = "0.1.0"
 dependencies = [
  "gpui-kit",
- "rich-gpui",
- "rich-layout",
- "rich-model",
+ "gpui-rich",
  "serde",
  "serde_json",
 ]
@@ -2934,6 +2932,20 @@ name = "gpui-pre-ztracing-macro"
 version = "0.3.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "85701631a9bbecf47e6d19f145e85e57767e7c50f7192d5b1bf65b5ef43cb373"
+
+[[package]]
+name = "gpui-rich"
+version = "0.1.0"
+dependencies = [
+ "gpui-kit",
+ "regex",
+ "serde",
+ "serde_json",
+ "smallvec",
+ "unicode-bidi",
+ "unicode-linebreak",
+ "unicode-segmentation",
+]
 
 [[package]]
 name = "granit-parser"
@@ -5567,41 +5579,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "47b34b781b31e5d73e9fbc8689c70551fd1ade9a19e3e28cfec8580a79290cc4"
 dependencies = [
  "bytemuck",
-]
-
-[[package]]
-name = "rich-gpui"
-version = "0.1.0"
-dependencies = [
- "gpui-kit",
- "rich-layout",
- "rich-model",
- "serde",
- "serde_json",
- "unicode-segmentation",
-]
-
-[[package]]
-name = "rich-layout"
-version = "0.1.0"
-dependencies = [
- "rich-model",
- "serde_json",
- "smallvec",
- "unicode-bidi",
- "unicode-linebreak",
- "unicode-segmentation",
-]
-
-[[package]]
-name = "rich-model"
-version = "0.1.0"
-dependencies = [
- "regex",
- "serde",
- "serde_json",
- "smallvec",
- "unicode-segmentation",
 ]
 
 [[package]]

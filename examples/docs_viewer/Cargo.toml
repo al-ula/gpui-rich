@@ -5,12 +5,10 @@ edition.workspace = true
 license.workspace = true
 
 [features]
-gpui-fast = ["gpui-kit/gpui-fast", "rich-gpui/gpui-fast"]
+gpui-fast = ["gpui-kit/gpui-fast", "gpui-rich/gpui-fast"]
 
 [dependencies]
 gpui-kit.workspace = true
-rich-model.workspace = true
-rich-layout.workspace = true
-rich-gpui.workspace = true
-serde_json.workspace = true
+gpui-rich = { path = "../.." }
 serde.workspace = true
+serde_json.workspace = true
