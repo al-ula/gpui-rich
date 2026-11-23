@@ -386,10 +386,11 @@ pub(crate) fn build_dropdown_options(
     theme: &RichTheme,
     cx: &mut gpui_kit::App,
 ) -> Option<(gpui_kit::AnyElement, usize)> {
-    let (selected_id, options) = view.update(cx, |this, _| {
-        dropdown_options_for_inline(&this.document, popover.block_id, popover.object_id)
-            .map(|(_, selected, options)| (selected, options))
-    })?;
+    let this = view.read(cx);
+    let (_, selected_id, options) =
+        dropdown_options_for_inline(&this.document, popover.block_id, popover.object_id)?;
+    let editing = this.policy.editing;
+    let can_choose = editing.enabled && editing.components;
     let option_count = options.len();
     let mut menu = gpui_kit::div()
         .id("rich-dropdown-options")
@@ -404,18 +405,19 @@ pub(crate) fn build_dropdown_options(
         .flex_col();
     for option in options {
         let selected = option.id == selected_id;
-        let view_for_option = view.clone();
-        let block_id = popover.block_id;
-        let object_id = popover.object_id;
-        let option_id = option.id.clone();
         let row = gpui_kit::div()
             .id(format!("rich-dropdown-option-{}", option.id))
             .px(gpui_kit::px(8.0))
             .py(gpui_kit::px(5.0))
             .rounded(gpui_kit::px(4.0))
             .text_color(if selected { theme.accent } else { theme.text })
-            .cursor_pointer()
-            .on_click(move |_, _, cx| {
+            .child(option.label);
+        menu = if can_choose {
+            let view_for_option = view.clone();
+            let block_id = popover.block_id;
+            let object_id = popover.object_id;
+            let option_id = option.id;
+            menu.child(row.cursor_pointer().on_click(move |_, _, cx| {
                 view_for_option.update(cx, |this, cx| {
                     this.dispatch_command(
                         RichCommand::Component(ComponentCommand::SelectDropdownOption {
@@ -427,9 +429,10 @@ pub(crate) fn build_dropdown_options(
                     );
                     this.dismiss_chip_popover(cx);
                 });
-            })
-            .child(option.label);
-        menu = menu.child(row);
+            }))
+        } else {
+            menu.child(row)
+        };
     }
     Some((menu.into_any_element(), option_count))
 }

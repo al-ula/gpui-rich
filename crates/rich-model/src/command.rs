@@ -259,17 +259,123 @@ pub enum CommandSource {
     Programmatic,
 }
 
-/// Controls which user-initiated interactions and mutations are permitted on a document view.
+/// Reader interactions. Turning off `enabled` masks every child without changing its value.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ReadingFeatures {
+    pub enabled: bool,
+    pub selection: bool,
+    pub links: bool,
+    pub heading_collapse: bool,
+    pub selection_copy: bool,
+    pub code_copy: bool,
+    pub smart_chips: bool,
+    pub read_only_caret: bool,
+}
+
+impl ReadingFeatures {
+    const DEFAULT: Self = Self {
+        enabled: true,
+        selection: true,
+        links: true,
+        heading_collapse: true,
+        selection_copy: true,
+        code_copy: true,
+        smart_chips: true,
+        read_only_caret: false,
+    };
+}
+
+/// Formatting commands. `enabled` masks all formatting children.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct FormattingFeatures {
+    pub enabled: bool,
+    /// Bold, italic, strikethrough, and inline code.
+    pub inline_marks: bool,
+    /// Arbitrary styles, alignment, font size, underline, superscript, and subscript.
+    pub rich_styles: bool,
+    pub headings: bool,
+    pub lists: bool,
+    pub links: bool,
+    pub clear: bool,
+}
+
+impl FormattingFeatures {
+    const DEFAULT: Self = Self {
+        enabled: true,
+        inline_marks: true,
+        rich_styles: true,
+        headings: true,
+        lists: true,
+        links: true,
+        clear: true,
+    };
+}
+
+/// Table authoring controls. Turning these off does not hide tables or prevent ordinary cell typing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct TableEditingFeatures {
+    pub enabled: bool,
+    pub column_resize: bool,
+    /// Row and column operations, cell merges and splits, and structural grid commands.
+    pub structure: bool,
+    /// Clearing or pasting into a rectangular grid selection, and TSV or table paste into a cell.
+    pub grid_editing: bool,
+}
+
+impl TableEditingFeatures {
+    const DEFAULT: Self = Self {
+        enabled: true,
+        column_resize: true,
+        structure: true,
+        grid_editing: true,
+    };
+}
+
+/// Editor interactions. Disabling `enabled` makes user commands read-only.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EditingFeatures {
+    pub enabled: bool,
+    pub formatting: FormattingFeatures,
+    pub tables: TableEditingFeatures,
+    pub history: bool,
+    /// Automatic list markers while typing. Also requires list formatting.
+    pub input_rules: bool,
+    pub plain_paste: bool,
+    pub rich_paste: bool,
+    pub inline_objects: bool,
+    pub image_resize: bool,
+    pub checklist_toggle: bool,
+    pub components: bool,
+    pub anchors: bool,
+    pub find_replace: bool,
+}
+
+impl EditingFeatures {
+    const DEFAULT: Self = Self {
+        enabled: false,
+        formatting: FormattingFeatures::DEFAULT,
+        tables: TableEditingFeatures::DEFAULT,
+        history: true,
+        input_rules: false,
+        plain_paste: true,
+        rich_paste: true,
+        inline_objects: true,
+        image_resize: true,
+        checklist_toggle: true,
+        components: true,
+        anchors: true,
+        find_replace: true,
+    };
+}
+
+/// Per-view feature configuration. Switches govern user interactions, not document content.
 ///
-/// Commands dispatched with [`CommandSource::Programmatic`] bypass user-interaction gates while
-/// still executing through middleware, transactions, layout synchronization, and host events.
+/// Disabling a parent masks its children; re-enabling it restores their configured values.
+/// [`CommandSource::Programmatic`] bypasses the user gates, so this is not a permission boundary.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct InteractionPolicy {
-    pub editable: bool,
-    pub selectable: bool,
-    pub clickable_links: bool,
-    pub collapsible_headings: bool,
-    pub show_caret_read_only: bool,
+    pub reading: ReadingFeatures,
+    pub editing: EditingFeatures,
 }
 
 impl Default for InteractionPolicy {
@@ -279,43 +385,97 @@ impl Default for InteractionPolicy {
 }
 
 impl InteractionPolicy {
-    /// Full editing preset: document mutations, selection, links, and collapsible headings enabled.
+    /// Full editor preset. Automatic list markers remain opt-in.
     pub const fn editable() -> Self {
         Self {
-            editable: true,
-            selectable: true,
-            clickable_links: true,
-            collapsible_headings: true,
-            show_caret_read_only: false,
+            editing: EditingFeatures {
+                enabled: true,
+                ..EditingFeatures::DEFAULT
+            },
+            ..Self::viewer()
         }
     }
 
-    /// Interactive read-only viewer preset: selection, copy, links, and collapsible headings enabled.
+    /// Read-only viewer with reader interactions enabled.
     pub const fn viewer() -> Self {
         Self {
-            editable: false,
-            selectable: true,
-            clickable_links: true,
-            collapsible_headings: true,
-            show_caret_read_only: false,
+            reading: ReadingFeatures::DEFAULT,
+            editing: EditingFeatures::DEFAULT,
         }
     }
 
-    /// Non-interactive preview preset: scrolling and zoom remain active while editing, selection,
-    /// link activation, and heading collapse are disabled for user input.
+    /// Preview with reader and editor interactions disabled. Scrolling and zoom are still active.
     pub const fn static_preview() -> Self {
         Self {
-            editable: false,
-            selectable: false,
-            clickable_links: false,
-            collapsible_headings: false,
-            show_caret_read_only: false,
+            reading: ReadingFeatures {
+                enabled: false,
+                ..ReadingFeatures::DEFAULT
+            },
+            ..Self::viewer()
         }
+    }
+
+    pub const fn can_select(&self) -> bool {
+        self.reading.enabled && self.reading.selection
+    }
+
+    pub const fn can_open_links(&self) -> bool {
+        self.reading.enabled && self.reading.links
+    }
+
+    pub const fn can_collapse_headings(&self) -> bool {
+        self.reading.enabled && self.reading.heading_collapse
+    }
+
+    pub const fn can_copy_code(&self) -> bool {
+        self.reading.enabled && self.reading.code_copy
+    }
+
+    pub const fn can_activate_smart_chips(&self) -> bool {
+        self.reading.enabled && self.reading.smart_chips
+    }
+
+    pub const fn can_toggle_checklists(&self) -> bool {
+        self.editing.enabled && self.editing.checklist_toggle
+    }
+
+    pub const fn can_resize_images(&self) -> bool {
+        self.editing.enabled && self.editing.image_resize
+    }
+
+    pub const fn can_resize_table_columns(&self) -> bool {
+        self.editing.enabled && self.editing.tables.enabled && self.editing.tables.column_resize
+    }
+
+    pub const fn can_edit_table_structure(&self) -> bool {
+        self.editing.enabled && self.editing.tables.enabled && self.editing.tables.structure
+    }
+
+    pub const fn can_edit_grid(&self) -> bool {
+        self.editing.enabled && self.editing.tables.enabled && self.editing.tables.grid_editing
+    }
+
+    pub const fn can_paste_rich_text(&self) -> bool {
+        self.editing.enabled && self.editing.rich_paste
+    }
+
+    pub const fn can_format_lists(&self) -> bool {
+        self.editing.enabled && self.editing.formatting.enabled && self.editing.formatting.lists
+    }
+
+    pub const fn can_apply_rich_styles(&self) -> bool {
+        self.editing.enabled
+            && self.editing.formatting.enabled
+            && self.editing.formatting.rich_styles
+    }
+
+    pub const fn can_apply_input_rules(&self) -> bool {
+        self.editing.input_rules && self.can_format_lists()
     }
 
     /// Returns true when a collapsed caret should be visible.
     pub const fn should_show_caret(&self) -> bool {
-        self.editable || self.show_caret_read_only
+        self.editing.enabled || (self.reading.enabled && self.reading.read_only_caret)
     }
 
     /// Evaluates whether `command` from `source` is permitted under this policy.
@@ -329,34 +489,65 @@ impl InteractionPolicy {
         if source == CommandSource::Programmatic {
             return None;
         }
-        if command.is_document_mutation() && !self.editable {
+        if command.is_document_mutation() && !self.editing.enabled {
             return Some(CommandOutcome::RejectedReadOnly);
         }
-        match command {
+        let formatting = &self.editing.formatting;
+        let permitted = match command {
             RichCommand::SetSelection(Some(_))
             | RichCommand::SelectAll
             | RichCommand::SelectWordAt(_)
             | RichCommand::MoveCaret { .. }
-            | RichCommand::NavigateTableCell { .. }
-            | RichCommand::CopySelection
-            | RichCommand::CopyCodeBlock(_)
-                if !self.selectable =>
-            {
-                Some(CommandOutcome::RejectedByPolicy)
+            | RichCommand::NavigateTableCell { .. } => self.can_select(),
+            RichCommand::CopySelection => self.reading.enabled && self.reading.selection_copy,
+            RichCommand::CopyCodeBlock(_) => self.can_copy_code(),
+            RichCommand::OpenLink(_) => self.can_open_links(),
+            RichCommand::ToggleHeadingCollapsed(_) => self.can_collapse_headings(),
+            RichCommand::Undo | RichCommand::Redo => self.editing.history,
+            RichCommand::InsertInlineObject(_) => self.editing.inline_objects,
+            RichCommand::ToggleChecklistItem(_) => self.can_toggle_checklists(),
+            RichCommand::ResizeInlineImage { .. } => self.can_resize_images(),
+            RichCommand::ToggleMark(
+                MarkKind::Bold | MarkKind::Italic | MarkKind::Strikethrough | MarkKind::InlineCode,
+            ) => formatting.enabled && formatting.inline_marks,
+            RichCommand::ToggleMark(_)
+            | RichCommand::SetInlineStyle(_)
+            | RichCommand::AdjustFontSize(_)
+            | RichCommand::SetBlockStyle(_)
+            | RichCommand::UpdateNamedStyle { .. }
+            | RichCommand::SetTextAlign(_) => self.can_apply_rich_styles(),
+            RichCommand::ClearFormatting => formatting.enabled && formatting.clear,
+            RichCommand::SetLink(_) => formatting.enabled && formatting.links,
+            RichCommand::SetHeading(_) => formatting.enabled && formatting.headings,
+            RichCommand::ToggleList(_)
+            | RichCommand::Structure(
+                crate::StructureCommand::RestartOrderedList { .. }
+                | crate::StructureCommand::ContinueOrderedList { .. },
+            ) => self.can_format_lists(),
+            RichCommand::PasteHtml { .. } => self.can_paste_rich_text(),
+            RichCommand::PasteText(_) => self.editing.plain_paste,
+            RichCommand::SetTableColumns { .. } => self.can_resize_table_columns(),
+            RichCommand::InsertTableRow { .. }
+            | RichCommand::DeleteTableRow
+            | RichCommand::InsertTableColumn { .. }
+            | RichCommand::DeleteTableColumn
+            | RichCommand::MergeTableCells
+            | RichCommand::SplitTableCell => self.can_edit_table_structure(),
+            RichCommand::Grid(crate::GridCommand::ClearSelection) => self.can_edit_grid(),
+            RichCommand::Grid(crate::GridCommand::PasteHtml { .. }) => {
+                self.can_edit_grid() && self.can_paste_rich_text()
             }
-            RichCommand::Navigation(_) | RichCommand::Anchor(_)
-                if !self.selectable && !command.is_document_mutation() =>
-            {
-                Some(CommandOutcome::RejectedByPolicy)
+            RichCommand::Grid(crate::GridCommand::PasteTsv { .. }) => {
+                self.can_edit_grid() && self.editing.plain_paste
             }
-            RichCommand::OpenLink(_) if !self.clickable_links => {
-                Some(CommandOutcome::RejectedByPolicy)
-            }
-            RichCommand::ToggleHeadingCollapsed(_) if !self.collapsible_headings => {
-                Some(CommandOutcome::RejectedByPolicy)
-            }
-            _ => None,
-        }
+            RichCommand::Grid(_) => self.can_edit_table_structure(),
+            RichCommand::Component(_) => self.editing.components,
+            RichCommand::Navigation(_) if command.is_document_mutation() => self.editing.find_replace,
+            RichCommand::Anchor(_) if command.is_document_mutation() => self.editing.anchors,
+            RichCommand::Navigation(_) | RichCommand::Anchor(_) => self.can_select(),
+            _ => true,
+        };
+        (!permitted).then_some(CommandOutcome::RejectedByPolicy)
     }
 }
 

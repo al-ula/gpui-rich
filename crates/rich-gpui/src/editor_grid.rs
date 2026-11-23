@@ -1,4 +1,6 @@
-use super::{CommandOutcome, Context, DocumentSelection, HistoryMergeGroup, RichDocumentView};
+use super::{
+    CommandOutcome, CommandSource, Context, DocumentSelection, HistoryMergeGroup, RichDocumentView,
+};
 use rich_model::{ClipboardBlock, ClipboardFragment, ClipboardTable, GridCommand, Step};
 
 impl RichDocumentView {
@@ -54,6 +56,7 @@ impl RichDocumentView {
     pub(super) fn execute_paste_text(
         &mut self,
         text: &str,
+        source: CommandSource,
         context: &mut Context<Self>,
     ) -> CommandOutcome {
         self.history.break_coalescing();
@@ -67,6 +70,9 @@ impl RichDocumentView {
                 }
             });
         if in_cell {
+            if source == CommandSource::User && !self.policy.can_edit_grid() {
+                return CommandOutcome::RejectedByPolicy;
+            }
             return self.execute_grid_command(
                 &GridCommand::PasteTsv {
                     text: text.to_owned(),

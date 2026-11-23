@@ -370,7 +370,7 @@ pub struct RichDocumentView {
     pub scroll_y: f32,
     pub zoom: f32,
     pub debug_overlay: bool,
-    pub policy: InteractionPolicy,
+    policy: InteractionPolicy,
     pub theme: RichTheme,
     pub follow_app_theme: bool,
     pub open_external_links: bool,
@@ -378,7 +378,6 @@ pub struct RichDocumentView {
     pub extensions: ExtensionRegistry,
     pub(crate) navigation: editor_navigation::NavigationState,
     pub(crate) pending_reveal: Option<DocPos>,
-    input_rules: bool,
     pending_input_rule_undo: Option<editor_structure::InputRuleUndo>,
     pub(crate) font_resolver: Option<Box<FontResolver>>,
     pub(crate) decoration_providers: Vec<(DecorationProviderId, Box<dyn DecorationProvider>)>,
@@ -436,7 +435,6 @@ impl RichDocumentView {
             extensions: ExtensionRegistry::new(),
             navigation: editor_navigation::NavigationState::default(),
             pending_reveal: None,
-            input_rules: false,
             pending_input_rule_undo: None,
             font_resolver: None,
             decoration_providers: Vec::new(),
@@ -475,6 +473,11 @@ impl RichDocumentView {
     pub fn with_policy(mut self, policy: InteractionPolicy) -> Self {
         self.policy = policy;
         self
+    }
+
+    /// Returns the configured switches, including children currently masked by a parent.
+    pub const fn policy(&self) -> InteractionPolicy {
+        self.policy
     }
 
     /// Builder method configuring an explicit [`RichTheme`].
@@ -592,12 +595,6 @@ impl RichDocumentView {
         self.update_selection(None, cx);
         self.resync_layout_with_anchor(None);
         cx.notify();
-    }
-
-    /// Enables reversible list markers typed at the start of a paragraph.
-    pub fn with_input_rules(mut self, enabled: bool) -> Self {
-        self.input_rules = enabled;
-        self
     }
 
     /// Applies an incoming CRDT [`SyncDelta`] through `bridge` without recording into local undo
@@ -850,28 +847,45 @@ impl RichDocumentView {
         self.extensions.unregister_command(id)
     }
 
-    /// Updates [`Self::policy`], clearing active selection or IME preedit when disallowed.
+    /// Applies feature switches and cancels transient interactions that are no longer enabled.
     pub fn set_policy(&mut self, policy: InteractionPolicy, cx: &mut Context<Self>) {
         if self.policy == policy {
             return;
         }
         self.policy = policy;
-        if !policy.editable {
+        if !policy.editing.enabled {
             self.ime_preedit = None;
+        }
+        if !policy.can_apply_input_rules() {
+            self.pending_input_rule_undo = None;
+        }
+        if !policy.can_resize_images() {
             self.selected_image = None;
             self.image_resize_drag = None;
             self.hovered_image_handle = None;
+        }
+        if !policy.can_resize_table_columns() {
             self.table_column_drag = None;
             self.hovered_column_divider = None;
         }
-        if !policy.selectable {
+        if !policy.can_activate_smart_chips() {
+            self.pending_chip = None;
+            self.active_chip_popover = None;
+        }
+        if !policy.can_open_links() {
+            self.pending_link = None;
+        }
+        if !policy.can_copy_code() {
+            self.copied_code_block = None;
+        }
+        if !policy.can_select() {
+            self.ime_preedit = None;
             self.dragging = false;
             self.drag_anchor_pos = None;
+            self.pending_footnote = None;
             self.update_selection(None, cx);
         }
-        if !policy.clickable_links && !policy.collapsible_headings {
-            self.hovered_pointer = false;
-        }
+        self.hovered_pointer = false;
         if policy.should_show_caret() && self.was_focused {
             self.reset_caret_blink(cx);
         } else if !policy.should_show_caret() {
@@ -1067,7 +1081,7 @@ impl RichDocumentView {
         ) {
             self.pending_input_rule_undo = None;
         }
-        let outcome = self.execute_command(&current_command, cx);
+        let outcome = self.execute_command(&current_command, source, cx);
         cx.emit(RichDocumentEvent::CommandExecuted {
             command: current_command,
             source,
@@ -1124,7 +1138,12 @@ impl RichDocumentView {
         applied.change_set
     }
 
-    fn execute_command(&mut self, command: &RichCommand, cx: &mut Context<Self>) -> CommandOutcome {
+    fn execute_command(
+        &mut self,
+        command: &RichCommand,
+        source: CommandSource,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
         match command {
             RichCommand::SetHorizontalLayout(layout) => {
                 if self.document.config.horizontal_layout == *layout {
@@ -1327,7 +1346,16 @@ impl RichDocumentView {
                 cx.notify();
                 CommandOutcome::Executed
             }
-            RichCommand::InsertText(text) => self.execute_insert_text(text, cx),
+            RichCommand::InsertText(text) => {
+                if source == CommandSource::User
+                    && self.policy.can_apply_input_rules()
+                    && self.try_apply_input_rule(text, cx)
+                {
+                    CommandOutcome::Executed
+                } else {
+                    self.execute_insert_text_inner(text, cx)
+                }
+            }
             RichCommand::InsertInlineObject(object) => {
                 self.execute_insert_inline_object(object.clone(), cx)
             }
@@ -1340,11 +1368,16 @@ impl RichDocumentView {
                 width_pt,
                 height_pt,
             } => self.execute_resize_inline_image(*block_id, *object_id, *width_pt, *height_pt, cx),
-            RichCommand::Delete { direction, unit } => self.execute_delete(*direction, *unit, cx),
+            RichCommand::Delete { direction, unit } => {
+                self.execute_delete(*direction, *unit, source, cx)
+            }
             RichCommand::SplitBlock => self.execute_split_block(cx),
             RichCommand::InsertSoftBreak => self.execute_insert_soft_break(cx),
-            RichCommand::Indent => self.execute_indent(cx),
-            RichCommand::Outdent => self.execute_outdent(cx),
+            RichCommand::Indent | RichCommand::Outdent if self.active_table_context().is_some() => {
+                self.execute_navigate_table_cell(matches!(command, RichCommand::Indent), source, cx)
+            }
+            RichCommand::Indent => self.execute_indent(source, cx),
+            RichCommand::Outdent => self.execute_outdent(source, cx),
             RichCommand::ToggleMark(mark) => self.execute_toggle_mark(*mark, cx),
             RichCommand::SetInlineStyle(style) => self.execute_set_inline_style(style, cx),
             RichCommand::ClearFormatting => self.execute_clear_formatting(cx),
@@ -1358,9 +1391,9 @@ impl RichDocumentView {
             RichCommand::ToggleList(list_kind) => self.execute_toggle_list(*list_kind, cx),
             RichCommand::SetTextAlign(align) => self.execute_set_text_align(*align, cx),
             RichCommand::PasteHtml { html, plain_text } => {
-                self.execute_paste_html(html, plain_text.as_deref(), cx)
+                self.execute_paste_html(html, plain_text.as_deref(), source, cx)
             }
-            RichCommand::PasteText(text) => self.execute_paste_text(text, cx),
+            RichCommand::PasteText(text) => self.execute_paste_text(text, source, cx),
             RichCommand::SetTableColumns { table_id, columns } => {
                 self.execute_set_table_columns(*table_id, columns.clone(), cx)
             }
@@ -1373,7 +1406,7 @@ impl RichDocumentView {
             RichCommand::MergeTableCells => self.execute_merge_table_cells(cx),
             RichCommand::SplitTableCell => self.execute_split_table_cell(cx),
             RichCommand::NavigateTableCell { forward } => {
-                self.execute_navigate_table_cell(*forward, cx)
+                self.execute_navigate_table_cell(*forward, source, cx)
             }
             RichCommand::Navigation(command) => self.execute_navigation_command_inner(command, cx),
             RichCommand::Grid(command) => self.execute_grid_command(command, cx),
@@ -1577,13 +1610,6 @@ impl RichDocumentView {
         } else {
             CommandOutcome::NoOp
         }
-    }
-
-    fn execute_insert_text(&mut self, raw_text: &str, cx: &mut Context<Self>) -> CommandOutcome {
-        if self.input_rules && self.try_apply_input_rule(raw_text, cx) {
-            return CommandOutcome::Executed;
-        }
-        self.execute_insert_text_inner(raw_text, cx)
     }
 
     fn execute_insert_text_inner(&mut self, raw_text: &str, cx: &mut Context<Self>) -> CommandOutcome {
@@ -1793,13 +1819,22 @@ impl RichDocumentView {
         &mut self,
         direction: MoveDirection,
         unit: MoveUnit,
+        source: CommandSource,
         cx: &mut Context<Self>,
     ) -> CommandOutcome {
+        if source == CommandSource::User
+            && matches!(self.selection, Some(DocumentSelection::TableCells { .. }))
+            && !self.policy.can_edit_grid()
+        {
+            return CommandOutcome::RejectedByPolicy;
+        }
         self.ime_preedit = None;
         if matches!(self.selection, Some(DocumentSelection::TableCells { .. })) {
             return self.execute_grid_command(&rich_model::GridCommand::ClearSelection, cx);
         }
-        if direction == MoveDirection::Backward && unit == MoveUnit::Grapheme
+        if source == CommandSource::User
+            && direction == MoveDirection::Backward
+            && unit == MoveUnit::Grapheme
             && self.try_undo_input_rule(cx)
         {
             return CommandOutcome::Executed;
@@ -2029,12 +2064,9 @@ impl RichDocumentView {
         CommandOutcome::Executed
     }
 
-    fn execute_indent(&mut self, cx: &mut Context<Self>) -> CommandOutcome {
+    fn execute_indent(&mut self, source: CommandSource, cx: &mut Context<Self>) -> CommandOutcome {
         self.ime_preedit = None;
         self.history.break_coalescing();
-        if self.active_table_context().is_some() {
-            return self.execute_navigate_table_cell(true, cx);
-        }
         let Some((_, focus, _)) = self.active_text_selection() else {
             return CommandOutcome::NoOp;
         };
@@ -2049,6 +2081,9 @@ impl RichDocumentView {
         if let Some(item) = block.kind.list_item_data()
             && let Some(content) = block.kind.inline_content().cloned()
         {
+            if source == CommandSource::User && !self.policy.can_format_lists() {
+                return CommandOutcome::RejectedByPolicy;
+            }
             if item.indent_level >= MAX_LIST_INDENT_LEVEL {
                 return CommandOutcome::NoOp;
             }
@@ -2074,20 +2109,17 @@ impl RichDocumentView {
             return CommandOutcome::Executed;
         }
         if block.kind.code_block_data().is_some() {
-            return self.execute_insert_text("    ", cx);
+            return self.execute_insert_text_inner("    ", cx);
         }
         if block.kind.inline_content().is_some() {
-            return self.execute_insert_text("\t", cx);
+            return self.execute_insert_text_inner("\t", cx);
         }
         CommandOutcome::NoOp
     }
 
-    fn execute_outdent(&mut self, cx: &mut Context<Self>) -> CommandOutcome {
+    fn execute_outdent(&mut self, source: CommandSource, cx: &mut Context<Self>) -> CommandOutcome {
         self.ime_preedit = None;
         self.history.break_coalescing();
-        if self.active_table_context().is_some() {
-            return self.execute_navigate_table_cell(false, cx);
-        }
         let Some((_, focus, _)) = self.active_text_selection() else {
             return CommandOutcome::NoOp;
         };
@@ -2102,6 +2134,9 @@ impl RichDocumentView {
         if let Some(item) = block.kind.list_item_data()
             && let Some(content) = block.kind.inline_content().cloned()
         {
+            if source == CommandSource::User && !self.policy.can_format_lists() {
+                return CommandOutcome::RejectedByPolicy;
+            }
             let (next_kind, next_style) = if item.indent_level > 0 {
                 let next_level = item.indent_level - 1;
                 let mut style = block.style.clone();
@@ -2166,6 +2201,9 @@ impl RichDocumentView {
             return CommandOutcome::Executed;
         }
         if block.kind.inline_content().is_some() {
+            if source == CommandSource::User && !self.policy.can_apply_rich_styles() {
+                return CommandOutcome::RejectedByPolicy;
+            }
             if block.style.indent_start_pt <= 0.0 {
                 return CommandOutcome::NoOp;
             }
@@ -2675,6 +2713,7 @@ impl RichDocumentView {
         &mut self,
         html: &str,
         plain_fallback: Option<&str>,
+        source: CommandSource,
         cx: &mut Context<Self>,
     ) -> CommandOutcome {
         self.ime_preedit = None;
@@ -2683,7 +2722,9 @@ impl RichDocumentView {
         let mut fragment = ClipboardFragment::from_html(html);
         if fragment.is_empty() {
             return match plain_fallback {
-                Some(fallback) if !fallback.is_empty() => self.execute_paste_text(fallback, cx),
+                Some(fallback) if !fallback.is_empty() => {
+                    self.execute_paste_text(fallback, source, cx)
+                }
                 _ => CommandOutcome::NoOp,
             };
         }
@@ -2696,6 +2737,13 @@ impl RichDocumentView {
             DocumentSelection::Text { focus, .. } => table_cell_of(focus).is_some(),
             _ => false,
         });
+        if source == CommandSource::User
+            && !self.policy.can_edit_grid()
+            && (rectangle
+                || (in_table && matches!(fragment.blocks.as_slice(), [ClipboardBlock::Table(_)])))
+        {
+            return CommandOutcome::RejectedByPolicy;
+        }
         if in_table && let [ClipboardBlock::Table(table)] = fragment.blocks.as_slice() {
             return self.execute_grid_paste(table, component_step, cx);
         }
@@ -2725,7 +2773,7 @@ impl RichDocumentView {
             let plain = plain_fallback
                 .map(ToOwned::to_owned)
                 .unwrap_or_else(|| fragment.to_plain_text_with(&self.extensions));
-            return self.execute_paste_text(&plain, cx);
+            return self.execute_paste_text(&plain, source, cx);
         }
 
         if fragment.is_open_inline()
@@ -3291,8 +3339,12 @@ impl RichDocumentView {
     fn execute_navigate_table_cell(
         &mut self,
         forward: bool,
+        source: CommandSource,
         cx: &mut Context<Self>,
     ) -> CommandOutcome {
+        if source == CommandSource::User && !self.policy.can_select() {
+            return CommandOutcome::RejectedByPolicy;
+        }
         self.ime_preedit = None;
         self.history.break_coalescing();
         let Some(context) = self.active_table_context() else {
@@ -3309,7 +3361,12 @@ impl RichDocumentView {
                 self.ensure_caret_visible();
                 CommandOutcome::Executed
             }
-            Some(rich_model::TableCellStep::AtBoundary) if forward && self.policy.editable => {
+            Some(rich_model::TableCellStep::AtBoundary)
+                if forward
+                    && self.policy.editing.enabled
+                    && (source == CommandSource::Programmatic
+                        || self.policy.can_edit_table_structure()) =>
+            {
                 // Tab past the final cell appends a new row below and focuses its first cell.
                 self.execute_insert_table_row(true, cx)
             }
@@ -4081,7 +4138,7 @@ impl RichDocumentView {
         let viewport_width: f32 = self.last_viewport_bounds.size.width.into();
 
         // 1. Check corner drag-resize handles on the currently selected inline image.
-        if self.policy.editable
+        if self.policy.can_resize_images()
             && let Some(selected_img) = self.selected_image
             && let Some(image_rect) = self.flow.inline_object_rect_cached(
                 selected_img.block_id,
@@ -4118,7 +4175,7 @@ impl RichDocumentView {
         }
 
         // 2. Check interactive table column divider dragging.
-        if self.policy.editable
+        if self.policy.can_resize_table_columns()
             && let Some(divider) = self.flow.hit_test_table_column_border(
                 canvas_point,
                 &self.document,
@@ -4159,7 +4216,7 @@ impl RichDocumentView {
             return;
         };
 
-        if self.policy.collapsible_headings
+        if self.policy.can_collapse_headings()
             && let Some(heading_id) = hit.toggled_heading
         {
             self.active_chip_popover = None;
@@ -4168,7 +4225,7 @@ impl RichDocumentView {
             return;
         }
 
-        if self.policy.editable
+        if self.policy.can_toggle_checklists()
             && let Some(checklist_id) = hit.toggled_checklist
         {
             self.active_chip_popover = None;
@@ -4177,7 +4234,7 @@ impl RichDocumentView {
             return;
         }
 
-        if self.policy.selectable
+        if self.policy.can_copy_code()
             && let Some(code_block_id) = hit.code_block_copy
         {
             self.active_chip_popover = None;
@@ -4203,7 +4260,9 @@ impl RichDocumentView {
         });
         self.pending_chip = None;
         match clicked_object {
-            Some((block_id, object_id, InlineObject::Image { .. })) if self.policy.editable => {
+            Some((block_id, object_id, InlineObject::Image { .. }))
+                if self.policy.can_resize_images() =>
+            {
                 self.selected_image = Some(SelectedInlineImage {
                     block_id,
                     object_id,
@@ -4218,7 +4277,7 @@ impl RichDocumentView {
                     label,
                     accent,
                 },
-            )) => {
+            )) if self.policy.can_activate_smart_chips() => {
                 self.selected_image = None;
                 self.pending_chip = Some(ActiveSmartChipPopover {
                     block_id,
@@ -4229,7 +4288,8 @@ impl RichDocumentView {
                 });
             }
             Some((block_id, object_id, InlineObject::Custom { kind, data }))
-                if kind.as_ref() == rich_model::DROPDOWN_KIND =>
+                if self.policy.can_activate_smart_chips()
+                    && kind.as_ref() == rich_model::DROPDOWN_KIND =>
             {
                 self.selected_image = None;
                 self.pending_chip = Some(ActiveSmartChipPopover {
@@ -4246,7 +4306,7 @@ impl RichDocumentView {
             }
         }
 
-        if self.policy.selectable && event.click_count >= 2 {
+        if self.policy.can_select() && event.click_count >= 2 {
             self.pending_link = None;
             self.pending_chip = None;
             self.drag_origin = None;
@@ -4259,7 +4319,7 @@ impl RichDocumentView {
             }
         }
 
-        self.pending_link = if self.policy.clickable_links {
+        self.pending_link = if self.policy.can_open_links() {
             hit.hit.link.map(|link| link.href)
         } else {
             None
@@ -4267,7 +4327,7 @@ impl RichDocumentView {
         self.drag_origin = Some(canvas_point);
         self.drag_moved = false;
 
-        if !self.policy.selectable {
+        if !self.policy.can_select() {
             self.drag_anchor_pos = None;
             self.dragging = false;
             cx.notify();
@@ -4380,8 +4440,8 @@ impl RichDocumentView {
             }
         }
 
-        if !self.dragging || !event.dragging() || !self.policy.selectable {
-            let next_image_handle = if self.policy.editable
+        if !self.dragging || !event.dragging() || !self.policy.can_select() {
+            let next_image_handle = if self.policy.can_resize_images()
                 && let Some(selected_img) = self.selected_image
                 && let Some(image_rect) = self.flow.inline_object_rect_cached(
                     selected_img.block_id,
@@ -4395,7 +4455,9 @@ impl RichDocumentView {
                 None
             };
 
-            let next_divider = if self.policy.editable && next_image_handle.is_none() {
+            let next_divider = if self.policy.can_resize_table_columns()
+                && next_image_handle.is_none()
+            {
                 self.flow.hit_test_table_column_border(
                     canvas_point,
                     &self.document,
@@ -4408,6 +4470,9 @@ impl RichDocumentView {
             };
 
             let hovered_chip = hit.as_ref().is_some_and(|result| {
+                if !self.policy.can_activate_smart_chips() {
+                    return false;
+                }
                 let Some(object_id) = result.hit.inline_object else {
                     return false;
                 };
@@ -4418,14 +4483,18 @@ impl RichDocumentView {
                     .find_block(block_id)
                     .and_then(|block| block.kind.inline_content())
                     .and_then(|inline| inline.object_by_id(object_id))
-                    .is_some_and(|entry| matches!(entry.object, InlineObject::SmartChip { .. }))
+                    .is_some_and(|entry| match &entry.object {
+                        InlineObject::SmartChip { .. } => true,
+                        InlineObject::Custom { kind, .. } => kind.as_ref() == rich_model::DROPDOWN_KIND,
+                        _ => false,
+                    })
             });
 
             let pointer = hit.as_ref().is_some_and(|result| {
-                (self.policy.collapsible_headings && result.toggled_heading.is_some())
-                    || (self.policy.editable && result.toggled_checklist.is_some())
-                    || (self.policy.selectable && result.code_block_copy.is_some())
-                    || (self.policy.clickable_links && result.hit.link.is_some())
+                (self.policy.can_collapse_headings() && result.toggled_heading.is_some())
+                    || (self.policy.can_toggle_checklists() && result.toggled_checklist.is_some())
+                    || (self.policy.can_copy_code() && result.code_block_copy.is_some())
+                    || (self.policy.can_open_links() && result.hit.link.is_some())
             }) || hovered_chip;
 
             let hover_changed = next_image_handle != self.hovered_image_handle
@@ -4634,7 +4703,7 @@ impl EntityInputHandler for RichDocumentView {
         _window: &mut Window,
         _cx: &mut Context<Self>,
     ) -> Option<UTF16Selection> {
-        if !self.policy.editable && !ignore_disabled_input {
+        if !self.policy.editing.enabled && !ignore_disabled_input {
             return None;
         }
         let (block_id, committed, effective_text) = self.ime_active_block_text()?;
@@ -4727,7 +4796,7 @@ impl EntityInputHandler for RichDocumentView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.policy.editable {
+        if !self.policy.editing.enabled {
             return;
         }
         let preserved_marks = self.active_text_selection().and_then(|(_, _, marks)| marks);
@@ -4793,7 +4862,7 @@ impl EntityInputHandler for RichDocumentView {
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        if !self.policy.editable {
+        if !self.policy.editing.enabled {
             return;
         }
         self.history.break_coalescing();
@@ -5196,7 +5265,7 @@ impl Render for RichDocumentView {
                 this.dispatch_command(RichCommand::CopySelection, cx);
             }))
             .on_action(cx.listener(|this, _: &Cut, _window, cx| {
-                if !this.policy.editable {
+                if !this.policy.editing.enabled {
                     return;
                 }
                 if this.dispatch_command(RichCommand::CopySelection, cx) == CommandOutcome::Executed
@@ -5213,7 +5282,9 @@ impl Render for RichDocumentView {
             .on_action(cx.listener(|this, _: &Paste, _window, cx| {
                 if let Some(item) = cx.read_from_clipboard() {
                     let plain_text = item.text();
-                    if let Some(html) = extract_clipboard_html(&item) {
+                    if this.policy.can_paste_rich_text()
+                        && let Some(html) = extract_clipboard_html(&item)
+                    {
                         this.dispatch_command(RichCommand::PasteHtml { html, plain_text }, cx);
                     } else if let Some(text) = plain_text {
                         this.dispatch_command(RichCommand::PasteText(text), cx);

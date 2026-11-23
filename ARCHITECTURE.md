@@ -79,8 +79,8 @@ flowchart TD
 
 * **Owned by `gpui-rich`**:
   * Unified `RichCommand` enum (`crates/rich-model/src/command.rs`) with stable dot-namespaced `command_id()` values, `is_document_mutation()` guards, and `CommandSource` (`User` vs `Programmatic`).
-  * `InteractionPolicy` (`editable`, `selectable`, `clickable_links`, `collapsible_headings`, `show_caret_read_only`) with presets (`editable()`, `viewer()`, `static_preview()`) controlling UI affordances and `CommandSource::User` gating.
-  * `RichDocumentView::dispatch_command` (`crates/rich-gpui/src/view.rs`) as the single execution seam backed by `Transaction` and coalesced `History`. `CommandSource::User` mutations require `policy.editable`, while `CommandSource::Programmatic` commands execute through middleware, `Transaction`, `LayoutCache`, and host events even when the UI is in view-only mode.
+  * `InteractionPolicy` groups per-view runtime switches under `reading` and `editing`, with nested `editing.formatting` and `editing.tables` groups. Parent switches mask their children without resetting them. Start from `viewer()`, `static_preview()`, or `editable()` and customize the switches.
+  * `RichDocumentView::dispatch_command` is the execution seam backed by `Transaction` and coalesced `History`. User commands respect the feature switches after middleware. Programmatic commands bypass the interaction policy and still run through middleware, transactions, layout synchronization, and host events.
   * Three-layer editing input model:
     * `gpui_kit::actions!` (`rich_document::*`) scoped to `"RichDocument"` for structural, navigation, and formatting keys (`Enter`, `Backspace`, `Delete`, `Tab`, arrows, `Ctrl/Cmd+B`, `Ctrl/Cmd+Z`), plus an opt-in `register_default_keybindings(cx)` helper.
     * `EntityInputHandler` for all text entry and IME. Uncommitted composition preedit stays ephemeral on the view (outside `Document` and `History`). Committed text dispatches `RichCommand::InsertText` (or range replacement) with `CommandSource::User` so `InteractionPolicy`, Markdown input rules, and host events run uniformly.
@@ -89,6 +89,24 @@ flowchart TD
   * Application chrome (toolbars, menus, outline sidebar, slash menus, command palette) built with `gpui-kit` / `gpui-component` and dispatching `RichCommand` or GPUI actions.
   * Keymap customization (either calling `register_default_keybindings(cx)` for defaults, or binding custom app keymaps / Vim modes directly to `rich_gpui::*` actions or `dispatch_command`).
   * App-level commands (Save, Export, File Open, Comments, AI actions) composed over `RichCommand` and `Transaction`.
+
+Use `with_policy` when constructing a view or `set_policy` to change it live. For example, a host can expose Markdown-oriented editing controls without arbitrary styles, rich paste, or table authoring:
+
+```rust
+let mut policy = InteractionPolicy::editable();
+policy.editing.input_rules = true;
+policy.editing.formatting.rich_styles = false;
+policy.editing.rich_paste = false;
+policy.editing.tables.enabled = false;
+view.set_policy(policy, cx);
+
+// Switch this view to read-only, retaining every editor setting.
+let mut policy = view.policy();
+policy.editing.enabled = false;
+view.set_policy(policy, cx);
+```
+
+The policy controls interactions, not what renders or what a codec accepts. A host that needs Markdown-only import/export chooses `MarkdownCodec` separately.
 
 ### `gpui-kit` Integration
 
@@ -133,7 +151,7 @@ flowchart TD
   * [x] Migrate `crates/rich-gpui` to `gpui-kit = { version = "0.10", default-features = false }` with optional `gpui-fast` feature passthrough and `gpui_kit::actions!`.
   * [x] Migrate `examples/docs_viewer` to `gpui-kit` application lifecycle (`gpui_kit::application()`, `gpui_kit::init(cx)`, `gpui_kit::open_window(...)`).
 * **2.1 Host Integration, Policy & Theming** (Complete):
-  * [x] `InteractionPolicy` (`editable`, `selectable`, `clickable_links`, `collapsible_headings`, `show_caret_read_only` + presets `editable()`, `viewer()`, `static_preview()`) and `CommandSource` (`User` vs `Programmatic`) gating.
+  * [x] Grouped `InteractionPolicy` switches, viewer/editor presets, and `CommandSource` (`User` vs `Programmatic`) gating.
   * [x] **Extensibility Seam 1**: `RichTheme` (Light/Dark/custom tokens + `gpui_kit::base::Theme` sync) and GPUI `EventEmitter<RichDocumentEvent>` (`LinkActivated`, `SelectionChanged`, `DocumentMutated`, `CommandExecuted`).
   * [x] Command middleware hooks (`before_command` with `CommandSource` and `after_transaction`).
 * **2.2 Core Editing & Navigation** (Complete):
@@ -162,14 +180,14 @@ flowchart TD
 * **Components:** `RichCommand::Component` edits document-owned dropdown choices and variable values. Dropdown selection is per chip; variable values are shared. Rich clipboard imports definitions into the destination document. Captured building blocks insert independent editable nodes in one transaction. Placeholder and table column kinds cover dates, people, and files; `TableBlock::cell_column_mismatches` is advisory and never rejects typing or paste.
   `BuildingBlock::task_tracker` provides a native editable table recipe with a caller-supplied status dropdown, assignee, and due date.
 * **Structure and references:** Sibling paragraph moves preserve IDs, and ordered lists support explicit restart and continuation. Grid commands include row and column moves, stable body-row sorting, and cell subdivision. Bookmarks map through edits. Pageless footnotes keep editable end-of-document bodies and derive reference numbers from reading order; clipboard HTML exports a readable superscript rather than a live note.
-* **Input rules:** Hosts opt in via `RichDocumentView::with_input_rules`. Typing `- ` or a positive decimal marker such as `3. ` at the start of an empty paragraph converts it to a list. Immediate Backspace restores the literal trigger.
+* **Input rules:** Hosts opt in via `policy.editing.input_rules` with list formatting enabled. Typing `- ` or a positive decimal marker such as `3. ` at the start of an empty paragraph converts it to a list. Immediate Backspace restores the literal trigger.
 
 ### Non-editing command implementation plan
 
 All existing non-editing command variants have handlers. Fix dispatch and navigation behavior before expanding the command API.
 
 1. **Separate table navigation from row insertion.** In `rich-gpui/src/view.rs`, make `NavigateTableCell` move the selection or return `NoOp` at a boundary; it must never insert a row. Route Tab and Shift+Tab to table navigation when the selection is in a table, and to `Indent`/`Outdent` otherwise. Resolve forward Tab at the last cell in editable mode to the existing `InsertTableRow` command so middleware, events, and undo see an edit. Verify read-only Tab and Shift+Tab move between cells, boundary navigation does not change rows or history, and editable Tab at the last cell appends one row that Undo removes.
-2. **Dispatch smart-chip activation.** Add a non-mutating `RichCommand` carrying `BlockId` and `InlineObjectId`. Resolve the object from the document at dispatch time and gate activation on `InteractionPolicy::selectable`, which allows the interactive viewer and blocks static preview. Route mouse activation through that command; preserve the existing popover toggle, activation event, and drag behavior. Verify that middleware can cancel activation and that static preview neither opens the popover nor emits `SmartChipActivated`.
+2. **Dispatch smart-chip activation.** Add a non-mutating `RichCommand` carrying `BlockId` and `InlineObjectId`. Resolve the object from the document at dispatch time and gate activation on `InteractionPolicy::can_activate_smart_chips`. Route mouse activation through that command; preserve the existing popover toggle, activation event, and drag behavior. Verify that middleware can cancel activation and that static preview neither opens the popover nor emits `SmartChipActivated`.
 3. **Match paragraph navigation to its name.** In `rich-model/src/navigation.rs`, make `PreviousParagraph` and `NextParagraph` target paragraph blocks, not every block with inline text. Check the `MoveCaret` caller that shares these targets. Add a focused model regression covering both directions with headings, code blocks, and folded content between visible paragraphs; run `cargo test -p rich-model paragraph_navigation -j 4`. Exercise the table and chip scenarios above in `docs_viewer`.
 
 **Optional reader affordances:** Add Page Up / Page Down actions using the viewport height and existing `ScrollBy` command; no new model command needed. If a host adds a find bar, use an empty `Find` query to clear the highlights and report `Executed` when that changes search state. Keep the find UI and its shortcuts host-owned.

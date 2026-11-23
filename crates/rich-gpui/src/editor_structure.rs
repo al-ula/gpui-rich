@@ -68,7 +68,7 @@ impl RichDocumentView {
     /// Called before ordinary text insertion; a successful conversion consumes `raw_text`.
     pub(super) fn try_apply_input_rule(&mut self, raw_text: &str, cx: &mut Context<Self>) -> bool {
         self.pending_input_rule_undo = None;
-        if !self.policy.editable || raw_text != " " {
+        if raw_text != " " {
             return false;
         }
         let Some((anchor, focus, _)) = self.active_text_selection() else {

@@ -180,6 +180,52 @@ mod tests {
     }
 
     #[test]
+    fn interaction_policy_masks_children_without_overwriting_siblings_or_child_choices() {
+        let mut policy = InteractionPolicy::editable();
+        policy.editing.formatting.rich_styles = false;
+        policy.editing.tables.column_resize = false;
+        policy.reading.links = false;
+
+        let bold = RichCommand::ToggleMark(MarkKind::Bold);
+        let underline = RichCommand::ToggleMark(MarkKind::Underline);
+        let resize_columns = RichCommand::SetTableColumns {
+            table_id: BlockId(1),
+            columns: vec![ColumnSpec::Auto],
+        };
+        let add_row = RichCommand::InsertTableRow { after: true };
+        let copy_code = RichCommand::CopyCodeBlock(BlockId(2));
+        let open_link = RichCommand::OpenLink("doc://spec".into());
+        let insert = RichCommand::InsertText("hello".into());
+        let rejected = Some(CommandOutcome::RejectedByPolicy);
+
+        policy.editing.formatting.enabled = false;
+        policy.editing.tables.enabled = false;
+        policy.reading.enabled = false;
+        for command in [&bold, &add_row, &copy_code] {
+            assert_eq!(policy.check_command(command, CommandSource::User), rejected);
+            assert_eq!(policy.check_command(command, CommandSource::Programmatic), None);
+        }
+        assert_eq!(policy.check_command(&insert, CommandSource::User), None);
+
+        policy.editing.formatting.enabled = true;
+        policy.editing.tables.enabled = true;
+        policy.reading.enabled = true;
+        for command in [&bold, &add_row, &copy_code] {
+            assert_eq!(policy.check_command(command, CommandSource::User), None);
+        }
+        for command in [&underline, &resize_columns, &open_link] {
+            assert_eq!(policy.check_command(command, CommandSource::User), rejected);
+        }
+
+        policy.editing.enabled = false;
+        assert_eq!(
+            policy.check_command(&bold, CommandSource::User),
+            Some(CommandOutcome::RejectedReadOnly)
+        );
+        assert_eq!(policy.check_command(&copy_code, CommandSource::User), None);
+    }
+
+    #[test]
     fn container_aware_split_merge_and_coalesced_history() {
         let mut doc = Document::new();
         let quote_child_id = doc.alloc_block_id();

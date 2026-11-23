@@ -441,10 +441,10 @@ impl Render for DocsViewerApp {
                 view.document.config.horizontal_layout,
                 view.document.config.active_margins_pt(),
                 view.debug_overlay,
-                view.policy,
+                view.policy(),
             )
         };
-        if !policy.editable {
+        if !policy.editing.enabled {
             self.font_menu_open = false;
         }
         let dark = self.dark_mode;
@@ -754,7 +754,7 @@ impl Render for DocsViewerApp {
 
         let mut active_font_selection: Option<SelectionValue<rich_model::SharedStr>> = None;
 
-        if policy.editable {
+        if policy.editing.enabled {
             let (
                 bold_active,
                 italic_active,
@@ -1190,7 +1190,7 @@ impl Render for DocsViewerApp {
 
         let mut root = root.child(div().flex_1().size_full().child(self.document_view.clone()));
 
-        if self.font_menu_open && policy.editable {
+        if self.font_menu_open && policy.editing.enabled {
             let menu_bg = if dark { rgb(0x161b22) } else { rgb(0xffffff) };
             let hover_bg = if dark { rgb(0x21262d) } else { rgb(0xf1f3f4) };
             let selected_bg = if dark { rgb(0x1f3a5f) } else { rgb(0xd3e3fd) };

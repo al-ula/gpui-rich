@@ -118,6 +118,12 @@ struct ColumnDividerGuide {
     dragging: bool,
 }
 
+struct BlockChromeControls {
+    heading_chevrons: bool,
+    code_copy: bool,
+    copied_code_block: Option<BlockId>,
+}
+
 /// Prepaint payload passed from `Element::prepaint` into `Element::paint`.
 pub struct RichPrepaintState {
     visible_blocks: Vec<VisibleBlock<GpuiGlyphBackend>>,
@@ -126,7 +132,6 @@ pub struct RichPrepaintState {
     block_inline_decorations: HashMap<BlockId, Vec<InlineDecoration>>,
     decoration_overlays: Vec<PrepaintDecorationOverlay>,
     image_assets: HashMap<String, LoadedAsset>,
-    copied_code_block: Option<BlockId>,
     selected_image_overlay: Option<SelectedImageOverlay>,
     column_divider_guide: Option<ColumnDividerGuide>,
     popover_element: Option<AnyElement>,
@@ -143,7 +148,7 @@ pub struct RichPrepaintState {
     horizontal: HorizontalMetrics,
     zoom: f32,
     debug_overlay: bool,
-    show_heading_chevrons: bool,
+    chrome_controls: BlockChromeControls,
     editable: bool,
     focused: bool,
     focus_handle: FocusHandle,
@@ -196,7 +201,6 @@ impl Element for RichDocumentElement {
             block_inline_decorations,
             decoration_overlays,
             image_assets,
-            copied_code_block,
             selected_image_overlay,
             column_divider_guide,
             pending_chip_popover,
@@ -210,13 +214,14 @@ impl Element for RichDocumentElement {
             horizontal,
             zoom,
             debug_overlay,
-            show_heading_chevrons,
+            chrome_controls,
             editable,
             focused,
             focus_handle,
             theme,
             cursor_style,
         ) = self.view.update(cx, |view, cx| {
+            let policy = view.policy();
             view.last_viewport_bounds = bounds;
             let focused = view.focus_handle.is_focused(window);
             view.sync_focus_state(focused, cx);
@@ -401,7 +406,7 @@ impl Element for RichDocumentElement {
                 }
             }
 
-            let selected_image_overlay = if view.policy.editable {
+            let selected_image_overlay = if policy.can_resize_images() {
                 view.selected_image.and_then(|selected| {
                     let canvas_rect = view.flow.inline_object_rect_in_visible(
                         selected.block_id,
@@ -512,7 +517,7 @@ impl Element for RichDocumentElement {
             });
 
             let caret_rect = if focused
-                && view.policy.should_show_caret()
+                && policy.should_show_caret()
                 && view.caret_visible
                 && preedit_overlay.is_none()
             {
@@ -549,7 +554,7 @@ impl Element for RichDocumentElement {
                 CursorStyle::ResizeColumn
             } else if view.hovered_pointer {
                 CursorStyle::PointingHand
-            } else if view.policy.selectable || view.policy.editable {
+            } else if policy.can_select() || policy.editing.enabled {
                 CursorStyle::IBeam
             } else {
                 CursorStyle::Arrow
@@ -565,7 +570,6 @@ impl Element for RichDocumentElement {
                 block_inline_decorations,
                 decoration_overlays,
                 image_assets,
-                view.copied_code_block,
                 selected_image_overlay,
                 column_divider_guide,
                 pending_chip_popover,
@@ -579,8 +583,12 @@ impl Element for RichDocumentElement {
                 horizontal,
                 view.zoom,
                 view.debug_overlay,
-                view.policy.collapsible_headings,
-                view.policy.editable,
+                BlockChromeControls {
+                    heading_chevrons: policy.can_collapse_headings(),
+                    code_copy: policy.can_copy_code(),
+                    copied_code_block: view.copied_code_block,
+                },
+                policy.editing.enabled,
                 focused,
                 focus_handle,
                 theme,
@@ -749,7 +757,6 @@ impl Element for RichDocumentElement {
             block_inline_decorations,
             decoration_overlays,
             image_assets,
-            copied_code_block,
             selected_image_overlay,
             column_divider_guide,
             popover_element,
@@ -766,7 +773,7 @@ impl Element for RichDocumentElement {
             horizontal,
             zoom,
             debug_overlay,
-            show_heading_chevrons,
+            chrome_controls,
             editable,
             focused,
             focus_handle,
@@ -865,8 +872,7 @@ impl Element for RichDocumentElement {
                     visible.x,
                     visible.y,
                     prepaint.zoom,
-                    prepaint.show_heading_chevrons,
-                    prepaint.copied_code_block,
+                    &prepaint.chrome_controls,
                     bounds,
                     &mut prepaint.chrome_custom_nodes,
                     theme,
@@ -1092,8 +1098,7 @@ fn paint_table_chrome(
     origin_x: f32,
     origin_y: f32,
     zoom: f32,
-    show_heading_chevrons: bool,
-    copied_code_block: Option<BlockId>,
+    controls: &BlockChromeControls,
     viewport_bounds: Bounds<Pixels>,
     chrome_custom_nodes: &mut HashMap<BlockId, PrepaintedCustomChrome>,
     theme: &RichTheme,
@@ -1130,8 +1135,7 @@ fn paint_table_chrome(
                 origin_x + cell.rect.x + child.x,
                 origin_y + cell.rect.y + child.y,
                 zoom,
-                show_heading_chevrons,
-                copied_code_block,
+                controls,
                 viewport_bounds,
                 chrome_custom_nodes,
                 theme,
@@ -1149,8 +1153,7 @@ fn paint_block_chrome(
     block_x: f32,
     block_y: f32,
     zoom: f32,
-    show_heading_chevrons: bool,
-    copied_code_block: Option<BlockId>,
+    controls: &BlockChromeControls,
     viewport_bounds: Bounds<Pixels>,
     chrome_custom_nodes: &mut HashMap<BlockId, PrepaintedCustomChrome>,
     theme: &RichTheme,
@@ -1165,7 +1168,7 @@ fn paint_block_chrome(
             chevron_rect,
             ..
         } => {
-            if !show_heading_chevrons {
+            if !controls.heading_chevrons {
                 return;
             }
             let symbol = if *collapsed { "▸" } else { "▾" };
@@ -1257,8 +1260,7 @@ fn paint_block_chrome(
                     block_x + child.x,
                     block_y + child.y,
                     zoom,
-                    show_heading_chevrons,
-                    copied_code_block,
+                    controls,
                     viewport_bounds,
                     chrome_custom_nodes,
                     theme,
@@ -1297,8 +1299,10 @@ fn paint_block_chrome(
                     cx,
                 );
             }
-            // Built-in interactive Copy button pill in the top-right corner of the code block.
-            let is_copied = copied_code_block == Some(layout.id);
+            if !controls.code_copy {
+                return;
+            }
+            let is_copied = controls.copied_code_block == Some(layout.id);
             let btn_origin = to_window(block_x + copy_button_rect.x, block_y + copy_button_rect.y);
             let btn_bounds = Bounds::new(
                 btn_origin,
@@ -1346,8 +1350,7 @@ fn paint_block_chrome(
                 block_x,
                 block_y,
                 zoom,
-                show_heading_chevrons,
-                copied_code_block,
+                controls,
                 viewport_bounds,
                 chrome_custom_nodes,
                 theme,
@@ -1400,8 +1403,7 @@ fn paint_block_chrome(
                     block_x + child.x,
                     block_y + child.y,
                     zoom,
-                    show_heading_chevrons,
-                    copied_code_block,
+                    controls,
                     viewport_bounds,
                     chrome_custom_nodes,
                     theme,
@@ -1435,8 +1437,7 @@ fn paint_block_chrome(
                 block_x + content_origin.x,
                 block_y + content_origin.y,
                 zoom,
-                show_heading_chevrons,
-                copied_code_block,
+                controls,
                 viewport_bounds,
                 chrome_custom_nodes,
                 theme,
