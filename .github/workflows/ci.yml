@@ -21,9 +21,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
+      - name: Set up Rust toolchain
+        run: rustup show active-toolchain
       - run: cargo fmt --all -- --check
 
   headless:
@@ -31,9 +30,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - name: Set up Rust toolchain
+        run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
       - name: Clippy (no-default-features)
         run: cargo clippy --no-default-features --all-targets -- -D warnings
@@ -60,9 +58,8 @@ jobs:
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
             libvulkan-dev
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
+      - name: Set up Rust toolchain
+        run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: gpui-linux
@@ -96,7 +93,8 @@ jobs:
             libxkbcommon-dev \
             libxkbcommon-x11-dev \
             libvulkan-dev
-      - uses: dtolnay/rust-toolchain@stable
+      - name: Set up Rust toolchain
+        run: rustup show active-toolchain
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: gpui-linux

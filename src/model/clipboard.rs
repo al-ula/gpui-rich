@@ -449,8 +449,13 @@ impl Document {
                     }
                 }
                 let mut rows = Vec::new();
-                for row_index in row_min..=row_max {
-                    let row = &table.rows[row_index];
+                for (row_index, row) in table
+                    .rows
+                    .iter()
+                    .enumerate()
+                    .take(row_max + 1)
+                    .skip(row_min)
+                {
                     let mut cells = Vec::new();
                     for placement in placements.iter().filter(|placement| {
                         placement.row_index == row_index

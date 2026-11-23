@@ -32,6 +32,7 @@ On Linux, `gpui-kit` transitively uses `yeslogic-fontconfig-sys`, which queries 
 ## Testing & Build Strategy
 
 * Always limit parallel Cargo jobs (for example, `cargo test --no-default-features -j 4`, `cargo check --all-targets -j 4`, `cargo check --all-targets --features gpui-fast -j 4`, `cargo build -j 4`).
+* Before committing code changes, run `cargo fmt --all -- --check`, `cargo clippy --no-default-features --all-targets -j 4 -- -D warnings`, and `cargo clippy --all-targets -j 4 -- -D warnings`.
 * Keep `src/model` and `src/layout` strictly free of `gpui-kit` imports so `cargo test --no-default-features -j 4` compiles and passes without GPUI.
 * Be conservative when writing tests: create tests only for critical architectural invariants or essential safety contracts. Avoid trivial, redundant, or fixture-heavy tests.
 * Use a headless browser against `examples/docs_viewer_web/` for real-use testing. Prefer built-in harness browser tools when available, otherwise fall back to an installed browser (for example, headless Chromium via Chrome DevTools Protocol).
