@@ -362,6 +362,41 @@ mod tests {
 
     #[test]
     fn mark_toggling_and_rich_html_clipboard_roundtrip() {
+        #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct BadgeData {
+            text: String,
+        }
+        struct BadgeSpec;
+        impl InlineSpec for BadgeSpec {
+            const KIND: &'static str = "badge";
+            type Data = BadgeData;
+        }
+
+        #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct CalloutLeafData {
+            tone: String,
+        }
+        struct CalloutLeafSpec;
+        impl BlockSpec for CalloutLeafSpec {
+            const KIND: &'static str = "callout";
+            type Shape = block_shape::Leaf;
+            type Data = CalloutLeafData;
+        }
+
+        #[derive(Debug)]
+        struct InsertCalloutCommand;
+        impl ExtensionCommand for InsertCalloutCommand {
+            const ID: &'static str = "app.insert_callout";
+            type Effect = Edit;
+        }
+
+        #[derive(Debug)]
+        struct InspectCalloutCommand;
+        impl ExtensionCommand for InspectCalloutCommand {
+            const ID: &'static str = "app.inspect_callout";
+            type Effect = ReadOnly;
+        }
+
         let mut document = Document::new();
         let heading_id = document.add_heading(2, InlineContent::plain("Overview"));
         let mut body = InlineContent::empty();
@@ -370,14 +405,13 @@ mod tests {
         body.push_text(" ", InlineStyle::default());
         body.push_text("link", InlineStyle::default().with_link("https://gpui.rs"));
         body.push_object(
-            InlineObject::custom("badge", CustomPayload::from_json(serde_json::json!({ "text": "v2" }))),
+            InlineObject::custom::<BadgeSpec>(BadgeData { text: "v2".into() }),
             InlineStyle::default(),
         );
         let paragraph_id = document.add_paragraph(body, BlockStyle::default().with_align(TextAlign::Center));
-        let custom_block_id = document.add_custom_block(
-            "callout",
-            CustomPayload::from_json(serde_json::json!({ "tone": "info" })),
-        );
+        let custom_block_id = document.add_leaf_block::<CalloutLeafSpec>(CalloutLeafData {
+            tone: "info".into(),
+        });
 
         // Verify clearing underline via mapped_spans_in_range + RestoreSpans is reversible.
         let base_style = document.config.default_style.clone();
@@ -446,10 +480,17 @@ mod tests {
                 content.style_at(12).link.as_ref().map(|l| l.href.as_str()),
                 Some("https://gpui.rs")
             );
-            assert!(matches!(
-                content.objects.first().map(|entry| &entry.object),
-                Some(InlineObject::Custom { kind, .. }) if kind.as_ref() == "badge"
-            ));
+            assert_eq!(
+                content
+                    .objects
+                    .first()
+                    .unwrap()
+                    .object
+                    .read_data::<BadgeSpec>()
+                    .unwrap()
+                    .text,
+                "v2"
+            );
         } else {
             panic!("expected paragraph block after HTML roundtrip");
         }
@@ -465,22 +506,14 @@ mod tests {
             panic!("expected sanitized paragraph");
         }
 
-        // Verify custom block serialization and Custom command policy gating.
+        // Verify custom block serialization and typed extension command policy gating.
         assert!(document.find_block(custom_block_id).is_some());
         let json = document.to_json_pretty().unwrap();
         let parsed = Document::from_json(&json).unwrap();
         assert_eq!(document, parsed);
 
-        let mutating_custom = RichCommand::Custom {
-            id: "app.insert_callout".into(),
-            payload: CustomPayload::empty(),
-            mutates_document: true,
-        };
-        let readonly_custom = RichCommand::Custom {
-            id: "app.inspect_callout".into(),
-            payload: CustomPayload::empty(),
-            mutates_document: false,
-        };
+        let mutating_custom = RichCommand::extension(InsertCalloutCommand);
+        let readonly_custom = RichCommand::extension(InspectCalloutCommand);
         assert_eq!(mutating_custom.command_id(), "app.insert_callout");
         let viewer = InteractionPolicy::viewer();
         assert_eq!(
@@ -753,8 +786,8 @@ mod tests {
     #[test]
     fn document_codec_markdown_and_html_roundtrip() {
         let registry = CodecRegistry::with_builtin_codecs();
-        assert!(registry.get_by_extension("md").is_some());
-        assert!(registry.get_by_mime("text/html").is_some());
+        assert!(registry.get_by_extension(&FileExtension::new("md")).is_ok());
+        assert!(registry.get_by_mime(&MimeType::new("text/html")).is_ok());
 
         let source_md = "\
 # Phase 3 Spec
@@ -775,7 +808,9 @@ fn main() {}
 | FPS | 120 |
 
 ---";
-        let decoded = registry.decode_as("markdown", source_md).unwrap();
+        let markdown_id = FormatId::new("markdown");
+        let html_id = FormatId::new("html");
+        let decoded = registry.decode_as(&markdown_id, source_md).unwrap();
         assert_eq!(decoded.blocks.len(), 8);
         assert_eq!(decoded.blocks[0].kind.heading_data().map(|h| h.level), Some(1));
         assert!(matches!(
@@ -798,12 +833,12 @@ fn main() {}
         assert!(decoded.blocks[6].kind.is_builtin_table());
         assert!(decoded.blocks[7].kind.is_horizontal_rule());
 
-        let reencoded_md = registry.encode_as("markdown", &decoded).unwrap();
-        let reparsed_md = registry.decode_as("markdown", &reencoded_md).unwrap();
+        let reencoded_md = registry.encode_as(&markdown_id, &decoded).unwrap();
+        let reparsed_md = registry.decode_as(&markdown_id, &reencoded_md).unwrap();
         assert_eq!(reparsed_md.blocks.len(), decoded.blocks.len());
 
-        let html = registry.encode_as("html", &decoded).unwrap();
-        let reparsed_html = registry.decode_as("html", &html).unwrap();
+        let html = registry.encode_as(&html_id, &decoded).unwrap();
+        let reparsed_html = registry.decode_as(&html_id, &html).unwrap();
         assert_eq!(reparsed_html.blocks.len(), decoded.blocks.len());
     }
 
@@ -904,14 +939,17 @@ fn main() {}
             title: String,
             tone: String,
         }
+        struct CalloutSpec;
+        impl BlockSpec for CalloutSpec {
+            const KIND: &'static str = "callout";
+            type Shape = block_shape::Container;
+            type Data = CalloutMeta;
+        }
 
         let meta = CalloutMeta {
             title: "Note".into(),
             tone: "info".into(),
         };
-        let typed = CustomPayload::typed(meta.clone());
-        assert_eq!(typed.downcast_ref::<CalloutMeta>(), Some(&meta));
-
         let mut doc = Document::new();
         let child_id = doc.alloc_block_id();
         let child = BlockNode::new(
@@ -919,7 +957,15 @@ fn main() {}
             BlockKind::paragraph(InlineContent::plain("First Second")),
             BlockStyle::default(),
         );
-        let container_id = doc.add_custom_container("callout", typed, vec![child]);
+        let container_id = doc.add_container_block::<CalloutSpec>(meta.clone(), vec![child]);
+        assert_eq!(
+            doc.find_block(container_id)
+                .unwrap()
+                .kind
+                .data()
+                .downcast_ref::<CalloutMeta>(),
+            Some(&meta)
+        );
 
         // JSON round-trip turns Typed payload into Raw while preserving Document equality and lazy decoding.
         let json = doc.to_json_pretty().unwrap();
@@ -928,8 +974,13 @@ fn main() {}
         let raw_payload = parsed.find_block(container_id).unwrap().kind.data();
         assert!(!raw_payload.is_typed());
         assert_eq!(
-            raw_payload.as_typed::<CalloutMeta>().as_deref(),
-            Some(&meta)
+            parsed
+                .find_block(container_id)
+                .unwrap()
+                .read_data::<CalloutSpec>()
+                .unwrap()
+                .as_ref(),
+            &meta
         );
 
         // Splitting a paragraph inside a custom Container updates container children and bumps ancestor version.
@@ -947,5 +998,429 @@ fn main() {}
         assert_eq!(children.len(), 2);
         assert_eq!(children[0].kind.inline_content().unwrap().text, "First ");
         assert_eq!(children[1].kind.inline_content().unwrap().text, "Second");
+    }
+
+    #[test]
+    fn custom_node_json_fidelity_error_classification_and_fallible_serialization() {
+        #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct CalloutData {
+            title: String,
+        }
+        struct CalloutSpec;
+        impl BlockSpec for CalloutSpec {
+            const KIND: &'static str = "callout";
+            type Shape = block_shape::Container;
+            type Data = CalloutData;
+        }
+        struct CalloutLeafSpec;
+        impl BlockSpec for CalloutLeafSpec {
+            const KIND: &'static str = "callout";
+            type Shape = block_shape::Leaf;
+            type Data = CalloutData;
+        }
+
+        // Unknown custom kind + unknown JSON fields + image ID string round-trip faithfully.
+        let mut original = Document::new();
+        let mut inline = InlineContent::empty();
+        inline.push_object(
+            InlineObject::Image {
+                asset_id: ImageAssetId::new("asset://hero/1"),
+                alt: "Hero".into(),
+                width_pt: 80.0,
+                height_pt: 40.0,
+                valign: InlineVAlign::Baseline,
+            },
+            InlineStyle::default(),
+        );
+        original.add_paragraph(inline, BlockStyle::default());
+        let unknown_id = original.alloc_block_id();
+        original.push_block(BlockNode::new(
+            unknown_id,
+            BlockKind::Leaf {
+                kind: std::sync::Arc::from("vendor.unknown_widget"),
+                data: CustomPayload::from_json(serde_json::json!({ "extra": [1, 2, 3] })),
+            },
+            BlockStyle::default(),
+        ));
+        let json = original.to_json_pretty().unwrap();
+        assert!(json.contains("\"asset_id\": \"asset://hero/1\""));
+        let reparsed = Document::from_json(&json).unwrap();
+        assert_eq!(reparsed, original);
+        assert_eq!(
+            reparsed
+                .find_block(unknown_id)
+                .unwrap()
+                .kind
+                .data()
+                .to_json()
+                .unwrap(),
+            serde_json::json!({ "extra": [1, 2, 3] })
+        );
+
+        // Distinguish wrong kind, wrong shape, and malformed payload on checked reads.
+        let corrupt_callout = BlockNode::new(
+            BlockId(99),
+            BlockKind::Container {
+                kind: std::sync::Arc::from("callout"),
+                data: CustomPayload::from_json(serde_json::json!({ "title": 123 })),
+                children: Vec::new(),
+            },
+            BlockStyle::default(),
+        );
+        assert!(matches!(
+            corrupt_callout.read_data::<CalloutSpec>(),
+            Err(NodeDataError::InvalidData { kind: "callout", .. })
+        ));
+        assert!(matches!(
+            corrupt_callout.read_data::<CalloutLeafSpec>(),
+            Err(NodeDataError::ShapeMismatch {
+                kind: "callout",
+                expected: BlockShapeKind::Leaf,
+                actual: BlockShapeKind::Container,
+            })
+        ));
+        assert!(matches!(
+            reparsed.find_block(unknown_id).unwrap().read_data::<CalloutSpec>(),
+            Err(NodeDataError::KindMismatch { expected: "callout", .. })
+        ));
+
+        // Typed payload serialization failure propagates an error instead of writing null.
+        #[derive(Clone, Debug, PartialEq)]
+        struct FailingPayload;
+        impl serde::Serialize for FailingPayload {
+            fn serialize<S: serde::Serializer>(&self, _serializer: S) -> Result<S::Ok, S::Error> {
+                Err(serde::ser::Error::custom("cannot serialize"))
+            }
+        }
+        impl<'de> serde::Deserialize<'de> for FailingPayload {
+            fn deserialize<D: serde::Deserializer<'de>>(
+                _deserializer: D,
+            ) -> Result<Self, D::Error> {
+                Ok(Self)
+            }
+        }
+        struct FailingSpec;
+        impl BlockSpec for FailingSpec {
+            const KIND: &'static str = "failing";
+            type Shape = block_shape::Leaf;
+            type Data = FailingPayload;
+        }
+        let mut failing_doc = Document::new();
+        failing_doc.add_leaf_block::<FailingSpec>(FailingPayload);
+        assert!(failing_doc.to_json_pretty().is_err());
+        assert!(matches!(
+            JsonCodec.encode(&failing_doc),
+            Err(CodecError::Serialize { .. })
+        ));
+        assert!(matches!(
+            MarkdownCodec.encode(&failing_doc),
+            Err(CodecError::Serialize { .. })
+        ));
+    }
+
+    #[test]
+    fn nested_payload_edits_preserve_identity_update_ancestors_reject_stale_and_undo() {
+        #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct CardData {
+            title: String,
+        }
+        struct CardSpec;
+        impl BlockSpec for CardSpec {
+            const KIND: &'static str = "card";
+            type Shape = block_shape::Container;
+            type Data = CardData;
+        }
+        struct OtherLeafSpec;
+        impl BlockSpec for OtherLeafSpec {
+            const KIND: &'static str = "other";
+            type Shape = block_shape::Leaf;
+            type Data = CardData;
+        }
+
+        #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct StatusData {
+            label: String,
+        }
+        struct StatusSpec;
+        impl InlineSpec for StatusSpec {
+            const KIND: &'static str = "status";
+            type Data = StatusData;
+        }
+        struct OtherInlineSpec;
+        impl InlineSpec for OtherInlineSpec {
+            const KIND: &'static str = "other_inline";
+            type Data = StatusData;
+        }
+
+        let mut doc = Document::new();
+        let mut leaf_inline = InlineContent::plain("Status: ");
+        let badge_id = leaf_inline.push_object(
+            InlineObject::custom::<StatusSpec>(StatusData {
+                label: "Draft".into(),
+            }),
+            InlineStyle::default(),
+        );
+        let child_id = doc.alloc_block_id();
+        let child = BlockNode::new(child_id, BlockKind::paragraph(leaf_inline), BlockStyle::default());
+        let inner_card_id = doc.alloc_block_id();
+        let inner_card = BlockNode::new(
+            inner_card_id,
+            BlockKind::container::<CardSpec>(CardData { title: "Inner v1".into() }, vec![child]),
+            BlockStyle::default(),
+        );
+        let outer_quote_id = doc.add_blockquote(vec![inner_card]);
+
+        let outer_v0 = doc.find_block(outer_quote_id).unwrap().version;
+        let inner_v0 = doc.find_block(inner_card_id).unwrap().version;
+        let mut history = History::default();
+
+        // Payload-only block edit preserves children and block ID, bumps ancestors, is non-structural.
+        let applied = doc.apply(Transaction::new(vec![Step::update_block_data::<CardSpec>(
+            inner_card_id,
+            CardData { title: "Inner v2".into() },
+        )]));
+        history.push_inverse(applied.inverse);
+        assert!(!applied.change_set.structure_changed);
+        assert!(applied.change_set.dirty_blocks.contains(&inner_card_id));
+        assert!(applied.change_set.dirty_blocks.contains(&outer_quote_id));
+        assert!(doc.find_block(inner_card_id).unwrap().version > inner_v0);
+        assert!(doc.find_block(outer_quote_id).unwrap().version > outer_v0);
+        assert_eq!(
+            doc.find_block(inner_card_id).unwrap().kind.children().unwrap()[0].id,
+            child_id
+        );
+        assert_eq!(
+            doc.find_block(inner_card_id).unwrap().read_data::<CardSpec>().unwrap().title,
+            "Inner v2"
+        );
+
+        // Stale wrong-kind block update is rejected without dirtying or changing data.
+        let stale_block = doc.apply(Transaction::new(vec![Step::update_block_data::<OtherLeafSpec>(
+            inner_card_id,
+            CardData { title: "Corrupted".into() },
+        )]));
+        assert!(stale_block.change_set.dirty_blocks.is_empty());
+        assert_eq!(
+            doc.find_block(inner_card_id).unwrap().read_data::<CardSpec>().unwrap().title,
+            "Inner v2"
+        );
+
+        // Checked inline payload update preserves object ID and bumps ancestors.
+        let inline_edit = doc.apply(Transaction::new(vec![Step::update_inline_data::<StatusSpec>(
+            child_id,
+            badge_id,
+            StatusData { label: "Done".into() },
+        )]));
+        history.push_inverse(inline_edit.inverse);
+        assert!(!inline_edit.change_set.structure_changed);
+        assert!(inline_edit.change_set.dirty_blocks.contains(&child_id));
+        assert!(inline_edit.change_set.dirty_blocks.contains(&inner_card_id));
+        assert!(inline_edit.change_set.dirty_blocks.contains(&outer_quote_id));
+
+        // Stale wrong-kind inline update does not overwrite the badge.
+        let stale_inline = doc.apply(Transaction::new(vec![Step::update_inline_data::<OtherInlineSpec>(
+            child_id,
+            badge_id,
+            StatusData { label: "Wrong".into() },
+        )]));
+        assert!(stale_inline.change_set.dirty_blocks.is_empty());
+        assert_eq!(
+            doc.find_block(child_id)
+                .unwrap()
+                .kind
+                .inline_content()
+                .unwrap()
+                .object_by_id(badge_id)
+                .unwrap()
+                .object
+                .read_data::<StatusSpec>()
+                .unwrap()
+                .label,
+            "Done"
+        );
+
+        // Undo restores both inline and nested block payloads cleanly.
+        history.undo(&mut doc).unwrap();
+        history.undo(&mut doc).unwrap();
+        assert_eq!(
+            doc.find_block(inner_card_id).unwrap().read_data::<CardSpec>().unwrap().title,
+            "Inner v1"
+        );
+        assert_eq!(
+            doc.find_block(child_id)
+                .unwrap()
+                .kind
+                .inline_content()
+                .unwrap()
+                .object_by_id(badge_id)
+                .unwrap()
+                .object
+                .read_data::<StatusSpec>()
+                .unwrap()
+                .label,
+            "Draft"
+        );
+    }
+
+    #[test]
+    fn versioned_clipboard_preserves_custom_grid_open_edges_and_rejects_malformed() {
+        #[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+        struct SheetMeta {
+            sheet_name: String,
+        }
+        struct SheetGridSpec;
+        impl BlockSpec for SheetGridSpec {
+            const KIND: &'static str = "acme.sheet";
+            type Shape = block_shape::Grid;
+            type Data = SheetMeta;
+        }
+
+        let mut doc = Document::new();
+        let before_id = doc.add_paragraph(InlineContent::plain("alpha beta"), BlockStyle::default());
+        let cell_id = doc.alloc_block_id();
+        let cell_para_id = doc.alloc_block_id();
+        let table = TableBlock {
+            columns: vec![ColumnSpec::Auto],
+            column_kinds: Default::default(),
+            rows: vec![TableRow {
+                is_header: false,
+                cells: vec![TableCell::simple(
+                    cell_id,
+                    vec![BlockNode::new(
+                        cell_para_id,
+                        BlockKind::paragraph(InlineContent::plain("42")),
+                        BlockStyle::default(),
+                    )],
+                )],
+            }],
+            border_style: TableBorderStyle::default(),
+        };
+        doc.add_grid_block::<SheetGridSpec>(SheetMeta { sheet_name: "Q4".into() }, table);
+        let after_id = doc.add_paragraph(InlineContent::plain("gamma delta"), BlockStyle::default());
+
+        let selection = DocumentSelection::Text {
+            anchor: doc.doc_pos_for_block(before_id, 6).unwrap(),
+            focus: doc.doc_pos_for_block(after_id, 5).unwrap(),
+            affinity: Affinity::Downstream,
+            goal_x: None,
+            stored_marks: None,
+        };
+        let fragment = doc.extract_selection_fragment(&selection).unwrap();
+        assert!(fragment.start_open);
+        assert!(fragment.end_open);
+        assert!(matches!(
+            &fragment.blocks[1],
+            ClipboardBlock::CustomGrid { kind, .. } if kind.as_ref() == "acme.sheet"
+        ));
+
+        let encoded = fragment.to_versioned_json().unwrap();
+        let decoded = ClipboardFragment::from_versioned_json(&encoded).unwrap();
+        assert_eq!(decoded, fragment);
+
+        // Destination materialization allocates fresh IDs and preserves custom grid data.
+        let mut destination = Document::new();
+        let nodes = decoded.to_block_nodes(&mut destination);
+        assert_eq!(nodes[1].read_data::<SheetGridSpec>().unwrap().sheet_name, "Q4");
+
+        // Unsupported version and broken UTF-8 span boundaries are rejected.
+        let bad_version = encoded.replace("\"version\":1", "\"version\":99");
+        assert!(matches!(
+            ClipboardFragment::from_versioned_json(&bad_version),
+            Err(ClipboardFragmentError::UnsupportedVersion { found: 99, expected: 1 })
+        ));
+        let valid_unicode = ClipboardFragment::from_blocks(vec![ClipboardBlock::Paragraph {
+            content: InlineContent::plain("é"),
+            align: TextAlign::Left,
+        }])
+        .to_versioned_json()
+        .unwrap();
+        let bad_utf8 = valid_unicode.replace("\"end\":2", "\"end\":1");
+        assert!(matches!(
+            ClipboardFragment::from_versioned_json(&bad_utf8),
+            Err(ClipboardFragmentError::Malformed(_))
+        ));
+    }
+
+    #[test]
+    fn extension_command_wire_rejection_checked_decorations_and_ambiguous_codecs() {
+        // Built-in commands round-trip; extension commands reject serialization; legacy Custom rejects deserialization.
+        let builtin = RichCommand::InsertText("hi".into());
+        let builtin_json = serde_json::to_string(&builtin).unwrap();
+        assert_eq!(serde_json::from_str::<RichCommand>(&builtin_json).unwrap(), builtin);
+
+        #[derive(Debug)]
+        struct LocalCmd(#[allow(dead_code)] u32);
+        impl ExtensionCommand for LocalCmd {
+            const ID: &'static str = "acme.local";
+            type Effect = ReadOnly;
+        }
+        assert!(serde_json::to_string(&RichCommand::extension(LocalCmd(7))).is_err());
+        let legacy_custom = r#"{"Custom":{"id":"acme.old","payload":null,"mutates_document":true}}"#;
+        assert!(serde_json::from_str::<RichCommand>(legacy_custom).is_err());
+
+        // DecorationWriter rejects invalid UTF-8 boundaries, reversed ranges, and out-of-bounds offsets.
+        let block = BlockNode::new(
+            BlockId(1),
+            BlockKind::paragraph(InlineContent::plain("aé")),
+            BlockStyle::default(),
+        );
+        let mut writer = DecorationWriter::new(&block);
+        assert_eq!(
+            writer.push_inline(
+                BlockByteRange::new(BlockByteOffset(0), BlockByteOffset(2)),
+                InlineDecorationStyle::new(),
+            ),
+            Err(DecorationError::InvalidUtf8Boundary { offset: 2 })
+        );
+        assert_eq!(
+            writer.push_inline(
+                BlockByteRange::new(BlockByteOffset(3), BlockByteOffset(1)),
+                InlineDecorationStyle::new(),
+            ),
+            Err(DecorationError::InvalidOrder { start: 3, end: 1 })
+        );
+        assert_eq!(
+            writer.push_ghost_text(BlockByteOffset(99), Affinity::Downstream, "x", None),
+            Err(DecorationError::OutOfBounds { offset: 99, len: 3 })
+        );
+        writer
+            .push_inline(
+                BlockByteRange::new(BlockByteOffset(1), BlockByteOffset(3)),
+                InlineDecorationStyle::new().with_priority(5),
+            )
+            .unwrap();
+        let decorations = writer.finish();
+        assert_eq!(decorations.inline.len(), 1);
+        assert_eq!(decorations.inline[0].range(), 1..3);
+
+        // CodecRegistry rejects duplicate IDs and reports ambiguous MIME/suffix lookups.
+        struct AltMarkdownFormat;
+        struct AltMarkdownCodec;
+        impl DocumentCodec for AltMarkdownCodec {
+            type Format = AltMarkdownFormat;
+            fn format_id(&self) -> &str { "alt-markdown" }
+            fn mime_types(&self) -> &[&str] { &["text/markdown"] }
+            fn file_extensions(&self) -> &[&str] { &["md"] }
+            fn encode(&self, _doc: &Document) -> Result<EncodedDocument<Self::Format>, CodecError> {
+                Ok(EncodedDocument::from_raw(""))
+            }
+            fn decode(&self, _input: &EncodedDocument<Self::Format>) -> Result<Document, CodecError> {
+                Ok(Document::new())
+            }
+        }
+        let mut registry = CodecRegistry::with_builtin_codecs();
+        assert!(matches!(
+            registry.register(MarkdownCodec),
+            Err(CodecError::DuplicateFormatId { .. })
+        ));
+        registry.register(AltMarkdownCodec).unwrap();
+        assert!(matches!(
+            registry.get_by_mime(&MimeType::new("text/markdown")),
+            Err(CodecError::AmbiguousMimeType { candidates, .. }) if candidates.len() == 2
+        ));
+        assert!(matches!(
+            registry.get_by_extension(&FileExtension::new(".md")),
+            Err(CodecError::AmbiguousFileExtension { candidates, .. }) if candidates.len() == 2
+        ));
     }
 }

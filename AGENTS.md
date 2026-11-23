@@ -22,7 +22,7 @@ On Linux, `gpui-kit` transitively uses `yeslogic-fontconfig-sys`, which queries 
   * Propagate with `?` when the caller should handle the error.
   * Log errors when intentional ignoring needs visibility.
   * Use `match` or `if let Err(...)` for explicit recovery.
-* Never create `mod.rs`. Use `src/<module>.rs` naming with flat, descriptive module paths.
+* Never create `mod.rs` or `<module>_<submodule>.rs`. Use `src/<module>.rs` + `src/<module>/<submodule>.rs` naming with descriptive module paths.
 * Implement strictly what is requested. Avoid speculative features or unrequested additions.
 * Use full words for variable names without abbreviations (for example, `queue`, `index`, `context`), except framework-idiomatic names such as GPUI's `cx`.
 * Use `cargo add` to add crate dependencies.

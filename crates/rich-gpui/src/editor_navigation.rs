@@ -21,24 +21,27 @@ impl NavigationState {
         }
     }
 
-    pub(crate) fn decorations(
+    pub(crate) fn write_decorations(
         &self,
         block_id: BlockId,
-    ) -> impl Iterator<Item = rich_model::InlineDecoration> + '_ {
-        self.by_block
-            .get(&block_id)
-            .into_iter()
-            .flatten()
-            .map(|&index| {
-                let color = if self.search.active == Some(index) {
-                    RgbaColor::rgb(0xff, 0xd5, 0x67)
-                } else {
-                    RgbaColor::rgb(0xff, 0xee, 0xa0)
-                };
-                rich_model::InlineDecoration::new(self.search.matches[index].range.clone())
-                    .with_background(color)
-                    .with_priority(20)
-            })
+        writer: &mut rich_model::DecorationWriter<'_>,
+    ) {
+        for &index in self.by_block.get(&block_id).into_iter().flatten() {
+            let color = if self.search.active == Some(index) {
+                RgbaColor::rgb(0xff, 0xd5, 0x67)
+            } else {
+                RgbaColor::rgb(0xff, 0xee, 0xa0)
+            };
+            let range = rich_model::BlockByteRange::from_usize_range(
+                self.search.matches[index].range.clone(),
+            );
+            let style = rich_model::InlineDecorationStyle::new()
+                .with_background(color)
+                .with_priority(20);
+            if let Err(error) = writer.push_inline(range, style) {
+                debug_assert!(false, "search match decoration rejected: {error}");
+            }
+        }
     }
 }
 

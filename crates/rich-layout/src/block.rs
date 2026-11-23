@@ -1,11 +1,10 @@
 use crate::geometry::{Insets, Point, Rect, pt_to_px};
 use crate::line::{HitResult, ParagraphLayout, layout_paragraph};
-use crate::shaper::{GlyphBackend, TextShaper};
+use crate::shaper::{GlyphBackend, TextShaper, is_valid_custom_insets, is_valid_custom_size};
 use rich_model::{
-    BlockId, BlockKind, BlockNode, CellVAlign, ColumnSpec, CustomPayload, Document,
-    DocumentLayoutConfig,
-    ListKind, NumberStyle, RgbaColor, SharedStr, StyleSheet, TableBlock, TableBorderStyle,
-    block_kinds,
+    BlockId, BlockKind, BlockNode, BlockShapeKind, CellVAlign, ColumnSpec, CustomPayload, Document,
+    DocumentLayoutConfig, ListKind, NumberStyle, RgbaColor, SharedStr, StyleSheet, TableBlock,
+    TableBorderStyle, block_kinds,
 };
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -483,7 +482,13 @@ pub fn layout_block<S: TextShaper>(
                 }
             }
             _ => {
-                let chrome = shaper.measure_custom_chrome(kind, data, max_width, zoom);
+                let raw_chrome =
+                    shaper.measure_custom_chrome(BlockShapeKind::Text, kind, data, max_width, zoom);
+                let chrome = if is_valid_custom_insets(raw_chrome) {
+                    raw_chrome
+                } else {
+                    Insets::xy(pt_to_px(12.0, zoom), pt_to_px(8.0, zoom))
+                };
                 let inner_w = (max_width - chrome.horizontal()).max(40.0);
                 let para =
                     layout_paragraph(content, &block.style, sheet, config, inner_w, zoom, shaper);
@@ -548,7 +553,18 @@ pub fn layout_block<S: TextShaper>(
                     },
                 }
             } else {
-                let chrome = shaper.measure_custom_chrome(kind, data, max_width, zoom);
+                let raw_chrome = shaper.measure_custom_chrome(
+                    BlockShapeKind::Container,
+                    kind,
+                    data,
+                    max_width,
+                    zoom,
+                );
+                let chrome = if is_valid_custom_insets(raw_chrome) {
+                    raw_chrome
+                } else {
+                    Insets::xy(pt_to_px(12.0, zoom), pt_to_px(8.0, zoom))
+                };
                 let child_max_w = (max_width - chrome.horizontal()).max(40.0);
                 let mut placed = Vec::with_capacity(children.len());
                 let mut y = chrome.top;
@@ -603,7 +619,18 @@ pub fn layout_block<S: TextShaper>(
                     kind: BlockLayoutKind::Table(t_layout),
                 }
             } else {
-                let chrome = shaper.measure_custom_chrome(kind, data, max_width, zoom);
+                let raw_chrome = shaper.measure_custom_chrome(
+                    BlockShapeKind::Grid,
+                    kind,
+                    data,
+                    max_width,
+                    zoom,
+                );
+                let chrome = if is_valid_custom_insets(raw_chrome) {
+                    raw_chrome
+                } else {
+                    Insets::xy(pt_to_px(12.0, zoom), pt_to_px(8.0, zoom))
+                };
                 let inner_w = (max_width - chrome.horizontal()).max(40.0);
                 let t_layout = layout_table(table, sheet, config, inner_w, zoom, cache, shaper);
                 let total_w = (t_layout.total_width + chrome.horizontal()).max(max_width);
@@ -639,7 +666,12 @@ pub fn layout_block<S: TextShaper>(
                     kind: BlockLayoutKind::HorizontalRule { rule_y: h * 0.5 },
                 }
             } else {
-                let measured = shaper.measure_custom_block(kind, data, max_width, zoom);
+                let raw_measured = shaper.measure_custom_block(kind, data, max_width, zoom);
+                let measured = if is_valid_custom_size(raw_measured) {
+                    raw_measured
+                } else {
+                    crate::geometry::Size::new(max_width.max(1.0), pt_to_px(44.0, zoom))
+                };
                 let width = measured.width.clamp(1.0, max_width.max(1.0));
                 let height = measured.height.max(1.0);
                 BlockLayout {

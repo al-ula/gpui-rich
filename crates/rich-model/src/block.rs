@@ -1,15 +1,208 @@
 use crate::components::{PLACEHOLDER_KIND, PlaceholderKind};
 use crate::inline::{ChipKind, InlineContent, InlineObject};
-use crate::payload::CustomPayload;
+use crate::payload::{CustomData, CustomPayload};
 use crate::selection::{DocPos, PathSegment};
 use crate::style::{
     BlockStyle, BlockWidth, DocumentLayoutConfig, Edges, RgbaColor, SharedStr, StyleId, StyleSheet,
 };
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use smallvec::SmallVec;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
+use std::fmt;
 use std::sync::Arc;
+
+/// Structural shape of a [`BlockKind`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum BlockShapeKind {
+    Leaf,
+    Text,
+    Container,
+    Grid,
+}
+
+impl fmt::Display for BlockShapeKind {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Leaf => formatter.write_str("leaf"),
+            Self::Text => formatter.write_str("text"),
+            Self::Container => formatter.write_str("container"),
+            Self::Grid => formatter.write_str("grid"),
+        }
+    }
+}
+
+mod block_shape_sealed {
+    pub trait Sealed {}
+}
+
+/// Sealed trait identifying one of the four structural shapes supported by [`BlockKind`].
+pub trait BlockShape: block_shape_sealed::Sealed + 'static {
+    const KIND: BlockShapeKind;
+}
+
+/// Marker types implementing [`BlockShape`] for [`BlockSpec::Shape`].
+pub mod block_shape {
+    use super::{BlockShape, BlockShapeKind, block_shape_sealed};
+
+    /// Atomic non-text leaf block shape (`BlockKind::Leaf`).
+    pub struct Leaf;
+    /// Editable inline text block shape (`BlockKind::Text`).
+    pub struct Text;
+    /// Vertical child-block container shape (`BlockKind::Container`).
+    pub struct Container;
+    /// Table/grid container shape (`BlockKind::Grid`).
+    pub struct Grid;
+
+    impl block_shape_sealed::Sealed for Leaf {}
+    impl block_shape_sealed::Sealed for Text {}
+    impl block_shape_sealed::Sealed for Container {}
+    impl block_shape_sealed::Sealed for Grid {}
+
+    impl BlockShape for Leaf {
+        const KIND: BlockShapeKind = BlockShapeKind::Leaf;
+    }
+
+    impl BlockShape for Text {
+        const KIND: BlockShapeKind = BlockShapeKind::Text;
+    }
+
+    impl BlockShape for Container {
+        const KIND: BlockShapeKind = BlockShapeKind::Container;
+    }
+
+    impl BlockShape for Grid {
+        const KIND: BlockShapeKind = BlockShapeKind::Grid;
+    }
+}
+
+/// Error returned by checked node payload reads such as [`BlockKind::read_data`] and
+/// [`crate::InlineObject::read_data`].
+///
+/// Distinguishes a node having another kind or shape from a node matching the specification
+/// whose payload cannot be decoded into the expected Rust type.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NodeDataError {
+    /// The node carries a different semantic kind identifier than the requested specification.
+    KindMismatch {
+        expected: &'static str,
+        actual: String,
+    },
+    /// The block matches `kind` but has a different structural [`BlockShapeKind`].
+    ShapeMismatch {
+        kind: &'static str,
+        expected: BlockShapeKind,
+        actual: BlockShapeKind,
+    },
+    /// The node matches the specification's kind and shape, but its payload is invalid or incompatible.
+    InvalidData {
+        kind: &'static str,
+        message: String,
+    },
+}
+
+impl fmt::Display for NodeDataError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::KindMismatch { expected, actual } => {
+                write!(formatter, "expected node kind '{expected}', found '{actual}'")
+            }
+            Self::ShapeMismatch {
+                kind,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "node kind '{kind}' expected {expected} shape, found {actual}"
+            ),
+            Self::InvalidData { kind, message } => {
+                write!(formatter, "invalid payload for node kind '{kind}': {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for NodeDataError {}
+
+/// GPUI-free specification binding a custom block kind identifier to its structural [`BlockShape`]
+/// and typed payload [`Self::Data`].
+///
+/// Constructors on [`BlockKind`] and [`Document`] enforce `Self::Shape` at compile time, while
+/// [`BlockKind::read_data`] validates heterogeneous or deserialized nodes at runtime.
+///
+/// # Example
+/// ```rust
+/// use rich_model::{BlockKind, BlockSpec, InlineContent, block_shape};
+/// use serde::{Deserialize, Serialize};
+///
+/// #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// struct CalloutData {
+///     title: String,
+/// }
+///
+/// struct CalloutSpec;
+/// impl BlockSpec for CalloutSpec {
+///     const KIND: &'static str = "callout";
+///     type Shape = block_shape::Container;
+///     type Data = CalloutData;
+/// }
+///
+/// let kind = BlockKind::container::<CalloutSpec>(
+///     CalloutData { title: "Note".into() },
+///     Vec::new(),
+/// );
+/// assert_eq!(kind.read_data::<CalloutSpec>().unwrap().title, "Note");
+/// ```
+///
+/// Passing the wrong shape or payload type fails at compile time:
+/// ```compile_fail
+/// use rich_model::{BlockKind, BlockSpec, block_shape};
+/// use serde::{Deserialize, Serialize};
+///
+/// #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// struct CalloutData {
+///     title: String,
+/// }
+///
+/// struct CalloutSpec;
+/// impl BlockSpec for CalloutSpec {
+///     const KIND: &'static str = "callout";
+///     type Shape = block_shape::Container;
+///     type Data = CalloutData;
+/// }
+///
+/// // Container spec cannot be constructed as a Leaf block.
+/// let _ = BlockKind::leaf::<CalloutSpec>(CalloutData { title: "Note".into() });
+/// ```
+///
+/// ```compile_fail
+/// use rich_model::{BlockKind, BlockSpec, block_shape};
+/// use serde::{Deserialize, Serialize};
+///
+/// #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+/// struct CalloutData {
+///     title: String,
+/// }
+///
+/// struct CalloutSpec;
+/// impl BlockSpec for CalloutSpec {
+///     const KIND: &'static str = "callout";
+///     type Shape = block_shape::Container;
+///     type Data = CalloutData;
+/// }
+///
+/// // Wrong payload type cannot be passed to CalloutSpec constructor.
+/// let _ = BlockKind::container::<CalloutSpec>("not callout data", Vec::new());
+/// ```
+pub trait BlockSpec: 'static {
+    /// Stable persisted kind identifier stored in [`BlockKind`].
+    const KIND: &'static str;
+    /// Sealed structural shape required for this block kind.
+    type Shape: BlockShape;
+    /// Typed payload persisted as JSON and borrowed directly when stored in memory.
+    type Data: CustomData + Clone + DeserializeOwned + 'static;
+}
 
 /// Built-in semantic kind identifiers for [`BlockKind`].
 pub mod block_kinds {
@@ -184,9 +377,14 @@ impl TableBlock {
             let [entry] = content.objects.as_slice() else { mixed = true; break; };
             if content.text.trim() != "\u{fffc}" || actual.is_some() { mixed = true; break; }
             actual = match &entry.object {
-                InlineObject::Custom { kind, data } if kind.as_ref() == PLACEHOLDER_KIND => {
-                    data.as_json().get("kind").and_then(serde_json::Value::as_str).and_then(PlaceholderKind::from_name)
-                }
+                InlineObject::Custom { kind, data } if kind.as_ref() == PLACEHOLDER_KIND => data
+                    .as_json()
+                    .ok()
+                    .and_then(|json| {
+                        json.get("kind")
+                            .and_then(serde_json::Value::as_str)
+                            .and_then(PlaceholderKind::from_name)
+                    }),
                 InlineObject::SmartChip { kind: ChipKind::Date, .. } => Some(PlaceholderKind::Date),
                 InlineObject::SmartChip { kind: ChipKind::Person, .. } => Some(PlaceholderKind::Person),
                 InlineObject::SmartChip { kind: ChipKind::Document, .. } => Some(PlaceholderKind::File),
@@ -398,7 +596,51 @@ impl BlockKind {
         }
     }
 
-    pub fn text(
+    /// Constructs a custom text block bound to [`BlockSpec`] `S`.
+    pub fn text<S: BlockSpec<Shape = block_shape::Text>>(
+        data: S::Data,
+        content: InlineContent,
+    ) -> Self {
+        Self::Text {
+            kind: Arc::from(S::KIND),
+            data: CustomPayload::typed(data),
+            content,
+        }
+    }
+
+    /// Constructs a custom container block bound to [`BlockSpec`] `S`.
+    pub fn container<S: BlockSpec<Shape = block_shape::Container>>(
+        data: S::Data,
+        children: Vec<BlockNode>,
+    ) -> Self {
+        Self::Container {
+            kind: Arc::from(S::KIND),
+            data: CustomPayload::typed(data),
+            children,
+        }
+    }
+
+    /// Constructs a custom grid block bound to [`BlockSpec`] `S`.
+    pub fn grid<S: BlockSpec<Shape = block_shape::Grid>>(
+        data: S::Data,
+        table: TableBlock,
+    ) -> Self {
+        Self::Grid {
+            kind: Arc::from(S::KIND),
+            data: CustomPayload::typed(data),
+            table,
+        }
+    }
+
+    /// Constructs a custom leaf block bound to [`BlockSpec`] `S`.
+    pub fn leaf<S: BlockSpec<Shape = block_shape::Leaf>>(data: S::Data) -> Self {
+        Self::Leaf {
+            kind: Arc::from(S::KIND),
+            data: CustomPayload::typed(data),
+        }
+    }
+
+    pub(crate) fn raw_text(
         kind: impl Into<SharedStr>,
         data: CustomPayload,
         content: InlineContent,
@@ -410,7 +652,7 @@ impl BlockKind {
         }
     }
 
-    pub fn container(
+    pub(crate) fn raw_container(
         kind: impl Into<SharedStr>,
         data: CustomPayload,
         children: Vec<BlockNode>,
@@ -422,7 +664,11 @@ impl BlockKind {
         }
     }
 
-    pub fn grid(kind: impl Into<SharedStr>, data: CustomPayload, table: TableBlock) -> Self {
+    pub(crate) fn raw_grid(
+        kind: impl Into<SharedStr>,
+        data: CustomPayload,
+        table: TableBlock,
+    ) -> Self {
         Self::Grid {
             kind: kind.into(),
             data,
@@ -430,11 +676,48 @@ impl BlockKind {
         }
     }
 
-    pub fn leaf(kind: impl Into<SharedStr>, data: CustomPayload) -> Self {
+    pub(crate) fn raw_leaf(kind: impl Into<SharedStr>, data: CustomPayload) -> Self {
         Self::Leaf {
             kind: kind.into(),
             data,
         }
+    }
+
+    /// Returns the structural [`BlockShapeKind`] of this block.
+    pub const fn shape_kind(&self) -> BlockShapeKind {
+        match self {
+            Self::Text { .. } => BlockShapeKind::Text,
+            Self::Container { .. } => BlockShapeKind::Container,
+            Self::Grid { .. } => BlockShapeKind::Grid,
+            Self::Leaf { .. } => BlockShapeKind::Leaf,
+        }
+    }
+
+    /// Performs a checked read of this block's payload against [`BlockSpec`] `S`.
+    ///
+    /// Distinguishes a wrong kind or shape from a corrupt or incompatible payload.
+    pub fn read_data<S: BlockSpec>(&self) -> Result<Cow<'_, S::Data>, NodeDataError> {
+        let actual_kind = self.semantic_kind();
+        if actual_kind != S::KIND {
+            return Err(NodeDataError::KindMismatch {
+                expected: S::KIND,
+                actual: actual_kind.to_owned(),
+            });
+        }
+        let actual_shape = self.shape_kind();
+        if actual_shape != S::Shape::KIND {
+            return Err(NodeDataError::ShapeMismatch {
+                kind: S::KIND,
+                expected: S::Shape::KIND,
+                actual: actual_shape,
+            });
+        }
+        self.data()
+            .try_as_typed::<S::Data>()
+            .map_err(|error| NodeDataError::InvalidData {
+                kind: S::KIND,
+                message: error.to_string(),
+            })
     }
 
     pub fn semantic_kind(&self) -> &str {
@@ -578,6 +861,11 @@ impl BlockNode {
     pub fn bump_version(&mut self) {
         self.version = self.version.wrapping_add(1);
     }
+
+    /// Performs a checked read of this block's payload against [`BlockSpec`] `S`.
+    pub fn read_data<S: BlockSpec>(&self) -> Result<Cow<'_, S::Data>, NodeDataError> {
+        self.kind.read_data::<S>()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -617,6 +905,21 @@ impl Document {
         let id = BlockId(self.next_block_id);
         self.next_block_id += 1;
         id
+    }
+
+    /// Returns the next unused raw block ID counter without mutating the document.
+    pub fn peek_next_block_id(&self) -> u64 {
+        self.next_block_id
+    }
+
+    /// Advances the internal block ID counter so future allocations do not collide with reserved IDs.
+    pub fn reserve_block_ids_up_to(&mut self, next_block_id: u64) {
+        self.next_block_id = self.next_block_id.max(next_block_id);
+    }
+
+    pub(crate) fn advance_next_block_id_for_node(&mut self, block: &BlockNode) {
+        let max_id = max_block_id_in_node(block);
+        self.next_block_id = self.next_block_id.max(max_id.saturating_add(1));
     }
 
     pub fn push_block(&mut self, block: BlockNode) -> BlockId {
@@ -691,11 +994,10 @@ impl Document {
         self.push_block(BlockNode::new(id, BlockKind::horizontal_rule(), style))
     }
 
-    /// Appends a host-defined custom leaf block node.
-    pub fn add_custom_block(
+    /// Appends a typed custom leaf block node bound to [`BlockSpec`] `S`.
+    pub fn add_leaf_block<S: BlockSpec<Shape = block_shape::Leaf>>(
         &mut self,
-        kind: impl Into<SharedStr>,
-        data: CustomPayload,
+        data: S::Data,
     ) -> BlockId {
         let id = self.alloc_block_id();
         let style = BlockStyle {
@@ -703,30 +1005,28 @@ impl Document {
             space_after_pt: Some(8.0),
             ..BlockStyle::default()
         };
-        self.push_block(BlockNode::new(id, BlockKind::leaf(kind, data), style))
+        self.push_block(BlockNode::new(id, BlockKind::leaf::<S>(data), style))
     }
 
-    /// Appends a host-defined custom text block node with editable [`InlineContent`].
-    pub fn add_custom_text(
+    /// Appends a typed custom text block node bound to [`BlockSpec`] `S`.
+    pub fn add_text_block<S: BlockSpec<Shape = block_shape::Text>>(
         &mut self,
-        kind: impl Into<SharedStr>,
-        data: CustomPayload,
+        data: S::Data,
         content: InlineContent,
         style: BlockStyle,
     ) -> BlockId {
         let id = self.alloc_block_id();
         self.push_block(BlockNode::new(
             id,
-            BlockKind::text(kind, data, content),
+            BlockKind::text::<S>(data, content),
             style,
         ))
     }
 
-    /// Appends a host-defined custom container block node hosting editable child blocks.
-    pub fn add_custom_container(
+    /// Appends a typed custom container block node bound to [`BlockSpec`] `S`.
+    pub fn add_container_block<S: BlockSpec<Shape = block_shape::Container>>(
         &mut self,
-        kind: impl Into<SharedStr>,
-        data: CustomPayload,
+        data: S::Data,
         children: Vec<BlockNode>,
     ) -> BlockId {
         let id = self.alloc_block_id();
@@ -737,8 +1037,22 @@ impl Document {
         };
         self.push_block(BlockNode::new(
             id,
-            BlockKind::container(kind, data, children),
+            BlockKind::container::<S>(data, children),
             style,
+        ))
+    }
+
+    /// Appends a typed custom grid block node bound to [`BlockSpec`] `S`.
+    pub fn add_grid_block<S: BlockSpec<Shape = block_shape::Grid>>(
+        &mut self,
+        data: S::Data,
+        table: TableBlock,
+    ) -> BlockId {
+        let id = self.alloc_block_id();
+        self.push_block(BlockNode::new(
+            id,
+            BlockKind::grid::<S>(data, table),
+            BlockStyle::default(),
         ))
     }
 
@@ -1029,6 +1343,29 @@ fn find_in_slice(blocks: &[BlockNode], id: BlockId) -> Option<&BlockNode> {
         }
     }
     None
+}
+
+fn max_block_id_in_node(block: &BlockNode) -> u64 {
+    let mut max_id = block.id.0;
+    match &block.kind {
+        BlockKind::Container { children, .. } => {
+            for child in children {
+                max_id = max_id.max(max_block_id_in_node(child));
+            }
+        }
+        BlockKind::Grid { table, .. } => {
+            for row in &table.rows {
+                for cell in &row.cells {
+                    max_id = max_id.max(cell.id.0);
+                    for child in &cell.blocks {
+                        max_id = max_id.max(max_block_id_in_node(child));
+                    }
+                }
+            }
+        }
+        BlockKind::Text { .. } | BlockKind::Leaf { .. } => {}
+    }
+    max_id
 }
 
 fn find_in_slice_mut(blocks: &mut [BlockNode], id: BlockId) -> Option<&mut BlockNode> {

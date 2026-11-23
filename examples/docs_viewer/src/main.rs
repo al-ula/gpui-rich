@@ -6,41 +6,44 @@ use gpui_kit::{
     Styled, Subscription, Window, WindowBounds, WindowOptions, div, px, rgb, size,
 };
 use rich_gpui::{
-    CustomRenderOutput, MemoryAssetProvider, RichDocumentEvent, RichDocumentView, RichTheme,
-    TypedBlockExtension, TypedBlockRenderContext, TypedInlineExtension, TypedInlineRenderContext,
+    BlockRenderContext, BlockRenderer, CustomRenderOutput, InlineRenderContext, InlineRenderer,
+    MemoryAssetProvider, RichDocumentEvent, RichDocumentView, RichTheme,
     register_default_keybindings,
 };
 use rich_layout::{InlineBoxMetrics, Insets, pt_to_px};
 use rich_model::{
-    BaselineShift, BlockDecorations, BlockKind, BlockNode, BlockStyle, BlockWidth, ChipKind,
-    ColumnSpec, CustomPayload, DecorationContext, DecorationProvider, Document, Edges, FontWeight,
-    HorizontalLayout, InlineContent, InlineDecoration, InlineObject, InlineStyle, InlineVAlign,
-    InteractionPolicy, ListId, ListKind, MarkKind, MarkdownCodec, NumberStyle, PaperSpec,
-    RgbaColor, RichCommand, SelectionValue, StyleId, TableBlock, TableBorderStyle, TableCell,
-    TableRow, TextAlign, UnderlineKind,
+    BaselineShift, BlockByteRange, BlockKind, BlockNode, BlockSpec, BlockStyle, BlockWidth,
+    ChipKind, ColumnSpec, DecorationContext, DecorationProvider, DecorationWriter, Document, Edges,
+    FontWeight, HorizontalLayout, ImageAssetId, InlineContent, InlineDecorationStyle, InlineObject,
+    InlineSpec, InlineStyle, InlineVAlign, InteractionPolicy, ListId, ListKind, MarkKind,
+    MarkdownCodec, NumberStyle, PaperSpec, RgbaColor, RichCommand, SelectionValue, StyleId,
+    TableBlock, TableBorderStyle, TableCell, TableRow, TextAlign, UnderlineKind, block_shape,
 };
 use serde::{Deserialize, Serialize};
 
 struct RustSyntaxDecorationProvider;
 
 impl DecorationProvider for RustSyntaxDecorationProvider {
-    fn decorations_for_block(&self, context: &DecorationContext<'_>) -> BlockDecorations {
+    fn collect_decorations(
+        &self,
+        context: &DecorationContext<'_>,
+        writer: &mut DecorationWriter<'_>,
+    ) {
         let Some(code) = context.block.kind.code_block_data() else {
-            return BlockDecorations::default();
+            return;
         };
         let Some(language) = code.language.as_deref() else {
-            return BlockDecorations::default();
+            return;
         };
         let Some(content) = context.block.kind.inline_content() else {
-            return BlockDecorations::default();
+            return;
         };
         if !language.eq_ignore_ascii_case("rust") {
-            return BlockDecorations::default();
+            return;
         }
 
         let keyword_color = RgbaColor::rgb(0xcf, 0x22, 0x2e);
         let type_color = RgbaColor::rgb(0x82, 0x50, 0xdf);
-        let mut decorations = BlockDecorations::default();
         let text = content.text.as_str();
         let mut start: Option<usize> = None;
 
@@ -54,19 +57,23 @@ impl DecorationProvider for RustSyntaxDecorationProvider {
                             word,
                             "pub" | "trait" | "type" | "fn" | "mut" | "let" | "struct" | "impl"
                         ) {
-                            decorations.inline.push(
-                                InlineDecoration::new(word_start..index)
-                                    .with_foreground(keyword_color),
-                            );
+                            if let Err(error) = writer.push_inline(
+                                BlockByteRange::from_usize_range(word_start..index),
+                                InlineDecorationStyle::new().with_foreground(keyword_color),
+                            ) {
+                                eprintln!("docs_viewer: syntax decoration error: {error}");
+                            }
                         } else if word
                             .chars()
                             .next()
                             .is_some_and(|first| first.is_ascii_uppercase())
                         {
-                            decorations.inline.push(
-                                InlineDecoration::new(word_start..index)
-                                    .with_foreground(type_color),
-                            );
+                            if let Err(error) = writer.push_inline(
+                                BlockByteRange::from_usize_range(word_start..index),
+                                InlineDecorationStyle::new().with_foreground(type_color),
+                            ) {
+                                eprintln!("docs_viewer: syntax decoration error: {error}");
+                            }
                         }
                     }
                     start = None;
@@ -74,7 +81,6 @@ impl DecorationProvider for RustSyntaxDecorationProvider {
                 _ => {}
             }
         }
-        decorations
     }
 }
 
@@ -83,14 +89,22 @@ struct CalloutData {
     title: String,
 }
 
-struct CalloutBlockExtension;
+struct CalloutBlockSpec;
 
-impl TypedBlockExtension for CalloutBlockExtension {
+impl BlockSpec for CalloutBlockSpec {
+    const KIND: &'static str = "callout";
+    type Shape = block_shape::Container;
     type Data = CalloutData;
+}
+
+struct CalloutBlockRenderer;
+
+impl BlockRenderer for CalloutBlockRenderer {
+    type Spec = CalloutBlockSpec;
 
     fn measure_chrome(
         &self,
-        _data: &Self::Data,
+        _data: &CalloutData,
         _max_width: f32,
         zoom: f32,
         _window: &Window,
@@ -103,9 +117,9 @@ impl TypedBlockExtension for CalloutBlockExtension {
         )
     }
 
-    fn render_block(
+    fn render(
         &self,
-        context: TypedBlockRenderContext<'_, Self::Data>,
+        context: BlockRenderContext<'_, CalloutData>,
         _window: &mut Window,
         _cx: &mut App,
     ) -> Option<CustomRenderOutput> {
@@ -136,7 +150,7 @@ impl TypedBlockExtension for CalloutBlockExtension {
         Some(CustomRenderOutput::Element(element))
     }
 
-    fn plain_text_block(&self, data: &Self::Data) -> Option<String> {
+    fn plain_text(&self, data: &CalloutData) -> Option<String> {
         Some(data.title.clone())
     }
 }
@@ -146,14 +160,21 @@ struct StatusBadgeData {
     label: String,
 }
 
-struct StatusBadgeExtension;
+struct StatusBadgeSpec;
 
-impl TypedInlineExtension for StatusBadgeExtension {
+impl InlineSpec for StatusBadgeSpec {
+    const KIND: &'static str = "status";
     type Data = StatusBadgeData;
+}
 
-    fn measure_inline(
+struct StatusBadgeRenderer;
+
+impl InlineRenderer for StatusBadgeRenderer {
+    type Spec = StatusBadgeSpec;
+
+    fn measure(
         &self,
-        data: &Self::Data,
+        data: &StatusBadgeData,
         zoom: f32,
         _window: &Window,
     ) -> InlineBoxMetrics {
@@ -166,9 +187,9 @@ impl TypedInlineExtension for StatusBadgeExtension {
         }
     }
 
-    fn render_inline(
+    fn render(
         &self,
-        context: TypedInlineRenderContext<'_, Self::Data>,
+        context: InlineRenderContext<'_, StatusBadgeData>,
         _window: &mut Window,
         _cx: &mut App,
     ) -> Option<CustomRenderOutput> {
@@ -195,7 +216,7 @@ impl TypedInlineExtension for StatusBadgeExtension {
         Some(CustomRenderOutput::Element(element))
     }
 
-    fn plain_text_inline(&self, data: &Self::Data) -> Option<String> {
+    fn plain_text(&self, data: &StatusBadgeData) -> Option<String> {
         Some(format!("[{}]", data.label))
     }
 }
@@ -311,11 +332,16 @@ impl DocsViewerApp {
             SAMPLE_DIAGRAM_SVG.as_bytes(),
         );
         let document_view = cx.new(|cx| {
-            RichDocumentView::new(document, cx)
+            let mut view = RichDocumentView::new(document, cx)
                 .with_asset_provider(assets)
-                .with_decoration_provider(RustSyntaxDecorationProvider)
-                .with_typed_block_extension("callout", CalloutBlockExtension)
-                .with_typed_inline_extension("status", StatusBadgeExtension)
+                .with_decoration_provider(RustSyntaxDecorationProvider);
+            if let Err(error) = view.register_block_renderer(CalloutBlockRenderer, cx) {
+                eprintln!("docs_viewer: failed to register callout renderer: {error}");
+            }
+            if let Err(error) = view.register_inline_renderer(StatusBadgeRenderer, cx) {
+                eprintln!("docs_viewer: failed to register status renderer: {error}");
+            }
+            view
         });
         let event_subscription = cx.subscribe(
             &document_view,
@@ -1102,7 +1128,9 @@ impl Render for DocsViewerApp {
                             let exported = this.document_view.read(cx).export_document(&MarkdownCodec);
                             match exported {
                                 Ok(markdown) => {
-                                    cx.write_to_clipboard(ClipboardItem::new_string(markdown));
+                                    cx.write_to_clipboard(ClipboardItem::new_string(
+                                        markdown.into_string(),
+                                    ));
                                     this.status_message = SharedString::from("Exported Markdown to clipboard");
                                 }
                                 Err(error) => {
@@ -1807,7 +1835,7 @@ fn build_sample_document() -> Document {
     inline_img.push_text("Inline image placeholder anchored to baseline: ", InlineStyle::default());
     inline_img.push_object(
         InlineObject::Image {
-            asset_id: "diagram-1".into(),
+            asset_id: ImageAssetId::new("diagram-1"),
             alt: "Diagram 160x36".into(),
             width_pt: 120.0,
             height_pt: 28.0,
@@ -1906,12 +1934,9 @@ fn build_sample_document() -> Document {
         InlineStyle::default(),
     );
     ext_intro.push_object(
-        InlineObject::custom(
-            "status",
-            CustomPayload::typed(StatusBadgeData {
-                label: "TYPED EXTENSIONS".into(),
-            }),
-        ),
+        InlineObject::custom::<StatusBadgeSpec>(StatusBadgeData {
+            label: "TYPED EXTENSIONS".into(),
+        }),
         InlineStyle::default(),
     );
     ext_intro.push_text(
@@ -1928,11 +1953,10 @@ fn build_sample_document() -> Document {
         )),
         BlockStyle::default(),
     );
-    document.add_custom_container(
-        "callout",
-        CustomPayload::typed(CalloutData {
+    document.add_container_block::<CalloutBlockSpec>(
+        CalloutData {
             title: "Editable Custom Container Block".into(),
-        }),
+        },
         vec![callout_body],
     );
 

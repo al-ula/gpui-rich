@@ -107,7 +107,7 @@ pub(super) fn execute_component_command(
                     steps.push(Step::UpdateInlineObject {
                         block_id,
                         object_id,
-                        object: InlineObject::custom(DROPDOWN_KIND, CustomPayload::from_json(data)),
+                        object: ComponentCommand::dropdown_object(data),
                     });
                 }
             }
@@ -133,13 +133,10 @@ pub(super) fn execute_component_command(
             }
             let mut content = InlineContent::empty();
             content.push_object(
-                InlineObject::custom(
-                    DROPDOWN_KIND,
-                    CustomPayload::from_json(ComponentCommand::dropdown_payload(
-                        definition_id.clone(),
-                        selected_option_id.clone(),
-                    )),
-                ),
+                ComponentCommand::dropdown_object(ComponentCommand::dropdown_payload(
+                    definition_id.clone(),
+                    selected_option_id.clone(),
+                )),
                 Default::default(),
             );
             steps.push(Step::InsertContent {
@@ -169,7 +166,9 @@ pub(super) fn execute_component_command(
             if kind.as_ref() != DROPDOWN_KIND {
                 return CommandOutcome::NoOp;
             }
-            let mut payload = data.to_json();
+            let Ok(mut payload) = data.to_json() else {
+                return CommandOutcome::NoOp;
+            };
             let definition_id = payload
                 .get("definition_id")
                 .and_then(serde_json::Value::as_str)
@@ -193,7 +192,7 @@ pub(super) fn execute_component_command(
             steps.push(Step::UpdateInlineObject {
                 block_id: *block_id,
                 object_id: *object_id,
-                object: InlineObject::custom(DROPDOWN_KIND, CustomPayload::from_json(payload)),
+                object: ComponentCommand::dropdown_object(payload),
             });
         }
         C::DefineVariable(definition) => {
@@ -251,13 +250,10 @@ pub(super) fn execute_component_command(
             }
             let mut content = InlineContent::empty();
             content.push_object(
-                InlineObject::custom(
-                    VARIABLE_KIND,
-                    CustomPayload::from_json(ComponentCommand::variable_payload(
-                        variable_id.clone(),
-                        definition.value.clone(),
-                    )),
-                ),
+                ComponentCommand::variable_object(ComponentCommand::variable_payload(
+                    variable_id.clone(),
+                    definition.value.clone(),
+                )),
                 Default::default(),
             );
             steps.push(Step::InsertContent {
@@ -304,7 +300,9 @@ pub(super) fn execute_component_command(
             if kind.as_ref() != PLACEHOLDER_KIND {
                 return CommandOutcome::NoOp;
             }
-            let mut payload = data.to_json();
+            let Ok(mut payload) = data.to_json() else {
+                return CommandOutcome::NoOp;
+            };
             if payload.get("value").and_then(serde_json::Value::as_str) == Some(value) {
                 return CommandOutcome::NoOp;
             }
@@ -312,7 +310,7 @@ pub(super) fn execute_component_command(
             steps.push(Step::UpdateInlineObject {
                 block_id: *block_id,
                 object_id: *object_id,
-                object: InlineObject::custom(PLACEHOLDER_KIND, CustomPayload::from_json(payload)),
+                object: rich_model::PlaceholderKind::filled_object(payload),
             });
         }
         C::CaptureBuildingBlock { id, name, blocks } => {
@@ -454,7 +452,7 @@ pub(super) fn dropdown_options_for_inline(
     if kind.as_ref() != DROPDOWN_KIND {
         return None;
     }
-    let json = data.to_json();
+    let json = data.to_json().ok()?;
     let definition_id = json.get("definition_id")?.as_str()?.to_owned();
     let selected_id = json.get("selected_option_id")?.as_str()?.to_owned();
     let definition = document.components.dropdowns.get(&definition_id)?;
@@ -472,7 +470,7 @@ fn valid_inline_offset(document: &Document, block_id: BlockId, offset: usize) ->
 
 fn object_data(object: &InlineObject) -> serde_json::Value {
     match object {
-        InlineObject::Custom { data, .. } => data.to_json(),
+        InlineObject::Custom { data, .. } => data.to_json().unwrap_or(serde_json::Value::Null),
         _ => serde_json::Value::Null,
     }
 }
@@ -497,20 +495,19 @@ fn collect_dropdowns(
     match &block.kind {
         BlockKind::Text { content, .. } => {
             for entry in &content.objects {
-                if let InlineObject::Custom { kind, data } = &entry.object {
-                    let value = data.to_json();
-                    if kind.as_ref() == DROPDOWN_KIND
-                        && value
-                            .get("definition_id")
-                            .and_then(serde_json::Value::as_str)
-                            == Some(definition)
-                        && value
-                            .get("selected_option_id")
-                            .and_then(serde_json::Value::as_str)
-                            == Some(option)
-                    {
-                        out.push((block.id, entry.id, entry.object.clone()));
-                    }
+                if let InlineObject::Custom { kind, data } = &entry.object
+                    && let Ok(value) = data.to_json()
+                    && kind.as_ref() == DROPDOWN_KIND
+                    && value
+                        .get("definition_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(definition)
+                    && value
+                        .get("selected_option_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(option)
+                {
+                    out.push((block.id, entry.id, entry.object.clone()));
                 }
             }
         }
@@ -535,16 +532,20 @@ fn collect_variable_refs(block: &BlockNode, variable_id: &str, out: &mut Vec<(Bl
     match &block.kind {
         BlockKind::Text { content, .. } => {
             for entry in &content.objects {
-                if let InlineObject::Custom { kind, data } = &entry.object {
-                    if kind.as_ref() == VARIABLE_KIND
-                        && data
-                            .to_json()
-                            .get("variable_id")
-                            .and_then(serde_json::Value::as_str)
-                            == Some(variable_id)
-                    {
-                        out.push((block.id, entry.byte_offset));
-                    }
+                if let InlineObject::Custom { kind, data } = &entry.object
+                    && kind.as_ref() == VARIABLE_KIND
+                    && data
+                        .to_json()
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("variable_id")
+                                .and_then(serde_json::Value::as_str)
+                                .map(|id| id == variable_id)
+                        })
+                        .unwrap_or(false)
+                {
+                    out.push((block.id, entry.byte_offset));
                 }
             }
         }

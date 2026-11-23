@@ -1,7 +1,7 @@
 use crate::geometry::{Insets, Size, pt_to_px};
 use rich_model::{
-    CustomPayload, FontWeight, InlineObject, InlineVAlign, ResolvedTextStyle, RgbaColor,
-    SharedStr, UnderlineKind,
+    BlockShapeKind, CustomPayload, FontWeight, InlineObject, InlineVAlign, ResolvedTextStyle,
+    RgbaColor, SharedStr, UnderlineKind,
 };
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -117,6 +117,36 @@ pub struct InlineBoxMetrics {
     pub valign: InlineVAlign,
 }
 
+impl InlineBoxMetrics {
+    /// Returns `true` when width and height are finite and nonnegative.
+    pub fn is_valid(&self) -> bool {
+        self.width.is_finite()
+            && self.width >= 0.0
+            && self.height.is_finite()
+            && self.height >= 0.0
+    }
+}
+
+/// Returns `true` when both `width` and `height` are finite and nonnegative.
+pub fn is_valid_custom_size(size: Size) -> bool {
+    size.width.is_finite()
+        && size.width >= 0.0
+        && size.height.is_finite()
+        && size.height >= 0.0
+}
+
+/// Returns `true` when all four chrome inset edges are finite and nonnegative.
+pub fn is_valid_custom_insets(insets: Insets) -> bool {
+    insets.top.is_finite()
+        && insets.top >= 0.0
+        && insets.right.is_finite()
+        && insets.right >= 0.0
+        && insets.bottom.is_finite()
+        && insets.bottom >= 0.0
+        && insets.left.is_finite()
+        && insets.left >= 0.0
+}
+
 /// Shaping abstraction keeping `rich-layout` pure Rust and testable without a GPU window.
 pub trait TextShaper {
     type Backend: GlyphBackend;
@@ -155,6 +185,7 @@ pub trait TextShaper {
     /// Measures chrome insets (in pixels) reserved around a custom text, container, or grid block.
     fn measure_custom_chrome(
         &mut self,
+        _shape: BlockShapeKind,
         _kind: &str,
         _data: &CustomPayload,
         _max_width: f32,

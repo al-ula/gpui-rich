@@ -1,16 +1,20 @@
 //! GPUI implementation of [`rich_layout::TextShaper`] backed by `WindowTextSystem`.
 
-use crate::extension::ExtensionRegistry;
+use crate::extension::{
+    BlockCallbackResult, ExtensionRegistry, InlineCallbackResult,
+};
 use gpui_kit::{
     Font, FontFallbacks, FontFeatures, FontId, FontStyle, FontWeight as GpuiFontWeight, GlyphId,
     Hsla, Rgba, SharedString, TextRun, Window, px,
 };
 use rich_layout::{
     GlyphBackend, InlineBoxMetrics, Insets, ShapedGlyph, ShapedGlyphRun, ShapedSegment,
-    ShaperRunSpec, Size, TextShaper, pt_to_px,
+    ShaperRunSpec, Size, TextShaper, is_valid_custom_insets, is_valid_custom_size, pt_to_px,
 };
-use rich_model::{AnchorId, ChipKind, ComponentStore, CustomPayload, DROPDOWN_KIND, InlineObject,
-    InlineVAlign, PLACEHOLDER_KIND, RgbaColor, VARIABLE_KIND, footnote_reference_id};
+use rich_model::{
+    AnchorId, BlockShapeKind, ChipKind, ComponentStore, CustomPayload, DROPDOWN_KIND, InlineObject,
+    InlineVAlign, PLACEHOLDER_KIND, RgbaColor, VARIABLE_KIND, footnote_reference_id,
+};
 use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
 
@@ -553,11 +557,16 @@ impl TextShaper for GpuiShaper<'_, '_> {
                 }
             }
             InlineObject::Custom { kind, data } => {
-                if let Some(extension) = self
+                if let Some(renderer) = self
                     .extensions
-                    .and_then(|registry| registry.get_node(kind))
+                    .and_then(|registry| registry.get_inline(kind))
                 {
-                    return extension.measure_inline(data, zoom, self.window);
+                    if let InlineCallbackResult::Ok(metrics) =
+                        renderer.measure(data, zoom, self.window)
+                        && metrics.is_valid()
+                    {
+                        return metrics;
+                    }
                 }
                 let label = kind.to_string();
                 let font_size = px(pt_to_px(10.0, zoom));
@@ -595,7 +604,8 @@ impl TextShaper for GpuiShaper<'_, '_> {
             return None;
         }
         let components = self.components?;
-        let mut label = components.inline_fallback(kind, &data.as_json());
+        let json = data.as_json().ok()?;
+        let mut label = components.inline_fallback(kind, &json);
         if kind.as_ref() == DROPDOWN_KIND {
             label.push_str(" ▾");
         }
@@ -615,27 +625,34 @@ impl TextShaper for GpuiShaper<'_, '_> {
         max_width: f32,
         zoom: f32,
     ) -> Size {
-        if let Some(extension) = self
+        if let Some(renderer) = self
             .extensions
-            .and_then(|registry| registry.get_node(kind))
+            .and_then(|registry| registry.get_block(kind))
+            && let BlockCallbackResult::Ok(measured) =
+                renderer.measure_leaf(data, max_width, zoom, self.window)
+            && is_valid_custom_size(measured)
         {
-            return extension.measure_block(data, max_width, zoom, self.window);
+            return measured;
         }
         Size::new(max_width, pt_to_px(44.0, zoom))
     }
 
     fn measure_custom_chrome(
         &mut self,
+        shape: BlockShapeKind,
         kind: &str,
         data: &CustomPayload,
         max_width: f32,
         zoom: f32,
     ) -> Insets {
-        if let Some(extension) = self
+        if let Some(renderer) = self
             .extensions
-            .and_then(|registry| registry.get_node(kind))
+            .and_then(|registry| registry.get_block(kind))
+            && let BlockCallbackResult::Ok(measured) =
+                renderer.measure_chrome(shape, data, max_width, zoom, self.window)
+            && is_valid_custom_insets(measured)
         {
-            return extension.measure_chrome(data, max_width, zoom, self.window);
+            return measured;
         }
         Insets::xy(pt_to_px(12.0, zoom), pt_to_px(8.0, zoom))
     }

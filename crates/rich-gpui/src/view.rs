@@ -4,8 +4,9 @@
 use crate::asset::{AssetProvider, LoadedAsset, decode_image_asset};
 use crate::element::RichDocumentElement;
 use crate::extension::{
-    CustomCommandResult, ExtensionRegistry, NodeExtension, TypedBlockExtension,
-    TypedInlineExtension,
+    BlockRenderer, CommandExecutionResult, EditCommandContext, ExtensionDiagnostic,
+    ExtensionRegistrationError, ExtensionRegistry, InlineRenderer, ReadCommandContext,
+    ReadCommandOutcome,
 };
 use crate::shaper::{FontResolver, GpuiGlyphBackend, GpuiShaper};
 use crate::theme::RichTheme;
@@ -20,15 +21,16 @@ use rich_layout::{
     resolve_horizontal_metrics,
 };
 use rich_model::{
-    Affinity, BlockId, BlockKind, BlockNode, BlockStyle, ChangeSet, ChipKind, ClipboardBlock,
-    ClipboardFragment, CodecError, ColumnSpec, CommandDecision, CommandMiddleware, CommandOutcome,
-    CommandSource, CrdtSyncBridge, CustomPayload, DecorationProvider, DocPos, Document,
-    DocumentCodec,
-    DocumentSelection, Edges, History, HistoryMergeGroup, HorizontalLayout, InlineContent,
-    InlineObject, InlineObjectId, InlineStyle, InteractionPolicy, LinkTarget, ListKind, MarkKind,
-    MoveDirection, MoveUnit, NamedStyle, NumberStyle, OBJECT_REPLACEMENT_UTF8_LEN, PathSegment,
-    ResolvedTextStyle, RgbaColor, RichCommand, SelectionValue, SharedStr, Step, StyleId,
-    SyncDelta, TextAlign, Transaction,
+    Affinity, BlockId, BlockKind, BlockNode, BlockSpec, BlockStyle, ChangeSet, ChipKind,
+    ClipboardBlock, ClipboardFragment, CodecError, ColumnSpec, CommandDecision, CommandEffectKind,
+    CommandMiddleware, CommandOutcome, CommandResolution, CommandSource, CrdtSyncBridge,
+    DecorationProvider, DocPos, Document, DocumentCodec, DocumentSelection, DynamicDocumentCodec,
+    Edit, Edges, EncodedDocument, ExtensionCommand, ExtensionInvocation, History,
+    HistoryMergeGroup, HorizontalLayout, ImageAssetId, InlineContent, InlineObject, InlineObjectId,
+    InlineSpec, InlineStyle, InteractionPolicy, LinkTarget, ListKind, MarkKind, MoveDirection,
+    MoveUnit, NamedStyle, NumberStyle, OBJECT_REPLACEMENT_UTF8_LEN, PathSegment, ReadOnly,
+    ResolvedCommand, ResolvedTextStyle, RgbaColor, RichCommand, SelectionValue, SharedStr, Step,
+    StyleId, SyncDelta, TextAlign, Transaction,
 };
 use std::collections::HashMap;
 use std::ops::Range;
@@ -56,6 +58,7 @@ const CARET_BLINK_PAUSE_DELAY: Duration = Duration::from_millis(500);
 const CARET_SCROLL_MARGIN_PX: f32 = 28.0;
 const MAX_LIST_INDENT_LEVEL: u8 = 6;
 const CLIPBOARD_HTML_METADATA_KEY: &str = "gpui_rich_html";
+const CLIPBOARD_FRAGMENT_METADATA_KEY: &str = "gpui_rich_fragment_v1";
 
 actions!(
     rich_document,
@@ -353,6 +356,9 @@ pub enum RichDocumentEvent {
     DocumentMutated { change_set: ChangeSet },
     /// A [`RichCommand`] completed, no-oped, or was rejected/cancelled in the dispatcher.
     CommandExecuted {
+        command_id: &'static str,
+        effect: CommandEffectKind,
+        resolution: CommandResolution,
         command: RichCommand,
         source: CommandSource,
         outcome: CommandOutcome,
@@ -375,7 +381,8 @@ pub struct RichDocumentView {
     pub follow_app_theme: bool,
     pub open_external_links: bool,
     pub ime_preedit: Option<ImePreedit>,
-    pub extensions: ExtensionRegistry,
+    pub(crate) extensions: ExtensionRegistry,
+    pub(crate) extension_diagnostics: Vec<ExtensionDiagnostic>,
     pub(crate) navigation: editor_navigation::NavigationState,
     pub(crate) pending_reveal: Option<DocPos>,
     pending_input_rule_undo: Option<editor_structure::InputRuleUndo>,
@@ -393,8 +400,8 @@ pub struct RichDocumentView {
     pub(crate) hovered_column_divider: Option<TableColumnDividerHit>,
     pub(crate) table_column_drag: Option<TableColumnDrag>,
     asset_provider: Option<Arc<dyn AssetProvider>>,
-    asset_cache: HashMap<String, LoadedAsset>,
-    asset_tasks: HashMap<String, Task<()>>,
+    asset_cache: HashMap<ImageAssetId, LoadedAsset>,
+    asset_tasks: HashMap<ImageAssetId, Task<()>>,
     _copy_feedback_task: Task<()>,
     was_focused: bool,
     blink_epoch: usize,
@@ -433,6 +440,7 @@ impl RichDocumentView {
             open_external_links: true,
             ime_preedit: None,
             extensions: ExtensionRegistry::new(),
+            extension_diagnostics: Vec::new(),
             navigation: editor_navigation::NavigationState::default(),
             pending_reveal: None,
             pending_input_rule_undo: None,
@@ -506,10 +514,15 @@ impl RichDocumentView {
     }
 
     /// Evicts `asset_id` from the image cache so the next paint reloads it.
-    pub fn invalidate_asset(&mut self, asset_id: &str, cx: &mut Context<Self>) {
+    pub fn invalidate_asset(&mut self, asset_id: &ImageAssetId, cx: &mut Context<Self>) {
         self.asset_cache.remove(asset_id);
         self.asset_tasks.remove(asset_id);
         cx.notify();
+    }
+
+    /// Returns the current cached load state for `asset_id`, if any.
+    pub fn asset_state(&self, asset_id: &ImageAssetId) -> Option<&LoadedAsset> {
+        self.asset_cache.get(asset_id)
     }
 
     /// Clears all cached decoded images.
@@ -523,24 +536,25 @@ impl RichDocumentView {
     /// fetch + decode task when an [`AssetProvider`] is configured and `asset_id` is uncached.
     pub(crate) fn resolve_or_request_image(
         &mut self,
-        asset_id: &str,
+        asset_id: &ImageAssetId,
         cx: &mut Context<Self>,
     ) -> Option<LoadedAsset> {
         if let Some(existing) = self.asset_cache.get(asset_id) {
             return Some(existing.clone());
         }
         let provider = self.asset_provider.as_ref()?.clone();
-        let key = asset_id.to_owned();
+        let key = asset_id.clone();
         self.asset_cache.insert(key.clone(), LoadedAsset::Loading);
         let svg_renderer = cx.svg_renderer();
         let load_future = provider.load_image(asset_id);
+        let key_for_decode = key.clone();
         let key_for_task = key.clone();
         let task = cx.spawn(async move |weak_view, cx| {
             let decoded_result = cx
                 .background_executor()
                 .spawn(async move {
                     let raw = load_future.await?;
-                    decode_image_asset(raw, svg_renderer)
+                    decode_image_asset(&key_for_decode, raw, svg_renderer)
                 })
                 .await;
             if let Err(error) = weak_view.update(cx, |view, cx| {
@@ -572,9 +586,83 @@ impl RichDocumentView {
         }
     }
 
-    /// Encodes the current [`Document`] using a pluggable [`DocumentCodec`].
-    pub fn export_document(&self, codec: &dyn DocumentCodec) -> Result<String, CodecError> {
+    /// Builds the GPUI [`ClipboardItem`] for the active selection, carrying plain text plus
+    /// HTML and versioned structured fragment metadata for same-process rich paste.
+    pub fn clipboard_item_for_selection(&self) -> Option<ClipboardItem> {
+        let fragment = self.selected_fragment()?;
+        let formatter = editor_clipboard::ComponentClipboardFormatter::new(self);
+        let plain_text = fragment.to_plain_text_with(&formatter);
+        let html = fragment.to_html_with(&formatter);
+        let mut structured = fragment;
+        editor_clipboard::attach_component_definitions(
+            &self.document.components,
+            &mut structured,
+        );
+        let mut metadata_map = serde_json::Map::new();
+        metadata_map.insert(
+            CLIPBOARD_HTML_METADATA_KEY.to_owned(),
+            serde_json::Value::String(html),
+        );
+        if let Ok(fragment_json) = structured.to_versioned_json() {
+            metadata_map.insert(
+                CLIPBOARD_FRAGMENT_METADATA_KEY.to_owned(),
+                serde_json::Value::String(fragment_json),
+            );
+        }
+        let metadata = serde_json::Value::Object(metadata_map).to_string();
+        Some(ClipboardItem::new_string_with_metadata(
+            plain_text, metadata,
+        ))
+    }
+
+    /// Pastes a GPUI [`ClipboardItem`] through the user command dispatch path.
+    ///
+    /// When `plain_text_only` is `true` (or rich paste is disabled by policy), private clipboard
+    /// metadata is ignored and only plain text is dispatched.
+    pub fn paste_clipboard_item(
+        &mut self,
+        item: &ClipboardItem,
+        plain_text_only: bool,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        let plain_text = item.text();
+        if !plain_text_only && self.policy.can_paste_rich_text() {
+            let html = extract_clipboard_html(item);
+            if let Some(fragment) = extract_clipboard_fragment(item) {
+                return self.dispatch_command(
+                    RichCommand::PasteFragment {
+                        fragment,
+                        html_fallback: html,
+                        plain_text,
+                    },
+                    cx,
+                );
+            }
+            if let Some(html) = html {
+                return self.dispatch_command(RichCommand::PasteHtml { html, plain_text }, cx);
+            }
+        }
+        if let Some(text) = plain_text {
+            self.dispatch_command(RichCommand::PasteText(text), cx)
+        } else {
+            CommandOutcome::NoOp
+        }
+    }
+
+    /// Encodes the current [`Document`] using a format-typed [`DocumentCodec`].
+    pub fn export_document<C: DocumentCodec>(
+        &self,
+        codec: &C,
+    ) -> Result<EncodedDocument<C::Format>, CodecError> {
         codec.encode(&self.document)
+    }
+
+    /// Encodes the current [`Document`] using a dynamically looked-up [`DynamicDocumentCodec`].
+    pub fn export_document_dynamic(
+        &self,
+        codec: &dyn DynamicDocumentCodec,
+    ) -> Result<String, CodecError> {
+        codec.encode_raw(&self.document)
     }
 
     /// Replaces the displayed [`Document`], resetting selection, undo history, and layout cache.
@@ -582,6 +670,8 @@ impl RichDocumentView {
         self.document = document;
         self.history = History::default();
         self.flow.cache.clear();
+        self.extensions.clear_resolved_caches();
+        self.extension_diagnostics.clear();
         self.scroll_x = 0.0;
         self.scroll_y = 0.0;
         self.ime_preedit = None;
@@ -737,114 +827,116 @@ impl RichDocumentView {
         cx.notify();
     }
 
-    /// Builder method registering a custom [`NodeExtension`] for `kind`.
-    pub fn with_node_extension(
-        mut self,
-        kind: impl Into<String>,
-        extension: impl NodeExtension + 'static,
-    ) -> Self {
-        self.extensions.register_node(kind, extension);
-        self
+    /// Borrows the view's [`ExtensionRegistry`] immutably.
+    ///
+    /// Mutations must go through [`Self::register_block_renderer`],
+    /// [`Self::register_inline_renderer`], and related methods so layout and payload caches are
+    /// invalidated consistently.
+    pub fn extensions(&self) -> &ExtensionRegistry {
+        &self.extensions
     }
 
-    /// Builder method registering a strongly typed [`TypedBlockExtension`] for `kind`.
-    pub fn with_typed_block_extension(
-        mut self,
-        kind: impl Into<String>,
-        extension: impl TypedBlockExtension + 'static,
-    ) -> Self {
-        self.extensions.register_typed_block(kind, extension);
-        self
+    /// Returns validation diagnostics collected for visible registered custom nodes on the most
+    /// recent prepaint pass.
+    pub fn extension_diagnostics(&self) -> &[ExtensionDiagnostic] {
+        &self.extension_diagnostics
     }
 
-    /// Builder method registering a strongly typed [`TypedInlineExtension`] for `kind`.
-    pub fn with_typed_inline_extension(
-        mut self,
-        kind: impl Into<String>,
-        extension: impl TypedInlineExtension + 'static,
-    ) -> Self {
-        self.extensions.register_typed_inline(kind, extension);
-        self
-    }
-
-    /// Registers a custom [`NodeExtension`] for `kind` and clears cached layouts for resizing.
-    pub fn register_node_extension(
+    /// Registers a spec-bound [`BlockRenderer`], invalidates cached layouts, and schedules repaint.
+    pub fn register_block_renderer<R: BlockRenderer>(
         &mut self,
-        kind: impl Into<String>,
-        extension: impl NodeExtension + 'static,
+        renderer: R,
         cx: &mut Context<Self>,
-    ) {
-        self.extensions.register_node(kind, extension);
+    ) -> Result<(), ExtensionRegistrationError> {
+        self.extensions.register_block(renderer)?;
+        self.extensions.clear_resolved_caches();
+        self.extension_diagnostics.clear();
         self.flow.cache.clear();
         cx.notify();
+        Ok(())
     }
 
-    /// Registers a strongly typed [`TypedBlockExtension`] for `kind` and clears cached layouts.
-    pub fn register_typed_block_extension(
+    /// Registers a spec-bound [`InlineRenderer`], invalidates cached layouts, and schedules repaint.
+    pub fn register_inline_renderer<R: InlineRenderer>(
         &mut self,
-        kind: impl Into<String>,
-        extension: impl TypedBlockExtension + 'static,
+        renderer: R,
         cx: &mut Context<Self>,
-    ) {
-        self.extensions.register_typed_block(kind, extension);
+    ) -> Result<(), ExtensionRegistrationError> {
+        self.extensions.register_inline(renderer)?;
+        self.extensions.clear_resolved_caches();
+        self.extension_diagnostics.clear();
         self.flow.cache.clear();
         cx.notify();
+        Ok(())
     }
 
-    /// Registers a strongly typed [`TypedInlineExtension`] for `kind` and clears cached layouts.
-    pub fn register_typed_inline_extension(
-        &mut self,
-        kind: impl Into<String>,
-        extension: impl TypedInlineExtension + 'static,
-        cx: &mut Context<Self>,
-    ) {
-        self.extensions.register_typed_inline(kind, extension);
-        self.flow.cache.clear();
-        cx.notify();
-    }
-
-    /// Unregisters a custom [`NodeExtension`] for `kind`.
-    pub fn unregister_node_extension(&mut self, kind: &str, cx: &mut Context<Self>) -> bool {
-        let removed = self.extensions.unregister_node(kind);
+    /// Unregisters the [`BlockRenderer`] for [`BlockSpec`] `S` and invalidates cached layouts.
+    pub fn unregister_block_renderer<S: BlockSpec>(&mut self, cx: &mut Context<Self>) -> bool {
+        let removed = self.extensions.unregister_block::<S>();
         if removed {
+            self.extensions.clear_resolved_caches();
+            self.extension_diagnostics.clear();
             self.flow.cache.clear();
             cx.notify();
         }
         removed
     }
 
-    /// Builder method registering a custom command handler on [`Self::extensions`].
-    pub fn with_custom_command(
-        mut self,
-        id: impl Into<String>,
-        handler: impl Fn(
-            &CustomPayload,
-            &mut Document,
-            Option<&DocumentSelection>,
-        ) -> CustomCommandResult
-        + 'static,
-    ) -> Self {
-        self.extensions.register_command(id, handler);
-        self
+    /// Unregisters the [`InlineRenderer`] for [`InlineSpec`] `S` and invalidates cached layouts.
+    pub fn unregister_inline_renderer<S: InlineSpec>(&mut self, cx: &mut Context<Self>) -> bool {
+        let removed = self.extensions.unregister_inline::<S>();
+        if removed {
+            self.extensions.clear_resolved_caches();
+            self.extension_diagnostics.clear();
+            self.flow.cache.clear();
+            cx.notify();
+        }
+        removed
     }
 
-    /// Registers a custom command handler for [`RichCommand::Custom`] matching `id`.
-    pub fn register_custom_command(
+    /// Registers a handler for a [`ReadOnly`] [`ExtensionCommand`].
+    pub fn register_read_command<C>(
         &mut self,
-        id: impl Into<String>,
-        handler: impl Fn(
-            &CustomPayload,
-            &mut Document,
-            Option<&DocumentSelection>,
-        ) -> CustomCommandResult
-        + 'static,
-    ) {
-        self.extensions.register_command(id, handler);
+        handler: impl Fn(&C, &ReadCommandContext<'_>) -> ReadCommandOutcome + 'static,
+    ) -> Result<(), ExtensionRegistrationError>
+    where
+        C: ExtensionCommand<Effect = ReadOnly>,
+    {
+        self.extensions.register_read_command::<C>(handler)
     }
 
-    /// Unregisters a custom command handler.
-    pub fn unregister_custom_command(&mut self, id: &str) -> bool {
-        self.extensions.unregister_command(id)
+    /// Registers a transaction planner for an [`Edit`] [`ExtensionCommand`].
+    pub fn register_edit_command<C>(
+        &mut self,
+        handler: impl Fn(&C, &mut EditCommandContext<'_>) -> Option<Transaction> + 'static,
+    ) -> Result<(), ExtensionRegistrationError>
+    where
+        C: ExtensionCommand<Effect = Edit>,
+    {
+        self.extensions.register_edit_command::<C>(handler)
+    }
+
+    /// Unregisters a typed [`ExtensionCommand`] handler.
+    pub fn unregister_command<C: ExtensionCommand>(&mut self) -> bool {
+        self.extensions.unregister_command::<C>()
+    }
+
+    /// Dispatches a user-initiated typed [`ExtensionCommand`] through middleware, policy, and events.
+    pub fn dispatch_extension_command<C: ExtensionCommand>(
+        &mut self,
+        command: C,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        self.dispatch_command(RichCommand::extension(command), cx)
+    }
+
+    /// Dispatches a programmatic typed [`ExtensionCommand`], bypassing user-only policy gates.
+    pub fn dispatch_programmatic_extension_command<C: ExtensionCommand>(
+        &mut self,
+        command: C,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        self.dispatch_programmatic_command(RichCommand::extension(command), cx)
     }
 
     /// Applies feature switches and cancels transient interactions that are no longer enabled.
@@ -1034,7 +1126,7 @@ impl RichDocumentView {
     }
 
     /// Central command execution seam for toolbars, GPUI actions, mouse interactions,
-    /// command palettes, programmatic APIs, and editing mutations.
+    /// command palettes, programmatic APIs, editing mutations, and typed extension commands.
     pub fn dispatch_command_with_source(
         &mut self,
         command: RichCommand,
@@ -1042,10 +1134,12 @@ impl RichDocumentView {
         cx: &mut Context<Self>,
     ) -> CommandOutcome {
         let mut current_command = command;
+        let mut resolution = self.extensions.resolve_command(&current_command);
 
         for (_, middleware) in &mut self.middleware {
+            let resolved = ResolvedCommand::new(&current_command, resolution);
             match middleware.before_command(
-                &current_command,
+                &resolved,
                 source,
                 &self.document,
                 self.selection.as_ref(),
@@ -1053,6 +1147,9 @@ impl RichDocumentView {
                 CommandDecision::Continue => {}
                 CommandDecision::Cancel => {
                     cx.emit(RichDocumentEvent::CommandExecuted {
+                        command_id: current_command.command_id(),
+                        effect: current_command.effect(),
+                        resolution,
                         command: current_command,
                         source,
                         outcome: CommandOutcome::Cancelled,
@@ -1061,12 +1158,44 @@ impl RichDocumentView {
                 }
                 CommandDecision::Replace(replacement) => {
                     current_command = replacement;
+                    resolution = self.extensions.resolve_command(&current_command);
                 }
             }
         }
 
+        match resolution {
+            CommandResolution::UnregisteredExtension => {
+                let outcome = CommandOutcome::UnregisteredCommand;
+                cx.emit(RichDocumentEvent::CommandExecuted {
+                    command_id: current_command.command_id(),
+                    effect: current_command.effect(),
+                    resolution,
+                    command: current_command,
+                    source,
+                    outcome,
+                });
+                return outcome;
+            }
+            CommandResolution::MismatchedExtension => {
+                let outcome = CommandOutcome::MismatchedCommandType;
+                cx.emit(RichDocumentEvent::CommandExecuted {
+                    command_id: current_command.command_id(),
+                    effect: current_command.effect(),
+                    resolution,
+                    command: current_command,
+                    source,
+                    outcome,
+                });
+                return outcome;
+            }
+            CommandResolution::BuiltIn | CommandResolution::RegisteredExtension => {}
+        }
+
         if let Some(rejection) = self.policy.check_command(&current_command, source) {
             cx.emit(RichDocumentEvent::CommandExecuted {
+                command_id: current_command.command_id(),
+                effect: current_command.effect(),
+                resolution,
                 command: current_command,
                 source,
                 outcome: rejection,
@@ -1083,6 +1212,9 @@ impl RichDocumentView {
         }
         let outcome = self.execute_command(&current_command, source, cx);
         cx.emit(RichDocumentEvent::CommandExecuted {
+            command_id: current_command.command_id(),
+            effect: current_command.effect(),
+            resolution,
             command: current_command,
             source,
             outcome,
@@ -1276,16 +1408,10 @@ impl RichDocumentView {
                 extend_selection,
             } => self.execute_move_caret(*direction, *unit, *extend_selection, cx),
             RichCommand::CopySelection => {
-                let Some(fragment) = self.selected_fragment() else {
+                let Some(item) = self.clipboard_item_for_selection() else {
                     return CommandOutcome::NoOp;
                 };
-                let formatter = editor_clipboard::ComponentClipboardFormatter::new(self);
-                let plain_text = fragment.to_plain_text_with(&formatter);
-                let html = fragment.to_html_with(&formatter);
-                let metadata = serde_json::json!({ CLIPBOARD_HTML_METADATA_KEY: html }).to_string();
-                cx.write_to_clipboard(ClipboardItem::new_string_with_metadata(
-                    plain_text, metadata,
-                ));
+                cx.write_to_clipboard(item);
                 CommandOutcome::Executed
             }
             RichCommand::CopyCodeBlock(block_id) => self.execute_copy_code_block(*block_id, cx),
@@ -1393,6 +1519,23 @@ impl RichDocumentView {
             RichCommand::PasteHtml { html, plain_text } => {
                 self.execute_paste_html(html, plain_text.as_deref(), source, cx)
             }
+            RichCommand::PasteFragment {
+                fragment,
+                html_fallback,
+                plain_text,
+            } => {
+                if fragment.is_empty() {
+                    if let Some(html) = html_fallback.as_deref() {
+                        self.execute_paste_html(html, plain_text.as_deref(), source, cx)
+                    } else if let Some(plain) = plain_text.as_deref() {
+                        self.execute_paste_text(plain, source, cx)
+                    } else {
+                        CommandOutcome::NoOp
+                    }
+                } else {
+                    self.execute_paste_fragment(fragment.clone(), plain_text.as_deref(), source, cx)
+                }
+            }
             RichCommand::PasteText(text) => self.execute_paste_text(text, source, cx),
             RichCommand::SetTableColumns { table_id, columns } => {
                 self.execute_set_table_columns(*table_id, columns.clone(), cx)
@@ -1413,7 +1556,7 @@ impl RichDocumentView {
             RichCommand::Component(command) => editor_components::execute_component_command(self, command, cx),
             RichCommand::Structure(command) => self.execute_structure_command(command, cx),
             RichCommand::Anchor(command) => self.execute_anchor_command(command, cx),
-            RichCommand::Custom { id, payload, .. } => self.execute_custom_command(id, payload, cx),
+            RichCommand::Extension(invocation) => self.execute_extension_command(invocation, cx),
         }
     }
 
@@ -2716,10 +2859,20 @@ impl RichDocumentView {
         source: CommandSource,
         cx: &mut Context<Self>,
     ) -> CommandOutcome {
+        let fragment = ClipboardFragment::from_html(html);
+        self.execute_paste_fragment(fragment, plain_fallback, source, cx)
+    }
+
+    fn execute_paste_fragment(
+        &mut self,
+        mut fragment: ClipboardFragment,
+        plain_fallback: Option<&str>,
+        source: CommandSource,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
         self.ime_preedit = None;
         self.history.break_coalescing();
 
-        let mut fragment = ClipboardFragment::from_html(html);
         if fragment.is_empty() {
             return match plain_fallback {
                 Some(fallback) if !fallback.is_empty() => {
@@ -2737,14 +2890,19 @@ impl RichDocumentView {
             DocumentSelection::Text { focus, .. } => table_cell_of(focus).is_some(),
             _ => false,
         });
+        let single_table = match fragment.blocks.as_slice() {
+            [ClipboardBlock::Table(table)] | [ClipboardBlock::CustomGrid { table, .. }] => {
+                Some(table)
+            }
+            _ => None,
+        };
         if source == CommandSource::User
             && !self.policy.can_edit_grid()
-            && (rectangle
-                || (in_table && matches!(fragment.blocks.as_slice(), [ClipboardBlock::Table(_)])))
+            && (rectangle || (in_table && single_table.is_some()))
         {
             return CommandOutcome::RejectedByPolicy;
         }
-        if in_table && let [ClipboardBlock::Table(table)] = fragment.blocks.as_slice() {
+        if in_table && let Some(table) = single_table {
             return self.execute_grid_paste(table, component_step, cx);
         }
         if rectangle {
@@ -3020,28 +3178,41 @@ impl RichDocumentView {
         CommandOutcome::Executed
     }
 
-    fn execute_custom_command(
+    fn execute_extension_command(
         &mut self,
-        id: &str,
-        payload: &CustomPayload,
+        invocation: &ExtensionInvocation,
         cx: &mut Context<Self>,
     ) -> CommandOutcome {
-        let Some(result) =
-            self.extensions
-                .execute_command(id, payload, &mut self.document, self.selection.as_ref())
-        else {
-            return CommandOutcome::Unsupported;
-        };
-        match result {
-            CustomCommandResult::Transaction(transaction) => {
-                self.apply_transaction(*transaction, true, cx);
-                CommandOutcome::Executed
-            }
-            CustomCommandResult::Executed => {
+        match self.extensions.execute_extension_command(
+            invocation,
+            &self.document,
+            self.selection.as_ref(),
+        ) {
+            CommandExecutionResult::Read(ReadCommandOutcome::Executed) => {
                 cx.notify();
                 CommandOutcome::Executed
             }
-            CustomCommandResult::NoOp => CommandOutcome::NoOp,
+            CommandExecutionResult::Read(ReadCommandOutcome::NoOp) => CommandOutcome::NoOp,
+            CommandExecutionResult::Edit {
+                transaction: Some(transaction),
+                next_block_id,
+            } => {
+                if transaction.steps.is_empty() {
+                    return CommandOutcome::NoOp;
+                }
+                self.document.reserve_block_ids_up_to(next_block_id);
+                let change_set = self.apply_transaction(transaction, true, cx);
+                if change_set.dirty_blocks.is_empty() && !change_set.structure_changed {
+                    CommandOutcome::NoOp
+                } else {
+                    CommandOutcome::Executed
+                }
+            }
+            CommandExecutionResult::Edit {
+                transaction: None, ..
+            } => CommandOutcome::NoOp,
+            CommandExecutionResult::Unregistered => CommandOutcome::UnregisteredCommand,
+            CommandExecutionResult::Mismatched => CommandOutcome::MismatchedCommandType,
         }
     }
 
@@ -4296,7 +4467,11 @@ impl RichDocumentView {
                     block_id,
                     object_id,
                     kind: ChipKind::Tag,
-                    label: self.document.components.inline_fallback(&kind, &data.to_json()),
+                    label: data
+                        .to_json()
+                        .ok()
+                        .map(|json| self.document.components.inline_fallback(&kind, &json))
+                        .unwrap_or_default(),
                     accent: None,
                 });
             }
@@ -5223,6 +5398,15 @@ fn extract_clipboard_html(item: &ClipboardItem) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
+fn extract_clipboard_fragment(item: &ClipboardItem) -> Option<ClipboardFragment> {
+    let raw_metadata = item.metadata()?;
+    let parsed: serde_json::Value = serde_json::from_str(raw_metadata).ok()?;
+    let encoded = parsed
+        .get(CLIPBOARD_FRAGMENT_METADATA_KEY)
+        .and_then(|value| value.as_str())?;
+    ClipboardFragment::from_versioned_json(encoded).ok()
+}
+
 fn last_text_pos_in_nodes(nodes: &[BlockNode]) -> Option<(BlockId, usize)> {
     for node in nodes.iter().rev() {
         if let Some(inline) = node.kind.inline_content() {
@@ -5281,19 +5465,12 @@ impl Render for RichDocumentView {
             }))
             .on_action(cx.listener(|this, _: &Paste, _window, cx| {
                 if let Some(item) = cx.read_from_clipboard() {
-                    let plain_text = item.text();
-                    if this.policy.can_paste_rich_text()
-                        && let Some(html) = extract_clipboard_html(&item)
-                    {
-                        this.dispatch_command(RichCommand::PasteHtml { html, plain_text }, cx);
-                    } else if let Some(text) = plain_text {
-                        this.dispatch_command(RichCommand::PasteText(text), cx);
-                    }
+                    this.paste_clipboard_item(&item, false, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &PastePlainText, _window, cx| {
-                if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
-                    this.dispatch_command(RichCommand::PasteText(text), cx);
+                if let Some(item) = cx.read_from_clipboard() {
+                    this.paste_clipboard_item(&item, true, cx);
                 }
             }))
             .on_action(cx.listener(|this, _: &SelectAll, _window, cx| {

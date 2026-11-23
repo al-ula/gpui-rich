@@ -1,12 +1,79 @@
-use crate::payload::CustomPayload;
+use crate::block::NodeDataError;
+use crate::payload::{CustomData, CustomPayload};
 use crate::style::{InlineStyle, RgbaColor, SharedStr};
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::borrow::Cow;
+use std::fmt;
 use std::ops::Range;
+use std::sync::Arc;
 
 /// Unicode Object Replacement Character used as a 1-scalar (3 UTF-8 bytes, 1 UTF-16 code unit)
 /// sentinel for every inline atomic object (image, smart chip, footnote reference).
 pub const OBJECT_REPLACEMENT_CHAR: char = '\u{FFFC}';
 pub const OBJECT_REPLACEMENT_UTF8_LEN: usize = 3;
+
+/// Typed identifier for an inline image asset.
+///
+/// Serializes transparently as its inner string to preserve existing native JSON and HTML/Markdown
+/// representations. An `ImageAssetId` identifies an image to an asset provider and is not required
+/// to be a filesystem path or URL.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ImageAssetId(pub String);
+
+impl ImageAssetId {
+    /// Creates an [`ImageAssetId`] from an arbitrary string identifier.
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    /// Borrows the underlying identifier string.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Returns `true` when the identifier string is empty.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl From<String> for ImageAssetId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl From<&str> for ImageAssetId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl AsRef<str> for ImageAssetId {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for ImageAssetId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// GPUI-free specification binding a custom inline object kind identifier to its typed payload.
+///
+/// Downstream crates implement this trait once per custom inline node kind and pass the
+/// specification type to [`InlineObject::custom`], [`InlineObject::read_data`],
+/// [`crate::Step::update_inline_data`], and GPUI renderers.
+pub trait InlineSpec: 'static {
+    /// Stable persisted kind identifier stored in [`InlineObject::Custom::kind`].
+    const KIND: &'static str;
+    /// Typed payload persisted as JSON and borrowed directly when stored in memory.
+    type Data: CustomData + Clone + DeserializeOwned + 'static;
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct InlineObjectId(pub u64);
@@ -30,7 +97,7 @@ pub enum ChipKind {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum InlineObject {
     Image {
-        asset_id: String,
+        asset_id: ImageAssetId,
         alt: String,
         width_pt: f32,
         height_pt: f32,
@@ -53,10 +120,63 @@ pub enum InlineObject {
 }
 
 impl InlineObject {
-    pub fn custom(kind: impl Into<SharedStr>, data: CustomPayload) -> Self {
+    /// Constructs a custom inline object bound to [`InlineSpec`] `S`.
+    pub fn custom<S: InlineSpec>(data: S::Data) -> Self {
+        Self::Custom {
+            kind: Arc::from(S::KIND),
+            data: CustomPayload::typed(data),
+        }
+    }
+
+    /// Interchange constructor used by deserializers and built-in internal objects.
+    pub(crate) fn raw_custom(kind: impl Into<SharedStr>, data: CustomPayload) -> Self {
         Self::Custom {
             kind: kind.into(),
             data,
+        }
+    }
+
+    /// Performs a checked read of this inline object's payload against [`InlineSpec`] `S`.
+    ///
+    /// Distinguishes a wrong object kind from a corrupt or incompatible payload.
+    pub fn read_data<S: InlineSpec>(&self) -> Result<Cow<'_, S::Data>, NodeDataError> {
+        match self {
+            Self::Custom { kind, data } => {
+                if kind.as_ref() != S::KIND {
+                    return Err(NodeDataError::KindMismatch {
+                        expected: S::KIND,
+                        actual: kind.to_string(),
+                    });
+                }
+                data.try_as_typed::<S::Data>()
+                    .map_err(|error| NodeDataError::InvalidData {
+                        kind: S::KIND,
+                        message: error.to_string(),
+                    })
+            }
+            Self::Image { .. } => Err(NodeDataError::KindMismatch {
+                expected: S::KIND,
+                actual: "image".to_owned(),
+            }),
+            Self::SmartChip { .. } => Err(NodeDataError::KindMismatch {
+                expected: S::KIND,
+                actual: "smart_chip".to_owned(),
+            }),
+            Self::FootnoteRef { .. } => Err(NodeDataError::KindMismatch {
+                expected: S::KIND,
+                actual: "footnote_ref".to_owned(),
+            }),
+        }
+    }
+
+    /// Returns `true` when `self` and `other` have the same built-in variant or custom kind string.
+    pub fn same_kind(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Image { .. }, Self::Image { .. })
+            | (Self::SmartChip { .. }, Self::SmartChip { .. })
+            | (Self::FootnoteRef { .. }, Self::FootnoteRef { .. }) => true,
+            (Self::Custom { kind: left, .. }, Self::Custom { kind: right, .. }) => left == right,
+            _ => false,
         }
     }
 }
@@ -177,6 +297,19 @@ impl InlineContent {
         object: InlineObject,
     ) -> Option<InlineObject> {
         let entry = self.objects.iter_mut().find(|entry| entry.id == id)?;
+        Some(std::mem::replace(&mut entry.object, object))
+    }
+
+    /// Replaces the payload of the inline object matching `id` only when its kind matches `object`.
+    pub fn update_object_checked(
+        &mut self,
+        id: InlineObjectId,
+        object: InlineObject,
+    ) -> Option<InlineObject> {
+        let entry = self.objects.iter_mut().find(|entry| entry.id == id)?;
+        if !entry.object.same_kind(&object) {
+            return None;
+        }
         Some(std::mem::replace(&mut entry.object, object))
     }
 
@@ -653,16 +786,22 @@ mod tests {
 
     #[test]
     fn copied_objects_get_fresh_ids_and_restore_can_preserve_identity() {
+        struct TestInlineSpec;
+        impl InlineSpec for TestInlineSpec {
+            const KIND: &'static str = "test";
+            type Data = ();
+        }
+
         let mut source = InlineContent::empty();
         let source_id = source.push_object(
-            InlineObject::custom("test", CustomPayload::default()),
+            InlineObject::custom::<TestInlineSpec>(()),
             InlineStyle::default(),
         );
         let copied = source.slice(0..source.len());
 
         let mut destination = InlineContent::empty();
         let existing_id = destination.push_object(
-            InlineObject::custom("test", CustomPayload::default()),
+            InlineObject::custom::<TestInlineSpec>(()),
             InlineStyle::default(),
         );
         destination.insert_content(destination.len(), &copied);

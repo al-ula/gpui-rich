@@ -1,9 +1,10 @@
 //! Custom GPUI [`Element`] implementing virtualized non-paginated 6-layer rich text painting.
 
-use crate::asset::LoadedAsset;
+use crate::asset::{ImageAssetError, LoadedAsset};
 use crate::extension::{
-    CustomBlockRenderContext, CustomInlineRenderContext, CustomRenderOutput, DirectPaintCallback,
-    ExtensionRegistry, NodeExtension,
+    BlockCallbackResult, CustomRenderOutput, DirectPaintCallback, ErasedBlockRenderer,
+    ErasedInlineRenderer, ExtensionDiagnostic, ExtensionNodeTarget, ExtensionRegistry,
+    InlineCallbackResult,
 };
 use crate::shaper::{GpuiGlyphBackend, GpuiShaper, rgba_to_hsla};
 use crate::theme::RichTheme;
@@ -11,25 +12,23 @@ use crate::view::{
     ActiveSmartChipPopover, ImageResizeCorner, ImePreedit, RichDocumentView,
     image_resize_handle_rects,
 };
-#[cfg(not(feature = "gpui-fast"))]
-use gpui_kit::IntoElement;
 use gpui_kit::{
     AnyElement, App, AvailableSpace, BorderStyle, Bounds, BoxShadow, ClipboardItem, ContentMask,
     Corners, CursorStyle, Edges, Element, ElementId, ElementInputHandler, Entity, FocusHandle,
     GlobalElementId, Hitbox, HitboxBehavior, Hsla, InspectorElementId, InteractiveElement,
-    LayoutId, Length, MouseButton, ParentElement, Pixels, Point, SharedString,
+    IntoElement, LayoutId, Length, MouseButton, ParentElement, Pixels, Point, SharedString,
     StatefulInteractiveElement, StrikethroughStyle, Style, Styled, TextRun, UnderlineStyle, Window,
     div, fill, outline, point, px, quad, size,
 };
 use rich_layout::{
     BlockLayout, BlockLayoutKind, HorizontalMetrics, InlineBoxFragment, Insets, LineFragment,
-    ParagraphLayout, Rect, TextFragment, VisibleBlock, collect_visible_leaf_paragraphs, pt_to_px,
-    resolve_horizontal_metrics,
+    ParagraphLayout, Rect, TextFragment, VisibleBlock, collect_visible_leaf_paragraphs_in_y_range,
+    pt_to_px, resolve_horizontal_metrics,
 };
 use rich_model::{
-    Affinity, BlockDecorations, BlockId, ChipKind, CustomPayload, DecorationContext,
-    DocumentSelection, InlineDecoration, InlineObject, InlineObjectId, OverlayDecoration,
-    RgbaColor, SharedStr, UnderlineKind,
+    Affinity, BlockId, BlockShapeKind, ChipKind, CustomPayload, DecorationContext,
+    DecorationWriter, DocumentSelection, ImageAssetId, InlineDecoration, InlineObject,
+    InlineObjectId, OverlayDecorationKind, RgbaColor, SharedStr, UnderlineKind,
 };
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -83,12 +82,13 @@ enum PrepaintDecorationOverlay {
 
 struct PendingCustomBlock {
     block_id: BlockId,
+    shape: BlockShapeKind,
     kind: SharedStr,
     data: CustomPayload,
     canvas_rect: Rect,
     chrome: Insets,
     is_chrome: bool,
-    extension: Rc<dyn NodeExtension>,
+    renderer: Rc<dyn ErasedBlockRenderer>,
 }
 
 struct PendingCustomInline {
@@ -97,7 +97,7 @@ struct PendingCustomInline {
     kind: SharedStr,
     data: CustomPayload,
     canvas_rect: Rect,
-    extension: Rc<dyn NodeExtension>,
+    renderer: Rc<dyn ErasedInlineRenderer>,
 }
 
 enum PrepaintedCustomChrome {
@@ -131,7 +131,7 @@ pub struct RichPrepaintState {
     decoration_highlights: Vec<(Rect, RgbaColor)>,
     block_inline_decorations: HashMap<BlockId, Vec<InlineDecoration>>,
     decoration_overlays: Vec<PrepaintDecorationOverlay>,
-    image_assets: HashMap<String, LoadedAsset>,
+    image_assets: HashMap<ImageAssetId, LoadedAsset>,
     selected_image_overlay: Option<SelectedImageOverlay>,
     column_divider_guide: Option<ColumnDividerGuide>,
     popover_element: Option<AnyElement>,
@@ -288,21 +288,25 @@ impl Element for RichDocumentElement {
             let mut decoration_overlays = Vec::new();
 
             if !view.decoration_providers.is_empty() || !view.navigation.search.matches.is_empty() {
-                let leaf_paragraphs = collect_visible_leaf_paragraphs(&visible);
+                let min_y = view.scroll_y - OVERSCAN_PX;
+                let max_y = view.scroll_y + viewport_height + OVERSCAN_PX;
+                let leaf_paragraphs =
+                    collect_visible_leaf_paragraphs_in_y_range(&visible, min_y, max_y);
                 for leaf in leaf_paragraphs {
                     let Some(block) = view.document.find_block(leaf.block_id) else {
                         continue;
                     };
-                    let mut aggregated = BlockDecorations::default();
-                    aggregated.inline.extend(view.navigation.decorations(leaf.block_id));
+                    let mut writer = DecorationWriter::new(block);
+                    view.navigation.write_decorations(leaf.block_id, &mut writer);
                     let context = DecorationContext {
                         document: &view.document,
                         block,
                         selection: view.selection.as_ref(),
                     };
                     for (_, provider) in &view.decoration_providers {
-                        aggregated.extend(provider.decorations_for_block(&context));
+                        provider.collect_decorations(&context, &mut writer);
                     }
+                    let mut aggregated = writer.finish();
                     if aggregated.is_empty() {
                         continue;
                     }
@@ -315,7 +319,7 @@ impl Element for RichDocumentElement {
                         if let Some(background) = inline_decoration.background {
                             for rect in leaf
                                 .paragraph
-                                .selection_rects(inline_decoration.range.clone(), false)
+                                .selection_rects(inline_decoration.range(), false)
                             {
                                 decoration_highlights
                                     .push((rect.translate(leaf.origin_x, leaf.origin_y), background));
@@ -346,37 +350,30 @@ impl Element for RichDocumentElement {
                     let font_size_px = pt_to_px(block_font_pt, view.zoom).max(10.0);
 
                     for overlay in aggregated.overlays {
-                        match overlay {
-                            OverlayDecoration::GhostText {
-                                offset,
-                                text,
-                                color,
-                            } => {
+                        let offset = overlay.offset().get();
+                        let affinity = overlay.affinity();
+                        match overlay.kind() {
+                            OverlayDecorationKind::GhostText { text, color } => {
                                 let anchor_rect = leaf
                                     .paragraph
-                                    .caret_rect(offset, Affinity::Downstream)
+                                    .caret_rect(offset, affinity)
                                     .translate(leaf.origin_x, leaf.origin_y);
                                 decoration_overlays.push(PrepaintDecorationOverlay::GhostText {
                                     anchor_rect,
                                     font_size_px,
-                                    text,
-                                    color,
+                                    text: text.clone(),
+                                    color: *color,
                                 });
                             }
-                            OverlayDecoration::RemoteCaret {
-                                offset,
-                                affinity,
-                                color,
-                                label,
-                            } => {
+                            OverlayDecorationKind::RemoteCaret { color, label } => {
                                 let caret_rect = leaf
                                     .paragraph
                                     .caret_rect(offset, affinity)
                                     .translate(leaf.origin_x, leaf.origin_y);
                                 decoration_overlays.push(PrepaintDecorationOverlay::RemoteCaret {
                                     caret_rect,
-                                    color,
-                                    label,
+                                    color: *color,
+                                    label: label.clone(),
                                 });
                             }
                         }
@@ -386,7 +383,7 @@ impl Element for RichDocumentElement {
 
             let mut pending_custom_blocks = Vec::new();
             let mut pending_custom_inlines = Vec::new();
-            let mut visible_image_ids: HashSet<String> = HashSet::new();
+            let mut visible_image_ids: HashSet<ImageAssetId> = HashSet::new();
             for entry in &visible {
                 collect_pending_custom_nodes(
                     &entry.layout,
@@ -614,6 +611,7 @@ impl Element for RichDocumentElement {
         let mut hosted_custom_elements = Vec::new();
         let mut direct_custom_paints = Vec::new();
         let mut foreground_custom_blocks = Vec::new();
+        let mut frame_diagnostics = Vec::new();
 
         // Prepaint Layer 1 custom chrome elements before the document hitbox so clicks inside
         // custom text, container, and grid blocks hit the document canvas for text selection and editing.
@@ -623,31 +621,45 @@ impl Element for RichDocumentElement {
                 continue;
             }
             let node_bounds = rect_to_bounds(custom_block.canvas_rect);
-            let render_context = CustomBlockRenderContext {
-                block_id: custom_block.block_id,
-                kind: &custom_block.kind,
-                data: &custom_block.data,
-                bounds: node_bounds,
-                chrome: custom_block.chrome,
+            match custom_block.renderer.render(
+                custom_block.shape,
+                custom_block.block_id,
+                &custom_block.kind,
+                &custom_block.data,
+                node_bounds,
+                custom_block.chrome,
                 zoom,
-                theme: &theme,
-            };
-            if let Some(output) = custom_block.extension.render_block(render_context, window, cx) {
-                handled_custom_blocks.insert(custom_block.block_id);
-                let prepainted = match output {
-                    CustomRenderOutput::Element(mut element) => {
-                        let available = size(
-                            AvailableSpace::Definite(node_bounds.size.width),
-                            AvailableSpace::Definite(node_bounds.size.height),
-                        );
-                        element.prepaint_as_root(node_bounds.origin, available, window, cx);
-                        PrepaintedCustomChrome::Element(node_bounds, element)
-                    }
-                    CustomRenderOutput::DirectPaint(callback) => {
-                        PrepaintedCustomChrome::DirectPaint(node_bounds, callback)
-                    }
-                };
-                chrome_custom_nodes.insert(custom_block.block_id, prepainted);
+                &theme,
+                window,
+                cx,
+            ) {
+                BlockCallbackResult::Ok(Some(output)) => {
+                    handled_custom_blocks.insert(custom_block.block_id);
+                    let prepainted = match output {
+                        CustomRenderOutput::Element(mut element) => {
+                            let available = size(
+                                AvailableSpace::Definite(node_bounds.size.width),
+                                AvailableSpace::Definite(node_bounds.size.height),
+                            );
+                            element.prepaint_as_root(node_bounds.origin, available, window, cx);
+                            PrepaintedCustomChrome::Element(node_bounds, element)
+                        }
+                        CustomRenderOutput::DirectPaint(callback) => {
+                            PrepaintedCustomChrome::DirectPaint(node_bounds, callback)
+                        }
+                    };
+                    chrome_custom_nodes.insert(custom_block.block_id, prepainted);
+                }
+                BlockCallbackResult::Ok(None) => {}
+                BlockCallbackResult::Invalid(detail) => {
+                    frame_diagnostics.push(ExtensionDiagnostic {
+                        target: ExtensionNodeTarget::Block {
+                            block_id: custom_block.block_id,
+                        },
+                        kind: custom_block.kind,
+                        detail,
+                    });
+                }
             }
         }
 
@@ -657,64 +669,93 @@ impl Element for RichDocumentElement {
         // interactive widgets receive pointer events above the document canvas.
         for custom_block in foreground_custom_blocks {
             let node_bounds = rect_to_bounds(custom_block.canvas_rect);
-            let render_context = CustomBlockRenderContext {
-                block_id: custom_block.block_id,
-                kind: &custom_block.kind,
-                data: &custom_block.data,
-                bounds: node_bounds,
-                chrome: custom_block.chrome,
+            match custom_block.renderer.render(
+                custom_block.shape,
+                custom_block.block_id,
+                &custom_block.kind,
+                &custom_block.data,
+                node_bounds,
+                custom_block.chrome,
                 zoom,
-                theme: &theme,
-            };
-            if let Some(output) = custom_block.extension.render_block(render_context, window, cx) {
-                handled_custom_blocks.insert(custom_block.block_id);
-                match output {
-                    CustomRenderOutput::Element(mut element) => {
-                        let available = size(
-                            AvailableSpace::Definite(node_bounds.size.width),
-                            AvailableSpace::Definite(node_bounds.size.height),
-                        );
-                        element.prepaint_as_root(node_bounds.origin, available, window, cx);
-                        hosted_custom_elements.push((node_bounds, element));
+                &theme,
+                window,
+                cx,
+            ) {
+                BlockCallbackResult::Ok(Some(output)) => {
+                    handled_custom_blocks.insert(custom_block.block_id);
+                    match output {
+                        CustomRenderOutput::Element(mut element) => {
+                            let available = size(
+                                AvailableSpace::Definite(node_bounds.size.width),
+                                AvailableSpace::Definite(node_bounds.size.height),
+                            );
+                            element.prepaint_as_root(node_bounds.origin, available, window, cx);
+                            hosted_custom_elements.push((node_bounds, element));
+                        }
+                        CustomRenderOutput::DirectPaint(callback) => {
+                            direct_custom_paints.push((node_bounds, callback));
+                        }
                     }
-                    CustomRenderOutput::DirectPaint(callback) => {
-                        direct_custom_paints.push((node_bounds, callback));
-                    }
+                }
+                BlockCallbackResult::Ok(None) => {}
+                BlockCallbackResult::Invalid(detail) => {
+                    frame_diagnostics.push(ExtensionDiagnostic {
+                        target: ExtensionNodeTarget::Block {
+                            block_id: custom_block.block_id,
+                        },
+                        kind: custom_block.kind,
+                        detail,
+                    });
                 }
             }
         }
 
         for custom_inline in pending_custom_inlines {
             let node_bounds = rect_to_bounds(custom_inline.canvas_rect);
-            let render_context = CustomInlineRenderContext {
-                block_id: custom_inline.block_id,
-                object_id: custom_inline.object_id,
-                kind: &custom_inline.kind,
-                data: &custom_inline.data,
-                bounds: node_bounds,
+            match custom_inline.renderer.render(
+                custom_inline.block_id,
+                custom_inline.object_id,
+                &custom_inline.kind,
+                &custom_inline.data,
+                node_bounds,
                 zoom,
-                theme: &theme,
-            };
-            if let Some(output) = custom_inline
-                .extension
-                .render_inline(render_context, window, cx)
-            {
-                handled_custom_inlines.insert((custom_inline.block_id, custom_inline.object_id));
-                match output {
-                    CustomRenderOutput::Element(mut element) => {
-                        let available = size(
-                            AvailableSpace::Definite(node_bounds.size.width),
-                            AvailableSpace::Definite(node_bounds.size.height),
-                        );
-                        element.prepaint_as_root(node_bounds.origin, available, window, cx);
-                        hosted_custom_elements.push((node_bounds, element));
+                &theme,
+                window,
+                cx,
+            ) {
+                InlineCallbackResult::Ok(Some(output)) => {
+                    handled_custom_inlines.insert((custom_inline.block_id, custom_inline.object_id));
+                    match output {
+                        CustomRenderOutput::Element(mut element) => {
+                            let available = size(
+                                AvailableSpace::Definite(node_bounds.size.width),
+                                AvailableSpace::Definite(node_bounds.size.height),
+                            );
+                            element.prepaint_as_root(node_bounds.origin, available, window, cx);
+                            hosted_custom_elements.push((node_bounds, element));
+                        }
+                        CustomRenderOutput::DirectPaint(callback) => {
+                            direct_custom_paints.push((node_bounds, callback));
+                        }
                     }
-                    CustomRenderOutput::DirectPaint(callback) => {
-                        direct_custom_paints.push((node_bounds, callback));
-                    }
+                }
+                InlineCallbackResult::Ok(None) => {}
+                InlineCallbackResult::Invalid(detail) => {
+                    frame_diagnostics.push(ExtensionDiagnostic {
+                        target: ExtensionNodeTarget::Inline {
+                            block_id: custom_inline.block_id,
+                            object_id: custom_inline.object_id,
+                        },
+                        kind: custom_inline.kind,
+                        detail,
+                    });
                 }
             }
         }
+
+        self.view.update(cx, |view, _| {
+            view.extension_diagnostics = frame_diagnostics;
+        });
 
         let popover_element = pending_chip_popover.map(|(popover, anchor_rect)| {
             let popover_w = 224.0f32;
@@ -1597,7 +1638,7 @@ fn paint_block_foreground(
     debug_overlay: bool,
     theme: &RichTheme,
     block_inline_decorations: &HashMap<BlockId, Vec<InlineDecoration>>,
-    image_assets: &HashMap<String, LoadedAsset>,
+    image_assets: &HashMap<ImageAssetId, LoadedAsset>,
     handled_custom_blocks: &HashSet<BlockId>,
     handled_custom_inlines: &HashSet<(BlockId, InlineObjectId)>,
     to_window: &impl Fn(f32, f32) -> Point<Pixels>,
@@ -1763,7 +1804,7 @@ fn paint_paragraph_foreground(
     debug_overlay: bool,
     theme: &RichTheme,
     extra_decorations: &[InlineDecoration],
-    image_assets: &HashMap<String, LoadedAsset>,
+    image_assets: &HashMap<ImageAssetId, LoadedAsset>,
     handled_custom_inlines: &HashSet<(BlockId, InlineObjectId)>,
     to_window: &impl Fn(f32, f32) -> Point<Pixels>,
     window: &mut Window,
@@ -1828,7 +1869,7 @@ fn foreground_override_for_byte(
     let mut best: Option<(i32, RgbaColor)> = None;
     for decoration in extra_decorations {
         if let Some(color) = decoration.foreground
-            && decoration.range.contains(&byte_index)
+            && decoration.range().contains(&byte_index)
             && best.is_none_or(|(priority, _)| decoration.priority >= priority)
         {
             best = Some((decoration.priority, color));
@@ -1929,8 +1970,9 @@ fn paint_text_fragment(
         if decoration.underline.is_none() && !decoration.strikethrough {
             continue;
         }
-        let overlap_start = decoration.range.start.max(fragment.doc_range.start);
-        let overlap_end = decoration.range.end.min(fragment.doc_range.end);
+        let range = decoration.range();
+        let overlap_start = range.start.max(fragment.doc_range.start);
+        let overlap_end = range.end.min(fragment.doc_range.end);
         if overlap_start >= overlap_end {
             continue;
         }
@@ -1986,7 +2028,7 @@ fn paint_inline_box(
     canvas_rect: Rect,
     zoom: f32,
     theme: &RichTheme,
-    image_assets: &HashMap<String, LoadedAsset>,
+    image_assets: &HashMap<ImageAssetId, LoadedAsset>,
     to_window: &impl Fn(f32, f32) -> Point<Pixels>,
     window: &mut Window,
     cx: &mut App,
@@ -2050,7 +2092,9 @@ fn paint_inline_box(
             let caption = match image_assets.get(asset_id) {
                 Some(LoadedAsset::Loading) => "Loading image...",
                 Some(LoadedAsset::Failed(_)) if !alt.is_empty() => alt.as_str(),
-                Some(LoadedAsset::Failed(_)) => "Image failed to load",
+                Some(LoadedAsset::Failed(ImageAssetError::NotFound { .. })) => "Image not found",
+                Some(LoadedAsset::Failed(ImageAssetError::Decode { .. })) => "Image could not decode",
+                Some(LoadedAsset::Failed(ImageAssetError::Provider { .. })) => "Image failed to load",
                 _ if !alt.is_empty() => alt.as_str(),
                 _ => "Image",
             };
@@ -2110,19 +2154,20 @@ fn collect_pending_custom_nodes(
     extensions: &ExtensionRegistry,
     out_blocks: &mut Vec<PendingCustomBlock>,
     out_inlines: &mut Vec<PendingCustomInline>,
-    out_images: &mut HashSet<String>,
+    out_images: &mut HashSet<ImageAssetId>,
 ) {
     match &layout.kind {
         BlockLayoutKind::CustomLeaf { kind, data, bounds } => {
-            if let Some(extension) = extensions.get_node(kind) {
+            if let Some(renderer) = extensions.get_block(kind) {
                 out_blocks.push(PendingCustomBlock {
                     block_id: layout.id,
+                    shape: BlockShapeKind::Leaf,
                     kind: kind.clone(),
                     data: data.clone(),
                     canvas_rect: bounds.translate(block_x, block_y),
                     chrome: Insets::ZERO,
                     is_chrome: false,
-                    extension,
+                    renderer,
                 });
             }
         }
@@ -2134,15 +2179,16 @@ fn collect_pending_custom_nodes(
             content_origin,
             paragraph,
         } => {
-            if let Some(extension) = extensions.get_node(kind) {
+            if let Some(renderer) = extensions.get_block(kind) {
                 out_blocks.push(PendingCustomBlock {
                     block_id: layout.id,
+                    shape: BlockShapeKind::Text,
                     kind: kind.clone(),
                     data: data.clone(),
                     canvas_rect: bounds.translate(block_x, block_y),
                     chrome: *chrome,
                     is_chrome: true,
-                    extension,
+                    renderer,
                 });
             }
             collect_custom_inlines_in_paragraph(
@@ -2162,15 +2208,16 @@ fn collect_pending_custom_nodes(
             chrome,
             children,
         } => {
-            if let Some(extension) = extensions.get_node(kind) {
+            if let Some(renderer) = extensions.get_block(kind) {
                 out_blocks.push(PendingCustomBlock {
                     block_id: layout.id,
+                    shape: BlockShapeKind::Container,
                     kind: kind.clone(),
                     data: data.clone(),
                     canvas_rect: bounds.translate(block_x, block_y),
                     chrome: *chrome,
                     is_chrome: true,
-                    extension,
+                    renderer,
                 });
             }
             for child in children {
@@ -2193,15 +2240,16 @@ fn collect_pending_custom_nodes(
             content_origin,
             table,
         } => {
-            if let Some(extension) = extensions.get_node(kind) {
+            if let Some(renderer) = extensions.get_block(kind) {
                 out_blocks.push(PendingCustomBlock {
                     block_id: layout.id,
+                    shape: BlockShapeKind::Grid,
                     kind: kind.clone(),
                     data: data.clone(),
                     canvas_rect: bounds.translate(block_x, block_y),
                     chrome: *chrome,
                     is_chrome: true,
-                    extension,
+                    renderer,
                 });
             }
             for cell in &table.cells {
@@ -2285,14 +2333,14 @@ fn collect_custom_inlines_in_paragraph(
     origin_y: f32,
     extensions: &ExtensionRegistry,
     out_inlines: &mut Vec<PendingCustomInline>,
-    out_images: &mut HashSet<String>,
+    out_images: &mut HashSet<ImageAssetId>,
 ) {
     for line in &paragraph.lines {
         for fragment in &line.fragments {
             if let LineFragment::InlineBox(inline_box) = fragment {
                 match &inline_box.object {
                     InlineObject::Custom { kind, data } => {
-                        if let Some(extension) = extensions.get_node(kind) {
+                        if let Some(renderer) = extensions.get_inline(kind) {
                             let canvas_rect = line
                                 .inline_box_rect(inline_box)
                                 .translate(origin_x, origin_y);
@@ -2302,7 +2350,7 @@ fn collect_custom_inlines_in_paragraph(
                                 kind: kind.clone(),
                                 data: data.clone(),
                                 canvas_rect,
-                                extension,
+                                renderer,
                             });
                         }
                     }

@@ -2,8 +2,8 @@
 
 use super::RichDocumentView;
 use rich_model::{
-    AnchorId, ClipboardBlock, ClipboardCustomFormatter, ClipboardFragment, ComponentStore,
-    CustomPayload, DROPDOWN_KIND, InlineObject, PLACEHOLDER_KIND, VARIABLE_KIND,
+    AnchorId, BlockShapeKind, ClipboardBlock, ClipboardCustomFormatter, ClipboardFragment,
+    ComponentStore, CustomPayload, DROPDOWN_KIND, InlineObject, PLACEHOLDER_KIND, VARIABLE_KIND,
 };
 use serde_json::Value;
 use std::cell::OnceCell;
@@ -23,10 +23,7 @@ impl<'a> ComponentClipboardFormatter<'a> {
     }
 
     fn footnote_label(&self, kind: &str, data: &CustomPayload) -> Option<String> {
-        if kind != rich_model::FOOTNOTE_REFERENCE_KIND {
-            return None;
-        }
-        let id = rich_model::footnote_reference_id(&InlineObject::custom(kind, data.clone()))?;
+        let id = rich_model::footnote_reference_id_from_payload(kind, data)?;
         let numbers = self.note_numbers.get_or_init(|| {
             self.view
                 .document
@@ -42,22 +39,28 @@ impl<'a> ComponentClipboardFormatter<'a> {
 }
 
 impl ClipboardCustomFormatter for ComponentClipboardFormatter<'_> {
-    fn plain_text_block(&self, kind: &str, data: &CustomPayload) -> Option<String> {
-        self.view.extensions.plain_text_block(kind, data)
+    fn plain_text_block(
+        &self,
+        shape: BlockShapeKind,
+        kind: &str,
+        data: &CustomPayload,
+    ) -> Option<String> {
+        self.view.extensions.plain_text_block(shape, kind, data)
     }
 
-    fn html_block(&self, kind: &str, data: &CustomPayload) -> Option<String> {
-        self.view.extensions.html_block(kind, data)
+    fn html_block(
+        &self,
+        shape: BlockShapeKind,
+        kind: &str,
+        data: &CustomPayload,
+    ) -> Option<String> {
+        self.view.extensions.html_block(shape, kind, data)
     }
 
     fn plain_text_inline(&self, kind: &str, data: &CustomPayload) -> Option<String> {
         if matches!(kind, DROPDOWN_KIND | VARIABLE_KIND | PLACEHOLDER_KIND) {
-            return Some(
-                self.view
-                    .document
-                    .components
-                    .inline_fallback(kind, &data.to_json()),
-            );
+            let json = data.to_json().ok()?;
+            return Some(self.view.document.components.inline_fallback(kind, &json));
         }
         self.footnote_label(kind, data)
             .or_else(|| self.view.extensions.plain_text_inline(kind, data))
@@ -66,7 +69,7 @@ impl ClipboardCustomFormatter for ComponentClipboardFormatter<'_> {
     fn html_inline(&self, kind: &str, data: &CustomPayload) -> Option<String> {
         if matches!(kind, DROPDOWN_KIND | VARIABLE_KIND | PLACEHOLDER_KIND) {
             let store = &self.view.document.components;
-            let mut payload = data.to_json();
+            let mut payload = data.to_json().ok()?;
             let label = store.inline_fallback(kind, &payload);
             let definition = match kind {
                 DROPDOWN_KIND => {
@@ -92,6 +95,37 @@ impl ClipboardCustomFormatter for ComponentClipboardFormatter<'_> {
     }
 }
 
+/// Attaches portable dropdown and variable definitions onto a cloned structured fragment so
+/// same-process copy/paste carries component definitions independently of HTML formatting.
+pub(super) fn attach_component_definitions(
+    store: &ComponentStore,
+    fragment: &mut ClipboardFragment,
+) {
+    for_custom_objects_mut(&mut fragment.blocks, &mut |kind, data| {
+        if !matches!(kind, DROPDOWN_KIND | VARIABLE_KIND) {
+            return;
+        }
+        let Ok(mut payload) = data.to_json() else {
+            return;
+        };
+        let definition = match kind {
+            DROPDOWN_KIND => payload
+                .get("definition_id")
+                .and_then(Value::as_str)
+                .and_then(|id| store.export_dropdown_metadata(id)),
+            VARIABLE_KIND => payload
+                .get("variable_id")
+                .and_then(Value::as_str)
+                .and_then(|id| store.export_variable_metadata(id)),
+            _ => None,
+        };
+        if let Some(definition) = definition {
+            payload["clipboard_definition"] = definition;
+            *data = CustomPayload::from_json(payload);
+        }
+    });
+}
+
 pub(super) fn import_component_definitions(
     store: &ComponentStore,
     fragment: &mut ClipboardFragment,
@@ -104,7 +138,9 @@ pub(super) fn import_component_definitions(
             VARIABLE_KIND => false,
             _ => return,
         };
-        let mut payload = data.to_json();
+        let Ok(mut payload) = data.to_json() else {
+            return;
+        };
         let Some(object) = payload.as_object_mut() else {
             return;
         };
@@ -162,7 +198,7 @@ fn for_custom_objects_mut(
             | ClipboardBlock::CustomContainer { children, .. } => {
                 for_custom_objects_mut(children, f);
             }
-            ClipboardBlock::Table(table) => {
+            ClipboardBlock::Table(table) | ClipboardBlock::CustomGrid { table, .. } => {
                 for row in &mut table.rows {
                     for cell in &mut row.cells {
                         for_custom_objects_mut(&mut cell.blocks, f);

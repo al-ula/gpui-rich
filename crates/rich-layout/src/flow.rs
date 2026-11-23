@@ -1194,6 +1194,94 @@ pub fn collect_visible_leaf_paragraphs<'layout, B: GlyphBackend>(
     leaves
 }
 
+/// Collects text-bearing leaf paragraphs whose canvas-space vertical bounds intersect `[min_y, max_y]`,
+/// culling off-screen container children and table cells (including rows of large tables).
+pub fn collect_visible_leaf_paragraphs_in_y_range<'layout, B: GlyphBackend>(
+    visible_blocks: &'layout [VisibleBlock<B>],
+    min_y: f32,
+    max_y: f32,
+) -> Vec<VisibleLeafParagraph<'layout, B>> {
+    let mut leaves = Vec::new();
+    for visible in visible_blocks {
+        if visible.y + visible.layout.height < min_y || visible.y > max_y {
+            continue;
+        }
+        collect_leaf_paragraphs_in_y_range(
+            &visible.layout,
+            visible.x,
+            visible.y,
+            min_y,
+            max_y,
+            &mut leaves,
+        );
+    }
+    leaves
+}
+
+fn collect_leaf_paragraphs_in_y_range<'layout, B: GlyphBackend>(
+    layout: &'layout BlockLayout<B>,
+    origin_x: f32,
+    origin_y: f32,
+    min_y: f32,
+    max_y: f32,
+    out: &mut Vec<VisibleLeafParagraph<'layout, B>>,
+) {
+    if origin_y + layout.height < min_y || origin_y > max_y {
+        return;
+    }
+    if let Some(paragraph) = layout.paragraph() {
+        let content_origin = layout.content_origin();
+        let para_y = origin_y + content_origin.y;
+        if para_y + paragraph.height >= min_y && para_y <= max_y {
+            out.push(VisibleLeafParagraph {
+                block_id: layout.id,
+                origin_x: origin_x + content_origin.x,
+                origin_y: para_y,
+                paragraph,
+            });
+        }
+        return;
+    }
+    if let Some(children) = layout.children() {
+        for child in children {
+            let child_y = origin_y + child.y;
+            if child_y + child.layout.height < min_y || child_y > max_y {
+                continue;
+            }
+            collect_leaf_paragraphs_in_y_range(
+                &child.layout,
+                origin_x + child.x,
+                child_y,
+                min_y,
+                max_y,
+                out,
+            );
+        }
+    } else if let Some(table) = layout.table_layout() {
+        let content_origin = layout.content_origin();
+        for cell in &table.cells {
+            let cell_y = origin_y + content_origin.y + cell.rect.y;
+            if cell_y + cell.rect.height < min_y || cell_y > max_y {
+                continue;
+            }
+            for child in &cell.children {
+                let child_y = cell_y + child.y;
+                if child_y + child.layout.height < min_y || child_y > max_y {
+                    continue;
+                }
+                collect_leaf_paragraphs_in_y_range(
+                    &child.layout,
+                    origin_x + content_origin.x + cell.rect.x + child.x,
+                    child_y,
+                    min_y,
+                    max_y,
+                    out,
+                );
+            }
+        }
+    }
+}
+
 fn collect_leaf_paragraphs<'layout, B: GlyphBackend>(
     layout: &'layout BlockLayout<B>,
     origin_x: f32,

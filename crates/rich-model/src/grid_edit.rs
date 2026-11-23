@@ -182,7 +182,7 @@ impl Document {
         }
         let step = Step::SetBlockKind {
             block_id: table_id,
-            kind: BlockKind::grid(kind, data, table),
+            kind: BlockKind::raw_grid(kind, data, table),
         };
         if let DocumentSelection::Text {
             anchor,

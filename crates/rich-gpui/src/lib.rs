@@ -8,14 +8,15 @@ pub mod theme;
 pub mod view;
 
 pub use asset::{
-    AssetProvider, FileAssetProvider, ImageAssetData, LoadedAsset, MemoryAssetProvider,
-    decode_image_asset, infer_image_format,
+    AssetProvider, FileAssetProvider, ImageAssetData, ImageAssetError, LoadedAsset,
+    MemoryAssetProvider, decode_image_asset, infer_image_format,
 };
 pub use element::RichDocumentElement;
 pub use extension::{
-    CustomBlockRenderContext, CustomCommandHandler, CustomCommandResult, CustomInlineRenderContext,
-    CustomRenderOutput, DirectPaintCallback, ExtensionRegistry, NodeExtension, TypedBlockExtension,
-    TypedBlockRenderContext, TypedInlineExtension, TypedInlineRenderContext,
+    BlockRenderContext, BlockRenderer, CustomRenderOutput, DirectPaintCallback, EditCommandContext,
+    ExtensionDiagnostic, ExtensionDiagnosticKind, ExtensionNamespace, ExtensionNodeTarget,
+    ExtensionRegistrationError, ExtensionRegistry, InlineRenderContext, InlineRenderer,
+    ReadCommandContext, ReadCommandOutcome,
 };
 pub use shaper::{
     FontResolver, GpuiGlyphBackend, GpuiShaper, clear_font_resolution_cache, resolve_font_family,
@@ -34,7 +35,7 @@ pub use view::{
     SelectDocStart, SelectDown, SelectLeft, SelectLineEnd, SelectLineStart, SelectRight, SelectUp,
     SelectWordLeft, SelectWordRight, SelectedInlineImage, SetHeading1, SetHeading2, SetHeading3,
     SetParagraph, SoftBreak, SplitTableCell, ToggleBold, ToggleBulletList, ToggleChecklist,
-    ToggleDebugOverlay, ToggleInlineCode, ToggleItalic, ToggleOrderedList, ToggleStrikethrough,
-    ToggleSubscript, ToggleSuperscript, ToggleUnderline, Undo, ZoomIn, ZoomOut, ZoomReset,
+    ToggleDebugOverlay, ToggleInlineCode, ToggleItalic, ToggleStrikethrough, ToggleSubscript,
+    ToggleSuperscript, ToggleUnderline, Undo, ZoomIn, ZoomOut, ZoomReset,
     register_default_keybindings,
 };

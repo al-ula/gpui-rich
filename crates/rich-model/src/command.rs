@@ -1,14 +1,27 @@
-//! Command model unifying viewer interactions, GPUI actions, and future editing operations.
+//! Command model unifying viewer interactions, GPUI actions, editing operations, and typed
+//! downstream extension commands.
+//!
+//! # Breaking changes and wire compatibility
+//!
+//! * Built-in [`RichCommand`] variants preserve their existing Serde wire format.
+//! * The raw `RichCommand::Custom { id, payload, mutates_document }` variant has been removed.
+//!   Old raw custom command JSON fails deserialization, and [`RichCommand::Extension`] invocations
+//!   return a serialization error. Extension commands are process-local typed values; consumers
+//!   that need a wire protocol decode their own DTO and construct a typed command via
+//!   [`RichCommand::extension`].
 
 use crate::block::{BlockId, ColumnSpec, Document, ListKind};
+use crate::clipboard::ClipboardFragment;
 use crate::inline::{InlineObject, InlineObjectId};
-use crate::payload::CustomPayload;
 use crate::selection::{DocPos, DocumentSelection};
 use crate::style::{
     BlockStyle, Edges, HorizontalLayout, InlineStyle, LinkTarget, NamedStyle, StyleId, TextAlign,
 };
 use crate::transaction::ChangeSet;
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize, Serializer};
+use std::any::{Any, TypeId, type_name};
+use std::fmt;
+use std::sync::Arc;
 
 /// Cardinal direction for caret navigation and deletion commands.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -42,8 +55,238 @@ pub enum MarkKind {
     Subscript,
 }
 
+/// Runtime effect classification for a command.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CommandEffectKind {
+    /// Does not mutate document content or styles.
+    ReadOnly,
+    /// Mutates document content or styles through transactions.
+    Edit,
+}
+
+mod command_effect_sealed {
+    pub trait Sealed {}
+}
+
+/// Sealed trait classifying an [`ExtensionCommand`] as [`ReadOnly`] or [`Edit`].
+pub trait CommandEffect: command_effect_sealed::Sealed + 'static {
+    const KIND: CommandEffectKind;
+}
+
+/// Marker [`CommandEffect`] for commands that only inspect state and cannot return transactions.
+pub struct ReadOnly;
+
+/// Marker [`CommandEffect`] for commands that plan optional document [`crate::Transaction`]s.
+pub struct Edit;
+
+impl command_effect_sealed::Sealed for ReadOnly {}
+impl command_effect_sealed::Sealed for Edit {}
+
+impl CommandEffect for ReadOnly {
+    const KIND: CommandEffectKind = CommandEffectKind::ReadOnly;
+}
+
+impl CommandEffect for Edit {
+    const KIND: CommandEffectKind = CommandEffectKind::Edit;
+}
+
+/// Typed downstream extension command routed through the unified dispatcher, middleware, and policy.
+///
+/// One Rust type defines a command's stable namespaced [`Self::ID`], sealed [`Self::Effect`], and
+/// in-process argument payload. Serde is not required for in-process command arguments.
+pub trait ExtensionCommand: Any + Send + Sync + fmt::Debug + 'static {
+    /// Stable dot-namespaced command identifier (for example `"acme.status.rename"`).
+    const ID: &'static str;
+    /// Sealed effect type ([`ReadOnly`] or [`Edit`]).
+    type Effect: CommandEffect;
+}
+
+trait ErasedCommandArgs: Any + Send + Sync + fmt::Debug {
+    fn as_any(&self) -> &dyn Any;
+}
+
+impl<T: Any + Send + Sync + fmt::Debug + 'static> ErasedCommandArgs for T {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+}
+
+/// Opaque, type-checked in-process invocation of an [`ExtensionCommand`].
+///
+/// Constructed exclusively via [`ExtensionInvocation::new`] or [`RichCommand::extension`].
+#[derive(Clone)]
+pub struct ExtensionInvocation {
+    id: &'static str,
+    effect: CommandEffectKind,
+    type_id: TypeId,
+    type_name: &'static str,
+    args: Arc<dyn ErasedCommandArgs>,
+}
+
+impl ExtensionInvocation {
+    /// Wraps a typed [`ExtensionCommand`] value in an opaque invocation.
+    pub fn new<C: ExtensionCommand>(command: C) -> Self {
+        Self {
+            id: C::ID,
+            effect: C::Effect::KIND,
+            type_id: TypeId::of::<C>(),
+            type_name: type_name::<C>(),
+            args: Arc::new(command),
+        }
+    }
+
+    /// Returns the command's stable identifier.
+    pub const fn id(&self) -> &'static str {
+        self.id
+    }
+
+    /// Returns the command's declared effect ([`CommandEffectKind::ReadOnly`] or [`CommandEffectKind::Edit`]).
+    pub const fn effect(&self) -> CommandEffectKind {
+        self.effect
+    }
+
+    /// Returns the concrete Rust [`TypeId`] of the wrapped command type.
+    pub const fn type_id(&self) -> TypeId {
+        self.type_id
+    }
+
+    /// Returns the Rust type name of the wrapped command type for diagnostics.
+    pub const fn type_name(&self) -> &'static str {
+        self.type_name
+    }
+
+    /// Performs a checked borrow of the wrapped arguments as `C`.
+    pub fn args<C: ExtensionCommand>(&self) -> Option<&C> {
+        if self.id != C::ID
+            || self.effect != C::Effect::KIND
+            || self.type_id != TypeId::of::<C>()
+        {
+            return None;
+        }
+        (*self.args).as_any().downcast_ref::<C>()
+    }
+}
+
+impl fmt::Debug for ExtensionInvocation {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExtensionInvocation")
+            .field("id", &self.id)
+            .field("effect", &self.effect)
+            .field("type_name", &self.type_name)
+            .field("args", &self.args)
+            .finish()
+    }
+}
+
+impl PartialEq for ExtensionInvocation {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+            && self.effect == other.effect
+            && self.type_id == other.type_id
+            && Arc::ptr_eq(&self.args, &other.args)
+    }
+}
+
+impl Serialize for ExtensionInvocation {
+    fn serialize<S>(&self, _serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        Err(serde::ser::Error::custom(format!(
+            "typed extension command invocation '{}' cannot be serialized",
+            self.id
+        )))
+    }
+}
+
+impl<'de> Deserialize<'de> for ExtensionInvocation {
+    fn deserialize<D>(_deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        Err(serde::de::Error::custom(
+            "extension command invocations cannot be deserialized directly",
+        ))
+    }
+}
+
+/// Resolution state of a [`RichCommand`] against the active extension registry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum CommandResolution {
+    /// Built-in [`RichCommand`] variant handled directly by the editor.
+    BuiltIn,
+    /// Extension command matching a registered handler and its concrete Rust type.
+    RegisteredExtension,
+    /// Extension command whose identifier is not registered on the view.
+    UnregisteredExtension,
+    /// Extension command whose identifier is registered for a different Rust type or effect.
+    MismatchedExtension,
+}
+
+/// Resolved metadata describing a command prior to middleware, policy, and completion events.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct ResolvedCommandMeta {
+    pub id: &'static str,
+    pub effect: CommandEffectKind,
+    pub resolution: CommandResolution,
+}
+
+/// Read-only view of a resolved [`RichCommand`] passed to [`CommandMiddleware::before_command`].
+pub struct ResolvedCommand<'a> {
+    command: &'a RichCommand,
+    meta: ResolvedCommandMeta,
+}
+
+impl<'a> ResolvedCommand<'a> {
+    /// Constructs a resolved command wrapper from `command` and its lookup `resolution`.
+    pub fn new(command: &'a RichCommand, resolution: CommandResolution) -> Self {
+        let meta = ResolvedCommandMeta {
+            id: command.command_id(),
+            effect: command.effect(),
+            resolution,
+        };
+        Self { command, meta }
+    }
+
+    /// Borrows the underlying [`RichCommand`].
+    pub fn command(&self) -> &'a RichCommand {
+        self.command
+    }
+
+    /// Returns the resolved command identifier.
+    pub const fn id(&self) -> &'static str {
+        self.meta.id
+    }
+
+    /// Returns the resolved command effect.
+    pub const fn effect(&self) -> CommandEffectKind {
+        self.meta.effect
+    }
+
+    /// Returns how this command resolved against the view's command registry.
+    pub const fn resolution(&self) -> CommandResolution {
+        self.meta.resolution
+    }
+
+    /// Returns the full resolved command metadata.
+    pub const fn meta(&self) -> ResolvedCommandMeta {
+        self.meta
+    }
+
+    /// Returns `true` when this command is an edit command.
+    pub const fn is_document_mutation(&self) -> bool {
+        matches!(self.meta.effect, CommandEffectKind::Edit)
+    }
+
+    /// Performs a checked borrow of typed extension arguments as `C`.
+    pub fn args<C: ExtensionCommand>(&self) -> Option<&'a C> {
+        self.command.extension_args::<C>()
+    }
+}
+
 /// Unified command representation for toolbar controls, keybindings, command palettes,
-/// mouse interactions, and Phase 2 editing mutations.
+/// mouse interactions, editing mutations, and typed downstream extension commands.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum RichCommand {
     // View & canvas commands
@@ -107,6 +350,12 @@ pub enum RichCommand {
         html: String,
         plain_text: Option<String>,
     },
+    /// Same-process structured rich clipboard paste preserving custom node shapes and payloads.
+    PasteFragment {
+        fragment: ClipboardFragment,
+        html_fallback: Option<String>,
+        plain_text: Option<String>,
+    },
     PasteText(String),
 
     // Phase 3 interactive table commands
@@ -134,16 +383,33 @@ pub enum RichCommand {
     Structure(crate::structure_edit::StructureCommand),
     Anchor(crate::anchors::AnchorCommand),
 
-    /// Host-defined custom command routed through policy gating, middleware, and `ExtensionRegistry`.
-    Custom {
-        id: String,
-        #[serde(default)]
-        payload: CustomPayload,
-        mutates_document: bool,
-    },
+    /// Opaque, type-checked downstream extension command routed through the unified dispatcher.
+    Extension(ExtensionInvocation),
 }
 
 impl RichCommand {
+    /// Wraps a typed [`ExtensionCommand`] inside the unified [`RichCommand`] pipeline.
+    pub fn extension<C: ExtensionCommand>(command: C) -> Self {
+        Self::Extension(ExtensionInvocation::new(command))
+    }
+
+    /// Performs a checked borrow of typed extension arguments when this command wraps `C`.
+    pub fn extension_args<C: ExtensionCommand>(&self) -> Option<&C> {
+        match self {
+            Self::Extension(invocation) => invocation.args::<C>(),
+            _ => None,
+        }
+    }
+
+    /// Returns the effect classification of this command.
+    pub fn effect(&self) -> CommandEffectKind {
+        if self.is_document_mutation() {
+            CommandEffectKind::Edit
+        } else {
+            CommandEffectKind::ReadOnly
+        }
+    }
+
     /// Returns true when the command mutates document content or document styles.
     pub fn is_document_mutation(&self) -> bool {
         match self {
@@ -169,6 +435,7 @@ impl RichCommand {
             | Self::ToggleList(_)
             | Self::SetTextAlign(_)
             | Self::PasteHtml { .. }
+            | Self::PasteFragment { .. }
             | Self::PasteText(_)
             | Self::SetTableColumns { .. }
             | Self::InsertTableRow { .. }
@@ -182,15 +449,13 @@ impl RichCommand {
             Self::Component(command) => command.is_document_mutation(),
             Self::Structure(command) => command.is_document_mutation(),
             Self::Anchor(command) => command.is_document_mutation(),
-            Self::Custom {
-                mutates_document, ..
-            } => *mutates_document,
+            Self::Extension(invocation) => invocation.effect() == CommandEffectKind::Edit,
             _ => false,
         }
     }
 
-    /// Returns a stable dot-namespaced identifier for keymaps, palettes, and logging.
-    pub fn command_id(&self) -> &str {
+    /// Returns a stable dot-namespaced identifier for keymaps, palettes, middleware, and logging.
+    pub fn command_id(&self) -> &'static str {
         match self {
             Self::SetHorizontalLayout(_) => "rich.view.set_horizontal_layout",
             Self::SetMargins(_) => "rich.view.set_margins",
@@ -230,6 +495,7 @@ impl RichCommand {
             Self::ToggleList(_) => "rich.format.toggle_list",
             Self::SetTextAlign(_) => "rich.format.set_text_align",
             Self::PasteHtml { .. } => "rich.clipboard.paste_html",
+            Self::PasteFragment { .. } => "rich.clipboard.paste_fragment",
             Self::PasteText(_) => "rich.clipboard.paste_text",
             Self::SetTableColumns { .. } => "rich.table.set_columns",
             Self::InsertTableRow { .. } => "rich.table.insert_row",
@@ -244,7 +510,7 @@ impl RichCommand {
             Self::Component(command) => command.command_id(),
             Self::Structure(command) => command.command_id(),
             Self::Anchor(command) => command.command_id(),
-            Self::Custom { id, .. } => id.as_str(),
+            Self::Extension(invocation) => invocation.id(),
         }
     }
 }
@@ -524,7 +790,9 @@ impl InteractionPolicy {
                 crate::StructureCommand::RestartOrderedList { .. }
                 | crate::StructureCommand::ContinueOrderedList { .. },
             ) => self.can_format_lists(),
-            RichCommand::PasteHtml { .. } => self.can_paste_rich_text(),
+            RichCommand::PasteHtml { .. } | RichCommand::PasteFragment { .. } => {
+                self.can_paste_rich_text()
+            }
             RichCommand::PasteText(_) => self.editing.plain_paste,
             RichCommand::SetTableColumns { .. } => self.can_resize_table_columns(),
             RichCommand::InsertTableRow { .. }
@@ -542,7 +810,9 @@ impl InteractionPolicy {
             }
             RichCommand::Grid(_) => self.can_edit_table_structure(),
             RichCommand::Component(_) => self.editing.components,
-            RichCommand::Navigation(_) if command.is_document_mutation() => self.editing.find_replace,
+            RichCommand::Navigation(_) if command.is_document_mutation() => {
+                self.editing.find_replace
+            }
             RichCommand::Anchor(_) if command.is_document_mutation() => self.editing.anchors,
             RichCommand::Navigation(_) | RichCommand::Anchor(_) => self.can_select(),
             _ => true,
@@ -558,16 +828,16 @@ pub enum CommandDecision {
     Continue,
     /// Abort command execution and report [`CommandOutcome::Cancelled`].
     Cancel,
-    /// Substitute a different command for remaining middleware and execution.
+    /// Substitute a different command for remaining middleware, policy, and execution.
     Replace(RichCommand),
 }
 
 /// Extension hook intercepting commands before execution and observing applied transactions.
 pub trait CommandMiddleware {
-    /// Inspects, cancels, or replaces a command prior to policy enforcement and execution.
+    /// Inspects, cancels, or replaces a resolved command prior to policy enforcement and execution.
     fn before_command(
         &mut self,
-        _command: &RichCommand,
+        _command: &ResolvedCommand<'_>,
         _source: CommandSource,
         _document: &Document,
         _selection: Option<&DocumentSelection>,
@@ -594,5 +864,9 @@ pub enum CommandOutcome {
     RejectedByPolicy,
     Cancelled,
     Unsupported,
+    /// Dispatched an extension command whose identifier is not registered on the view.
+    UnregisteredCommand,
+    /// Dispatched an extension command whose identifier is registered for another Rust type or effect.
+    MismatchedCommandType,
     TargetHidden,
 }

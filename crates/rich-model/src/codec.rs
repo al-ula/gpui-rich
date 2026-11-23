@@ -1,4 +1,30 @@
-//! Pluggable [`DocumentCodec`] abstraction with built-in Markdown (GFM), HTML, and JSON codecs.
+//! Pluggable [`DocumentCodec`] abstraction with format-typed direct calls, dynamic
+//! [`CodecRegistry`] dispatch, and built-in Markdown (GFM), HTML, and JSON codecs.
+//!
+//! Direct Rust codec calls tie [`EncodedDocument<Format>`] to a codec's associated [`DocumentCodec::Format`]
+//! so encoded text from one codec cannot be passed to another by mistake:
+//!
+//! ```rust
+//! use rich_model::{Document, DocumentCodec, HtmlCodec, MarkdownCodec};
+//!
+//! let mut doc = Document::new();
+//! doc.add_paragraph(rich_model::InlineContent::plain("Hello"), Default::default());
+//! let encoded_md = MarkdownCodec.encode(&doc).unwrap();
+//! let roundtrip = MarkdownCodec.decode(&encoded_md).unwrap();
+//! assert_eq!(roundtrip.blocks.len(), 1);
+//!
+//! let encoded_html = HtmlCodec::default().encode(&doc).unwrap();
+//! let _ = HtmlCodec::default().decode(&encoded_html).unwrap();
+//! ```
+//!
+//! Mixing encoded formats fails at compile time:
+//! ```compile_fail
+//! use rich_model::{Document, DocumentCodec, HtmlCodec, MarkdownCodec};
+//!
+//! let doc = Document::new();
+//! let encoded_md = MarkdownCodec.encode(&doc).unwrap();
+//! let _ = HtmlCodec::default().decode(&encoded_md);
+//! ```
 
 use crate::block::{
     BlockKind, BlockNode, ColumnSpec, Document, ListId, ListKind, NumberStyle, TableBlock,
@@ -6,7 +32,7 @@ use crate::block::{
 };
 use crate::clipboard::ClipboardFragment;
 use crate::inline::{
-    ChipKind, InlineContent, InlineObject, InlineVAlign, OBJECT_REPLACEMENT_CHAR,
+    ChipKind, ImageAssetId, InlineContent, InlineObject, InlineVAlign, OBJECT_REPLACEMENT_CHAR,
 };
 use crate::payload::CustomPayload;
 use crate::style::{
@@ -14,16 +40,215 @@ use crate::style::{
 };
 use std::collections::HashMap;
 use std::fmt;
+use std::marker::PhantomData;
 
-/// Error returned by [`DocumentCodec::encode`] or [`DocumentCodec::decode`].
+/// Format marker for [`JsonCodec`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct JsonFormat;
+
+/// Format marker for [`HtmlCodec`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct HtmlFormat;
+
+/// Format marker for [`MarkdownCodec`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct MarkdownFormat;
+
+/// Encoded document text tagged with its concrete codec `Format` marker.
+///
+/// Direct calls to [`DocumentCodec::encode`] return `EncodedDocument<Self::Format>`, preventing
+/// callers from passing one codec's output to another codec's [`DocumentCodec::decode`].
+/// Constructing an [`EncodedDocument`] from untrusted input via [`Self::from_raw`] is explicit
+/// and still validated by [`DocumentCodec::decode`].
+pub struct EncodedDocument<Format> {
+    text: String,
+    _format: PhantomData<fn() -> Format>,
+}
+
+impl<Format> EncodedDocument<Format> {
+    /// Tags raw untrusted text as a candidate for `Format`. Validation happens in [`DocumentCodec::decode`].
+    pub fn from_raw(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            _format: PhantomData,
+        }
+    }
+
+    /// Borrows the encoded string content.
+    pub fn as_str(&self) -> &str {
+        &self.text
+    }
+
+    /// Unwraps the inner encoded string.
+    pub fn into_string(self) -> String {
+        self.text
+    }
+}
+
+impl<Format> Clone for EncodedDocument<Format> {
+    fn clone(&self) -> Self {
+        Self {
+            text: self.text.clone(),
+            _format: PhantomData,
+        }
+    }
+}
+
+impl<Format> fmt::Debug for EncodedDocument<Format> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("EncodedDocument")
+            .field("text", &self.text)
+            .finish()
+    }
+}
+
+impl<Format> PartialEq for EncodedDocument<Format> {
+    fn eq(&self, other: &Self) -> bool {
+        self.text == other.text
+    }
+}
+
+impl<Format> Eq for EncodedDocument<Format> {}
+
+/// Stable codec format identifier such as `"markdown"`, `"html"`, or `"json"`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FormatId(String);
+
+impl FormatId {
+    pub fn new(id: impl Into<String>) -> Self {
+        Self(id.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for FormatId {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl From<String> for FormatId {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Display for FormatId {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// MIME media type lookup key such as `"text/markdown"` or `"text/html"`.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct MimeType(String);
+
+impl MimeType {
+    pub fn new(mime: impl Into<String>) -> Self {
+        Self(mime.into())
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for MimeType {
+    fn from(value: &str) -> Self {
+        Self(value.to_owned())
+    }
+}
+
+impl From<String> for MimeType {
+    fn from(value: String) -> Self {
+        Self(value)
+    }
+}
+
+impl fmt::Display for MimeType {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// File suffix lookup key such as `"md"` or `"html"` (leading dots are normalized away).
+#[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct FileExtension(String);
+
+impl FileExtension {
+    pub fn new(extension: impl Into<String>) -> Self {
+        let raw = extension.into();
+        let trimmed = raw.trim_start_matches('.').to_owned();
+        Self(trimmed)
+    }
+
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl From<&str> for FileExtension {
+    fn from(value: &str) -> Self {
+        Self::new(value)
+    }
+}
+
+impl From<String> for FileExtension {
+    fn from(value: String) -> Self {
+        Self::new(value)
+    }
+}
+
+impl fmt::Display for FileExtension {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+/// Structured error returned by [`DocumentCodec`] and [`CodecRegistry`] operations.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub struct CodecError {
-    pub message: String,
+pub enum CodecError {
+    /// Attempted to register a codec with a `format_id` already present in the registry.
+    DuplicateFormatId { format_id: FormatId },
+    /// No codec was registered for `format_id`.
+    UnknownFormatId { format_id: FormatId },
+    /// No codec claimed `mime_type`.
+    UnknownMimeType { mime_type: MimeType },
+    /// No codec claimed `extension`.
+    UnknownFileExtension { extension: FileExtension },
+    /// Multiple registered codecs claimed `mime_type`; select explicitly by [`FormatId`].
+    AmbiguousMimeType {
+        mime_type: MimeType,
+        candidates: Vec<FormatId>,
+    },
+    /// Multiple registered codecs claimed `extension`; select explicitly by [`FormatId`].
+    AmbiguousFileExtension {
+        extension: FileExtension,
+        candidates: Vec<FormatId>,
+    },
+    /// Input could not be parsed by the codec.
+    Parse { format_id: FormatId, message: String },
+    /// Document could not be serialized by the codec.
+    Serialize { format_id: FormatId, message: String },
 }
 
 impl CodecError {
-    pub fn new(message: impl Into<String>) -> Self {
-        Self {
+    /// Constructs a parse error for `format_id`.
+    pub fn parse(format_id: impl Into<FormatId>, message: impl Into<String>) -> Self {
+        Self::Parse {
+            format_id: format_id.into(),
+            message: message.into(),
+        }
+    }
+
+    /// Constructs a serialization error for `format_id`.
+    pub fn serialize(format_id: impl Into<FormatId>, message: impl Into<String>) -> Self {
+        Self::Serialize {
+            format_id: format_id.into(),
             message: message.into(),
         }
     }
@@ -31,14 +256,60 @@ impl CodecError {
 
 impl fmt::Display for CodecError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.message)
+        match self {
+            Self::DuplicateFormatId { format_id } => {
+                write!(formatter, "duplicate document codec format ID '{format_id}'")
+            }
+            Self::UnknownFormatId { format_id } => {
+                write!(formatter, "unknown document codec format ID '{format_id}'")
+            }
+            Self::UnknownMimeType { mime_type } => {
+                write!(formatter, "no document codec registered for MIME type '{mime_type}'")
+            }
+            Self::UnknownFileExtension { extension } => {
+                write!(formatter, "no document codec registered for file extension '{extension}'")
+            }
+            Self::AmbiguousMimeType {
+                mime_type,
+                candidates,
+            } => write!(
+                formatter,
+                "ambiguous MIME type '{mime_type}' matched multiple codecs: {}",
+                candidates
+                    .iter()
+                    .map(FormatId::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::AmbiguousFileExtension {
+                extension,
+                candidates,
+            } => write!(
+                formatter,
+                "ambiguous file extension '{extension}' matched multiple codecs: {}",
+                candidates
+                    .iter()
+                    .map(FormatId::as_str)
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            Self::Parse { format_id, message } => {
+                write!(formatter, "codec '{format_id}' failed to parse input: {message}")
+            }
+            Self::Serialize { format_id, message } => {
+                write!(formatter, "codec '{format_id}' failed to serialize document: {message}")
+            }
+        }
     }
 }
 
 impl std::error::Error for CodecError {}
 
-/// Pluggable document serializer and deserializer (for example Markdown, HTML, JSON, or host formats).
+/// Pluggable document serializer and deserializer bound to an associated [`Self::Format`] marker.
 pub trait DocumentCodec {
+    /// Marker type distinguishing this codec's [`EncodedDocument`] from other formats at compile time.
+    type Format: 'static;
+
     /// Stable short identifier such as `"markdown"`, `"html"`, or `"json"`.
     fn format_id(&self) -> &str;
 
@@ -48,17 +319,66 @@ pub trait DocumentCodec {
     /// Supported file extensions (without leading dot) such as `["md", "markdown"]`.
     fn file_extensions(&self) -> &[&str];
 
-    /// Serializes `document` into this codec's textual format.
-    fn encode(&self, document: &Document) -> Result<String, CodecError>;
+    /// Serializes `document` into a format-tagged [`EncodedDocument`].
+    fn encode(&self, document: &Document) -> Result<EncodedDocument<Self::Format>, CodecError>;
 
-    /// Parses `input` into a fresh [`Document`].
-    fn decode(&self, input: &str) -> Result<Document, CodecError>;
+    /// Parses a format-tagged [`EncodedDocument`] into a fresh [`Document`].
+    fn decode(&self, input: &EncodedDocument<Self::Format>) -> Result<Document, CodecError>;
+
+    /// Explicit fallible decode from untrusted raw text (for example from disk or network).
+    fn decode_raw(&self, input: &str) -> Result<Document, CodecError> {
+        let candidate = EncodedDocument::<Self::Format>::from_raw(input);
+        self.decode(&candidate)
+    }
 }
 
-/// Registry of pluggable [`DocumentCodec`] implementations indexed by format ID, MIME type, or extension.
+/// Format-erased dynamic codec interface exposed only inside [`CodecRegistry`] lookup.
+pub trait DynamicDocumentCodec {
+    /// Stable short identifier such as `"markdown"`, `"html"`, or `"json"`.
+    fn format_id(&self) -> &str;
+
+    /// Supported MIME types such as `["text/markdown"]`.
+    fn mime_types(&self) -> &[&str];
+
+    /// Supported file extensions (without leading dot) such as `["md", "markdown"]`.
+    fn file_extensions(&self) -> &[&str];
+
+    /// Serializes `document` into raw text.
+    fn encode_raw(&self, document: &Document) -> Result<String, CodecError>;
+
+    /// Parses untrusted raw text into a fresh [`Document`].
+    fn decode_raw(&self, input: &str) -> Result<Document, CodecError>;
+}
+
+struct ErasedCodec<C>(C);
+
+impl<C: DocumentCodec> DynamicDocumentCodec for ErasedCodec<C> {
+    fn format_id(&self) -> &str {
+        self.0.format_id()
+    }
+
+    fn mime_types(&self) -> &[&str] {
+        self.0.mime_types()
+    }
+
+    fn file_extensions(&self) -> &[&str] {
+        self.0.file_extensions()
+    }
+
+    fn encode_raw(&self, document: &Document) -> Result<String, CodecError> {
+        self.0.encode(document).map(EncodedDocument::into_string)
+    }
+
+    fn decode_raw(&self, input: &str) -> Result<Document, CodecError> {
+        self.0.decode_raw(input)
+    }
+}
+
+/// Registry of pluggable [`DocumentCodec`] implementations indexed by [`FormatId`], [`MimeType`],
+/// or [`FileExtension`].
 #[derive(Default)]
 pub struct CodecRegistry {
-    codecs: Vec<Box<dyn DocumentCodec>>,
+    codecs: Vec<Box<dyn DynamicDocumentCodec>>,
 }
 
 impl CodecRegistry {
@@ -70,69 +390,148 @@ impl CodecRegistry {
     /// Creates a registry pre-populated with [`MarkdownCodec`], [`HtmlCodec`], and [`JsonCodec`].
     pub fn with_builtin_codecs() -> Self {
         let mut registry = Self::new();
-        registry.register(MarkdownCodec);
-        registry.register(HtmlCodec::default());
-        registry.register(JsonCodec);
+        for registration in [
+            registry.register(MarkdownCodec),
+            registry.register(HtmlCodec::default()),
+            registry.register(JsonCodec),
+        ] {
+            if let Err(error) = registration {
+                debug_assert!(false, "built-in codec registration failed: {error}");
+            }
+        }
         registry
     }
 
-    /// Registers `codec`, replacing any previously registered codec sharing the same `format_id`.
-    pub fn register(&mut self, codec: impl DocumentCodec + 'static) {
-        let target_id = codec.format_id().to_ascii_lowercase();
-        self.codecs
-            .retain(|existing| !existing.format_id().eq_ignore_ascii_case(&target_id));
-        self.codecs.push(Box::new(codec));
+    /// Registers `codec`, rejecting duplicate format identifiers (case-insensitive).
+    pub fn register<C: DocumentCodec + 'static>(&mut self, codec: C) -> Result<(), CodecError> {
+        let format_id = codec.format_id();
+        if self
+            .codecs
+            .iter()
+            .any(|existing| existing.format_id().eq_ignore_ascii_case(format_id))
+        {
+            return Err(CodecError::DuplicateFormatId {
+                format_id: FormatId::new(format_id),
+            });
+        }
+        self.codecs.push(Box::new(ErasedCodec(codec)));
+        Ok(())
     }
 
-    /// Looks up a registered codec by its `format_id` (case-insensitive).
-    pub fn get(&self, format_id: &str) -> Option<&dyn DocumentCodec> {
+    /// Looks up a registered codec by its [`FormatId`] (case-insensitive).
+    pub fn get(&self, format_id: &FormatId) -> Result<&dyn DynamicDocumentCodec, CodecError> {
         self.codecs
             .iter()
-            .find(|codec| codec.format_id().eq_ignore_ascii_case(format_id))
+            .find(|codec| codec.format_id().eq_ignore_ascii_case(format_id.as_str()))
             .map(Box::as_ref)
+            .ok_or_else(|| CodecError::UnknownFormatId {
+                format_id: format_id.clone(),
+            })
     }
 
-    /// Looks up a registered codec matching a MIME type (case-insensitive).
-    pub fn get_by_mime(&self, mime_type: &str) -> Option<&dyn DocumentCodec> {
-        self.codecs
+    /// Looks up a registered codec matching `mime_type` (case-insensitive), reporting ambiguity
+    /// when multiple codecs claim the same MIME type.
+    pub fn get_by_mime(
+        &self,
+        mime_type: &MimeType,
+    ) -> Result<&dyn DynamicDocumentCodec, CodecError> {
+        let matches: Vec<&dyn DynamicDocumentCodec> = self
+            .codecs
             .iter()
-            .find(|codec| {
+            .filter(|codec| {
                 codec
                     .mime_types()
                     .iter()
-                    .any(|candidate| candidate.eq_ignore_ascii_case(mime_type))
+                    .any(|candidate| candidate.eq_ignore_ascii_case(mime_type.as_str()))
             })
             .map(Box::as_ref)
+            .collect();
+        match matches.as_slice() {
+            [] => Err(CodecError::UnknownMimeType {
+                mime_type: mime_type.clone(),
+            }),
+            [single] => Ok(*single),
+            many => Err(CodecError::AmbiguousMimeType {
+                mime_type: mime_type.clone(),
+                candidates: many
+                    .iter()
+                    .map(|codec| FormatId::new(codec.format_id()))
+                    .collect(),
+            }),
+        }
     }
 
-    /// Looks up a registered codec matching a file extension (with or without leading dot).
-    pub fn get_by_extension(&self, extension: &str) -> Option<&dyn DocumentCodec> {
-        let trimmed = extension.trim_start_matches('.');
-        self.codecs
+    /// Looks up a registered codec matching `extension`, reporting ambiguity when multiple codecs
+    /// claim the same suffix.
+    pub fn get_by_extension(
+        &self,
+        extension: &FileExtension,
+    ) -> Result<&dyn DynamicDocumentCodec, CodecError> {
+        let trimmed = extension.as_str().trim_start_matches('.');
+        let matches: Vec<&dyn DynamicDocumentCodec> = self
+            .codecs
             .iter()
-            .find(|codec| {
+            .filter(|codec| {
                 codec
                     .file_extensions()
                     .iter()
                     .any(|candidate| candidate.eq_ignore_ascii_case(trimmed))
             })
             .map(Box::as_ref)
+            .collect();
+        match matches.as_slice() {
+            [] => Err(CodecError::UnknownFileExtension {
+                extension: extension.clone(),
+            }),
+            [single] => Ok(*single),
+            many => Err(CodecError::AmbiguousFileExtension {
+                extension: extension.clone(),
+                candidates: many
+                    .iter()
+                    .map(|codec| FormatId::new(codec.format_id()))
+                    .collect(),
+            }),
+        }
     }
 
     /// Encodes `document` using the codec registered for `format_id`.
-    pub fn encode_as(&self, format_id: &str, document: &Document) -> Result<String, CodecError> {
-        let codec = self
-            .get(format_id)
-            .ok_or_else(|| CodecError::new(format!("unknown document codec: {format_id}")))?;
-        codec.encode(document)
+    pub fn encode_as(
+        &self,
+        format_id: &FormatId,
+        document: &Document,
+    ) -> Result<String, CodecError> {
+        let codec = self.get(format_id)?;
+        codec.encode_raw(document)
     }
 
-    /// Decodes `input` using the codec registered for `format_id`.
-    pub fn decode_as(&self, format_id: &str, input: &str) -> Result<Document, CodecError> {
-        let codec = self
-            .get(format_id)
-            .ok_or_else(|| CodecError::new(format!("unknown document codec: {format_id}")))?;
-        codec.decode(input)
+    /// Decodes raw `input` using the codec registered for `format_id`.
+    pub fn decode_as(
+        &self,
+        format_id: &FormatId,
+        input: &str,
+    ) -> Result<Document, CodecError> {
+        let codec = self.get(format_id)?;
+        codec.decode_raw(input)
+    }
+
+    /// Decodes raw `input` using the unique codec matching `mime_type`.
+    pub fn decode_by_mime(
+        &self,
+        mime_type: &MimeType,
+        input: &str,
+    ) -> Result<Document, CodecError> {
+        let codec = self.get_by_mime(mime_type)?;
+        codec.decode_raw(input)
+    }
+
+    /// Decodes raw `input` using the unique codec matching `extension`.
+    pub fn decode_by_extension(
+        &self,
+        extension: &FileExtension,
+        input: &str,
+    ) -> Result<Document, CodecError> {
+        let codec = self.get_by_extension(extension)?;
+        codec.decode_raw(input)
     }
 }
 
@@ -141,6 +540,8 @@ impl CodecRegistry {
 pub struct JsonCodec;
 
 impl DocumentCodec for JsonCodec {
+    type Format = JsonFormat;
+
     fn format_id(&self) -> &str {
         "json"
     }
@@ -153,14 +554,16 @@ impl DocumentCodec for JsonCodec {
         &["json"]
     }
 
-    fn encode(&self, document: &Document) -> Result<String, CodecError> {
-        document
+    fn encode(&self, document: &Document) -> Result<EncodedDocument<Self::Format>, CodecError> {
+        let text = document
             .to_json_pretty()
-            .map_err(|error| CodecError::new(error.to_string()))
+            .map_err(|error| CodecError::serialize(self.format_id(), error.to_string()))?;
+        Ok(EncodedDocument::from_raw(text))
     }
 
-    fn decode(&self, input: &str) -> Result<Document, CodecError> {
-        Document::from_json(input).map_err(|error| CodecError::new(error.to_string()))
+    fn decode(&self, input: &EncodedDocument<Self::Format>) -> Result<Document, CodecError> {
+        Document::from_json(input.as_str())
+            .map_err(|error| CodecError::parse(self.format_id(), error.to_string()))
     }
 }
 
@@ -178,6 +581,8 @@ impl HtmlCodec {
 }
 
 impl DocumentCodec for HtmlCodec {
+    type Format = HtmlFormat;
+
     fn format_id(&self) -> &str {
         "html"
     }
@@ -190,19 +595,20 @@ impl DocumentCodec for HtmlCodec {
         &["html", "htm"]
     }
 
-    fn encode(&self, document: &Document) -> Result<String, CodecError> {
+    fn encode(&self, document: &Document) -> Result<EncodedDocument<Self::Format>, CodecError> {
         let body = ClipboardFragment::from_document(document).to_html();
-        if self.full_document {
-            Ok(format!(
+        let text = if self.full_document {
+            format!(
                 "<!DOCTYPE html><html><head><meta charset=\"utf-8\"></head><body>{body}</body></html>"
-            ))
+            )
         } else {
-            Ok(body)
-        }
+            body
+        };
+        Ok(EncodedDocument::from_raw(text))
     }
 
-    fn decode(&self, input: &str) -> Result<Document, CodecError> {
-        let fragment = ClipboardFragment::from_html(input);
+    fn decode(&self, input: &EncodedDocument<Self::Format>) -> Result<Document, CodecError> {
+        let fragment = ClipboardFragment::from_html(input.as_str());
         let mut document = Document::new();
         for node in fragment.to_block_nodes(&mut document) {
             document.push_block(node);
@@ -216,6 +622,8 @@ impl DocumentCodec for HtmlCodec {
 pub struct MarkdownCodec;
 
 impl DocumentCodec for MarkdownCodec {
+    type Format = MarkdownFormat;
+
     fn format_id(&self) -> &str {
         "markdown"
     }
@@ -228,14 +636,14 @@ impl DocumentCodec for MarkdownCodec {
         &["md", "markdown"]
     }
 
-    fn encode(&self, document: &Document) -> Result<String, CodecError> {
+    fn encode(&self, document: &Document) -> Result<EncodedDocument<Self::Format>, CodecError> {
         let mut output = String::new();
-        encode_markdown_blocks(&document.blocks, "", &mut output);
-        Ok(output)
+        encode_markdown_blocks(&document.blocks, "", &mut output)?;
+        Ok(EncodedDocument::from_raw(output))
     }
 
-    fn decode(&self, input: &str) -> Result<Document, CodecError> {
-        let normalized = input.replace("\r\n", "\n").replace('\r', "\n");
+    fn decode(&self, input: &EncodedDocument<Self::Format>) -> Result<Document, CodecError> {
+        let normalized = input.as_str().replace("\r\n", "\n").replace('\r', "\n");
         let lines: Vec<&str> = normalized.split('\n').collect();
         let mut document = Document::new();
         let blocks = parse_markdown_blocks(&lines, &mut document);
@@ -250,7 +658,11 @@ impl DocumentCodec for MarkdownCodec {
 // Markdown Encoding
 // ============================================================================
 
-fn encode_markdown_blocks(blocks: &[BlockNode], line_prefix: &str, output: &mut String) {
+fn encode_markdown_blocks(
+    blocks: &[BlockNode],
+    line_prefix: &str,
+    output: &mut String,
+) -> Result<(), CodecError> {
     let mut ordered_counters: HashMap<(ListId, u8), usize> = HashMap::new();
 
     for (index, block) in blocks.iter().enumerate() {
@@ -346,8 +758,8 @@ fn encode_markdown_blocks(blocks: &[BlockNode], line_prefix: &str, output: &mut 
                 }
                 _ => {
                     output.push_str(line_prefix);
-                    let payload =
-                        serde_json::to_string(data).unwrap_or_else(|_| "null".into());
+                    let payload = serde_json::to_string(data)
+                        .map_err(|error| CodecError::serialize("markdown", error.to_string()))?;
                     output.push_str(&format!("<!-- gpui-rich:{kind} {payload} -->\n"));
                     let rendered = encode_markdown_inline(content);
                     for (line_idx, line) in rendered.split('\n').enumerate() {
@@ -366,14 +778,14 @@ fn encode_markdown_blocks(blocks: &[BlockNode], line_prefix: &str, output: &mut 
             } => {
                 if kind.as_ref() == block_kinds::BLOCKQUOTE {
                     let nested_prefix = format!("{line_prefix}> ");
-                    encode_markdown_blocks(children, &nested_prefix, output);
+                    encode_markdown_blocks(children, &nested_prefix, output)?;
                 } else {
                     output.push_str(line_prefix);
-                    let payload =
-                        serde_json::to_string(data).unwrap_or_else(|_| "null".into());
+                    let payload = serde_json::to_string(data)
+                        .map_err(|error| CodecError::serialize("markdown", error.to_string()))?;
                     output.push_str(&format!("<!-- gpui-rich:{kind} {payload} -->\n"));
                     let nested_prefix = format!("{line_prefix}> ");
-                    encode_markdown_blocks(children, &nested_prefix, output);
+                    encode_markdown_blocks(children, &nested_prefix, output)?;
                 }
             }
             BlockKind::Grid { table, .. } => {
@@ -385,13 +797,14 @@ fn encode_markdown_blocks(blocks: &[BlockNode], line_prefix: &str, output: &mut 
                     output.push_str("---");
                 } else {
                     output.push_str(line_prefix);
-                    let payload =
-                        serde_json::to_string(data).unwrap_or_else(|_| "null".into());
+                    let payload = serde_json::to_string(data)
+                        .map_err(|error| CodecError::serialize("markdown", error.to_string()))?;
                     output.push_str(&format!("<!-- gpui-rich:{kind} {payload} -->"));
                 }
             }
         }
     }
+    Ok(())
 }
 
 fn encode_markdown_table(table: &TableBlock, line_prefix: &str, output: &mut String) {
@@ -571,7 +984,7 @@ fn parse_markdown_blocks(lines: &[&str], document: &mut Document) -> Vec<BlockNo
             let id = document.alloc_block_id();
             blocks.push(BlockNode::new(
                 id,
-                BlockKind::leaf(kind, data),
+                BlockKind::raw_leaf(kind, data),
                 BlockStyle {
                     space_before_pt: Some(6.0),
                     space_after_pt: Some(8.0),
@@ -1041,7 +1454,7 @@ fn parse_markdown_inline_into(input: &str, active_style: &InlineStyle, output: &
             flush_plain(&mut plain_buffer, output);
             output.push_object(
                 InlineObject::Image {
-                    asset_id: src.to_string(),
+                    asset_id: ImageAssetId::new(src),
                     alt: alt.to_string(),
                     width_pt: 240.0,
                     height_pt: 150.0,

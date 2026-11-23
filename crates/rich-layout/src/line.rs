@@ -1144,7 +1144,16 @@ fn itemize_and_shape<S: TextShaper>(
                     });
                 } else if let Some(entry) = content.object_at(abs_idx) {
                     let object = shaper.resolve_inline_object(&entry.object).unwrap_or_else(|| entry.object.clone());
-                    let metrics = shaper.measure_inline_object(&object, zoom);
+                    let raw_metrics = shaper.measure_inline_object(&object, zoom);
+                    let metrics = if raw_metrics.is_valid() {
+                        raw_metrics
+                    } else {
+                        InlineBoxMetrics {
+                            width: pt_to_px(72.0, zoom),
+                            height: pt_to_px(18.0, zoom),
+                            valign: InlineVAlign::Middle,
+                        }
+                    };
                     items.push(ShapedItem::InlineBox {
                         doc_range: abs_idx..(abs_idx + ch_len),
                         object_id: entry.id,

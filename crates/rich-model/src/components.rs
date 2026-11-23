@@ -65,7 +65,7 @@ impl BuildingBlock {
         status_data["fallback"] = option.label.clone().into();
         let mut status_value = InlineContent::empty();
         status_value.push_object(
-            InlineObject::custom(DROPDOWN_KIND, CustomPayload::from_json(status_data)),
+            InlineObject::raw_custom(DROPDOWN_KIND, CustomPayload::from_json(status_data)),
             Default::default(),
         );
         let mut assignee = InlineContent::empty();
@@ -286,10 +286,14 @@ pub enum PlaceholderKind {
 
 impl PlaceholderKind {
     pub fn object(self, label: &str) -> InlineObject {
-        InlineObject::custom(
+        InlineObject::raw_custom(
             PLACEHOLDER_KIND,
             CustomPayload::from_json(serde_json::json!({"kind": self.as_str(), "label": label})),
         )
+    }
+
+    pub fn filled_object(payload: serde_json::Value) -> InlineObject {
+        InlineObject::raw_custom(PLACEHOLDER_KIND, CustomPayload::from_json(payload))
     }
 
     pub const fn as_str(self) -> &'static str {
@@ -342,6 +346,16 @@ impl ComponentCommand {
         selected_option_id: impl Into<String>,
     ) -> serde_json::Value {
         serde_json::json!({"definition_id": definition_id.into(), "selected_option_id": selected_option_id.into()})
+    }
+
+    /// Constructs a built-in dropdown component inline object.
+    pub fn dropdown_object(payload: serde_json::Value) -> InlineObject {
+        InlineObject::raw_custom(DROPDOWN_KIND, CustomPayload::from_json(payload))
+    }
+
+    /// Constructs a built-in variable component inline object.
+    pub fn variable_object(payload: serde_json::Value) -> InlineObject {
+        InlineObject::raw_custom(VARIABLE_KIND, CustomPayload::from_json(payload))
     }
 
     pub fn variable_payload(

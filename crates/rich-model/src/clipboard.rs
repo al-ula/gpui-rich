@@ -2,12 +2,13 @@
 //! and normalized HTML parsing for copy/paste.
 
 use crate::block::{
-    BlockKind, BlockNode, ColumnSpec, Document, ListId, ListKind, NumberStyle, TableBlock,
-    TableBorderStyle, TableCell, TableRow, block_kinds,
+    BlockKind, BlockNode, BlockShapeKind, ColumnSpec, Document, ListId, ListKind, NumberStyle,
+    TableBlock, TableBorderStyle, TableCell, TableRow, block_kinds,
 };
 use crate::components::PlaceholderKind;
 use crate::inline::{
-    ChipKind, InlineContent, InlineObject, InlineVAlign, OBJECT_REPLACEMENT_CHAR,
+    ChipKind, ImageAssetId, InlineContent, InlineObject, InlineVAlign, OBJECT_REPLACEMENT_CHAR,
+    OBJECT_REPLACEMENT_UTF8_LEN,
 };
 use crate::payload::CustomPayload;
 use crate::selection::DocumentSelection;
@@ -15,17 +16,64 @@ use crate::style::{
     BaselineShift, BlockStyle, FontWeight, InlineStyle, LinkTarget, RgbaColor, SharedStr, StyleId,
     TextAlign, UnderlineKind,
 };
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 
-/// Custom node clipboard fallback formatter implemented by host registries (such as `ExtensionRegistry`).
+/// Current wire version for same-process structured [`ClipboardFragment`] serialization.
+pub const CLIPBOARD_FRAGMENT_VERSION: u32 = 1;
+
+/// Failure returned when decoding or validating a versioned structured [`ClipboardFragment`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ClipboardFragmentError {
+    /// Input was not valid JSON or did not match the versioned fragment envelope.
+    Parse(String),
+    /// Envelope version is not supported by this library version.
+    UnsupportedVersion { found: u32, expected: u32 },
+    /// Fragment violated structural invariants such as UTF-8 boundaries or object sentinels.
+    Malformed(String),
+}
+
+impl fmt::Display for ClipboardFragmentError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Parse(message) => write!(formatter, "clipboard fragment parse error: {message}"),
+            Self::UnsupportedVersion { found, expected } => write!(
+                formatter,
+                "unsupported clipboard fragment version {found} (expected {expected})"
+            ),
+            Self::Malformed(message) => {
+                write!(formatter, "malformed clipboard fragment: {message}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ClipboardFragmentError {}
+
+/// Custom node clipboard presentation formatter implemented by host registries
+/// (such as `ExtensionRegistry`).
+///
+/// Controls readable plain-text and HTML output only. Same-process structured clipboard fragments
+/// preserve custom node kinds, shapes, and payloads independently of this formatter.
 pub trait ClipboardCustomFormatter {
-    fn plain_text_block(&self, kind: &str, data: &CustomPayload) -> Option<String> {
-        let _ = (kind, data);
+    fn plain_text_block(
+        &self,
+        shape: BlockShapeKind,
+        kind: &str,
+        data: &CustomPayload,
+    ) -> Option<String> {
+        let _ = (shape, kind, data);
         None
     }
 
-    fn html_block(&self, kind: &str, data: &CustomPayload) -> Option<String> {
-        let _ = (kind, data);
+    fn html_block(
+        &self,
+        shape: BlockShapeKind,
+        kind: &str,
+        data: &CustomPayload,
+    ) -> Option<String> {
+        let _ = (shape, kind, data);
         None
     }
 
@@ -47,7 +95,7 @@ pub struct DefaultClipboardFormatter;
 impl ClipboardCustomFormatter for DefaultClipboardFormatter {}
 
 /// Serializable block inside a [`ClipboardFragment`].
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum ClipboardBlock {
     Paragraph {
         content: InlineContent,
@@ -88,38 +136,51 @@ pub enum ClipboardBlock {
         data: CustomPayload,
         children: Vec<ClipboardBlock>,
     },
+    CustomGrid {
+        kind: SharedStr,
+        data: CustomPayload,
+        table: ClipboardTable,
+    },
 }
 
 /// Portable table representation inside a [`ClipboardFragment`].
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClipboardTable {
     pub rows: Vec<ClipboardTableRow>,
+    #[serde(default)]
     pub column_kinds: BTreeMap<usize, PlaceholderKind>,
 }
 
 /// Portable table row inside a [`ClipboardTable`].
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClipboardTableRow {
     pub is_header: bool,
     pub cells: Vec<ClipboardTableCell>,
 }
 
 /// Portable table cell inside a [`ClipboardTableRow`].
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct ClipboardTableCell {
     pub colspan: u16,
     pub rowspan: u16,
     pub blocks: Vec<ClipboardBlock>,
 }
 
-/// Structured rich clipboard payload convertible to/from `text/html` and `text/plain`.
-#[derive(Clone, Debug, Default, PartialEq)]
+/// Structured rich clipboard payload convertible to/from `text/html`, `text/plain`, and versioned
+/// same-process JSON metadata.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
 pub struct ClipboardFragment {
     pub blocks: Vec<ClipboardBlock>,
     /// The leading block boundary was not selected; this fragment starts inside its text.
     pub start_open: bool,
     /// The trailing block boundary was not selected; this fragment ends inside its text.
     pub end_open: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct VersionedClipboardFragment {
+    version: u32,
+    fragment: ClipboardFragment,
 }
 
 impl ClipboardFragment {
@@ -228,6 +289,124 @@ impl ClipboardFragment {
             && self.end_open
             && matches!(self.blocks.as_slice(), [ClipboardBlock::Paragraph { .. }])
     }
+
+    /// Serializes this fragment into a versioned JSON envelope for same-process rich clipboard paste.
+    pub fn to_versioned_json(&self) -> Result<String, serde_json::Error> {
+        let envelope = VersionedClipboardFragment {
+            version: CLIPBOARD_FRAGMENT_VERSION,
+            fragment: self.clone(),
+        };
+        serde_json::to_string(&envelope)
+    }
+
+    /// Parses and structurally validates a versioned JSON fragment envelope.
+    ///
+    /// Unknown custom node kinds are accepted as opaque data. Unsupported versions, invalid JSON,
+    /// broken UTF-8 span boundaries, and missing inline object sentinels are rejected.
+    pub fn from_versioned_json(input: &str) -> Result<Self, ClipboardFragmentError> {
+        let envelope: VersionedClipboardFragment = serde_json::from_str(input)
+            .map_err(|error| ClipboardFragmentError::Parse(error.to_string()))?;
+        if envelope.version != CLIPBOARD_FRAGMENT_VERSION {
+            return Err(ClipboardFragmentError::UnsupportedVersion {
+                found: envelope.version,
+                expected: CLIPBOARD_FRAGMENT_VERSION,
+            });
+        }
+        let mut fragment = envelope.fragment;
+        validate_clipboard_blocks(&mut fragment.blocks)?;
+        Ok(fragment)
+    }
+}
+
+fn validate_clipboard_blocks(blocks: &mut [ClipboardBlock]) -> Result<(), ClipboardFragmentError> {
+    for block in blocks {
+        match block {
+            ClipboardBlock::Paragraph { content, .. }
+            | ClipboardBlock::Heading { content, .. }
+            | ClipboardBlock::ListItem { content, .. }
+            | ClipboardBlock::CodeBlock { content, .. }
+            | ClipboardBlock::CustomText { content, .. } => {
+                validate_inline_content(content)?;
+            }
+            ClipboardBlock::Blockquote(children)
+            | ClipboardBlock::CustomContainer { children, .. } => {
+                validate_clipboard_blocks(children)?;
+            }
+            ClipboardBlock::Table(table) | ClipboardBlock::CustomGrid { table, .. } => {
+                validate_clipboard_table(table)?;
+            }
+            ClipboardBlock::HorizontalRule | ClipboardBlock::Custom { .. } => {}
+        }
+    }
+    Ok(())
+}
+
+fn validate_clipboard_table(table: &mut ClipboardTable) -> Result<(), ClipboardFragmentError> {
+    for row in &mut table.rows {
+        for cell in &mut row.cells {
+            if cell.colspan == 0 || cell.rowspan == 0 {
+                return Err(ClipboardFragmentError::Malformed(
+                    "table cell colspan and rowspan must be at least 1".to_owned(),
+                ));
+            }
+            validate_clipboard_blocks(&mut cell.blocks)?;
+        }
+    }
+    Ok(())
+}
+
+fn validate_inline_content(content: &mut InlineContent) -> Result<(), ClipboardFragmentError> {
+    let text_len = content.text.len();
+    let mut previous_end = 0usize;
+    for span in &content.spans {
+        if span.range.start > span.range.end || span.range.end > text_len {
+            return Err(ClipboardFragmentError::Malformed(format!(
+                "inline span range {:?} out of bounds for text length {text_len}",
+                span.range
+            )));
+        }
+        if !content.text.is_char_boundary(span.range.start)
+            || !content.text.is_char_boundary(span.range.end)
+        {
+            return Err(ClipboardFragmentError::Malformed(format!(
+                "inline span range {:?} does not align to UTF-8 boundaries",
+                span.range
+            )));
+        }
+        if span.range.start < previous_end {
+            return Err(ClipboardFragmentError::Malformed(
+                "inline spans overlap or are out of order".to_owned(),
+            ));
+        }
+        previous_end = span.range.end;
+    }
+
+    let mut previous_object_end = 0usize;
+    for entry in &content.objects {
+        let Some(end) = entry.byte_offset.checked_add(OBJECT_REPLACEMENT_UTF8_LEN) else {
+            return Err(ClipboardFragmentError::Malformed(
+                "inline object byte offset overflow".to_owned(),
+            ));
+        };
+        if end > text_len
+            || !content.text.is_char_boundary(entry.byte_offset)
+            || !content.text[entry.byte_offset..].starts_with(OBJECT_REPLACEMENT_CHAR)
+        {
+            return Err(ClipboardFragmentError::Malformed(format!(
+                "inline object at byte {} does not match U+FFFC sentinel",
+                entry.byte_offset
+            )));
+        }
+        if entry.byte_offset < previous_object_end {
+            return Err(ClipboardFragmentError::Malformed(
+                "inline objects overlap or are out of order".to_owned(),
+            ));
+        }
+        previous_object_end = end;
+    }
+
+    content.normalize();
+    Ok(())
 }
 
 impl Document {
@@ -552,29 +731,40 @@ fn block_node_to_clipboard_block(block: &BlockNode) -> ClipboardBlock {
                 }
             }
         }
-        BlockKind::Grid { table, .. } => ClipboardBlock::Table(ClipboardTable {
-            column_kinds: table.column_kinds.clone(),
-            rows: table
-                .rows
-                .iter()
-                .map(|row| ClipboardTableRow {
-                    is_header: row.is_header,
-                    cells: row
-                        .cells
-                        .iter()
-                        .map(|cell| ClipboardTableCell {
-                            colspan: cell.colspan,
-                            rowspan: cell.rowspan,
-                            blocks: cell
-                                .blocks
-                                .iter()
-                                .map(block_node_to_clipboard_block)
-                                .collect(),
-                        })
-                        .collect(),
-                })
-                .collect(),
-        }),
+        BlockKind::Grid { kind, data, table } => {
+            let clipboard_table = ClipboardTable {
+                column_kinds: table.column_kinds.clone(),
+                rows: table
+                    .rows
+                    .iter()
+                    .map(|row| ClipboardTableRow {
+                        is_header: row.is_header,
+                        cells: row
+                            .cells
+                            .iter()
+                            .map(|cell| ClipboardTableCell {
+                                colspan: cell.colspan,
+                                rowspan: cell.rowspan,
+                                blocks: cell
+                                    .blocks
+                                    .iter()
+                                    .map(block_node_to_clipboard_block)
+                                    .collect(),
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+            };
+            if kind.as_ref() == block_kinds::TABLE {
+                ClipboardBlock::Table(clipboard_table)
+            } else {
+                ClipboardBlock::CustomGrid {
+                    kind: kind.clone(),
+                    data: data.clone(),
+                    table: clipboard_table,
+                }
+            }
+        }
         BlockKind::Leaf { kind, data } => {
             if kind.as_ref() == block_kinds::HORIZONTAL_RULE {
                 ClipboardBlock::HorizontalRule
@@ -671,7 +861,7 @@ fn extract_partial_node(
                 })
             }
         }
-        BlockKind::Grid { table, .. } => {
+        BlockKind::Grid { kind, data, table } => {
             let mut rows = Vec::with_capacity(table.rows.len());
             for row in &table.rows {
                 let mut cells = Vec::new();
@@ -727,7 +917,19 @@ fn extract_partial_node(
                     cells,
                 });
             }
-            Some(ClipboardBlock::Table(ClipboardTable { rows, column_kinds: Default::default() }))
+            let clipboard_table = ClipboardTable {
+                rows,
+                column_kinds: Default::default(),
+            };
+            if kind.as_ref() == block_kinds::TABLE {
+                Some(ClipboardBlock::Table(clipboard_table))
+            } else {
+                Some(ClipboardBlock::CustomGrid {
+                    kind: kind.clone(),
+                    data: data.clone(),
+                    table: clipboard_table,
+                })
+            }
         }
         BlockKind::Leaf { .. } => {
             if *cursor > start_index && *cursor <= end_index {
@@ -927,7 +1129,7 @@ fn clipboard_block_to_node(
                 space_after_pt: Some(8.0),
                 ..BlockStyle::default()
             };
-            BlockNode::new(id, BlockKind::leaf(kind.clone(), data.clone()), style)
+            BlockNode::new(id, BlockKind::raw_leaf(kind.clone(), data.clone()), style)
         }
         ClipboardBlock::CustomText {
             kind,
@@ -936,7 +1138,7 @@ fn clipboard_block_to_node(
             align,
         } => BlockNode::new(
             id,
-            BlockKind::text(kind.clone(), data.clone(), content.clone()),
+            BlockKind::raw_text(kind.clone(), data.clone(), content.clone()),
             BlockStyle::default().with_align(*align),
         ),
         ClipboardBlock::CustomContainer {
@@ -963,8 +1165,67 @@ fn clipboard_block_to_node(
             };
             BlockNode::new(
                 id,
-                BlockKind::container(kind.clone(), data.clone(), child_nodes),
+                BlockKind::raw_container(kind.clone(), data.clone(), child_nodes),
                 style,
+            )
+        }
+        ClipboardBlock::CustomGrid { kind, data, table } => {
+            let column_count = table
+                .rows
+                .iter()
+                .map(|row| {
+                    row.cells
+                        .iter()
+                        .map(|cell| cell.colspan.max(1) as usize)
+                        .sum::<usize>()
+                })
+                .max()
+                .unwrap_or(1)
+                .max(1);
+            let rows = table
+                .rows
+                .iter()
+                .map(|row| TableRow {
+                    is_header: row.is_header,
+                    cells: row
+                        .cells
+                        .iter()
+                        .map(|cell| {
+                            let cell_id = document.alloc_block_id();
+                            let mut cell_blocks: Vec<BlockNode> = cell
+                                .blocks
+                                .iter()
+                                .map(|inner| clipboard_block_to_node(inner, document, list_id_map))
+                                .collect();
+                            if cell_blocks.is_empty() {
+                                let para_id = document.alloc_block_id();
+                                cell_blocks.push(BlockNode::new(
+                                    para_id,
+                                    BlockKind::paragraph(InlineContent::empty()),
+                                    BlockStyle::default(),
+                                ));
+                            }
+                            let mut table_cell = TableCell::simple(cell_id, cell_blocks);
+                            table_cell.colspan = cell.colspan.max(1);
+                            table_cell.rowspan = cell.rowspan.max(1);
+                            table_cell
+                        })
+                        .collect(),
+                })
+                .collect();
+            BlockNode::new(
+                id,
+                BlockKind::raw_grid(
+                    kind.clone(),
+                    data.clone(),
+                    TableBlock {
+                        columns: vec![ColumnSpec::Auto; column_count],
+                        column_kinds: table.column_kinds.clone(),
+                        rows,
+                        border_style: TableBorderStyle::default(),
+                    },
+                ),
+                BlockStyle::default(),
             )
         }
     }
@@ -974,6 +1235,27 @@ fn clipboard_block_to_node(
 // Plain-Text Serialization
 // ============================================================================
 
+fn table_to_plain_text(table: &ClipboardTable, formatter: &dyn ClipboardCustomFormatter) -> String {
+    table
+        .rows
+        .iter()
+        .map(|row| {
+            row.cells
+                .iter()
+                .map(|cell| {
+                    cell.blocks
+                        .iter()
+                        .map(|inner| block_to_plain_text(inner, formatter))
+                        .collect::<Vec<_>>()
+                        .join(" ")
+                })
+                .collect::<Vec<_>>()
+                .join("\t")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 fn block_to_plain_text(
     block: &ClipboardBlock,
     formatter: &dyn ClipboardCustomFormatter,
@@ -982,8 +1264,24 @@ fn block_to_plain_text(
         ClipboardBlock::Paragraph { content, .. }
         | ClipboardBlock::Heading { content, .. }
         | ClipboardBlock::ListItem { content, .. }
-        | ClipboardBlock::CodeBlock { content, .. }
-        | ClipboardBlock::CustomText { content, .. } => inline_to_plain_text(content, formatter),
+        | ClipboardBlock::CodeBlock { content, .. } => inline_to_plain_text(content, formatter),
+        ClipboardBlock::CustomText {
+            kind,
+            data,
+            content,
+            ..
+        } => {
+            let body = inline_to_plain_text(content, formatter);
+            if let Some(prefix) = formatter.plain_text_block(BlockShapeKind::Text, kind, data) {
+                if body.is_empty() {
+                    prefix
+                } else {
+                    format!("{prefix}\n{body}")
+                }
+            } else {
+                body
+            }
+        }
         ClipboardBlock::Blockquote(children) => children
             .iter()
             .map(|child| block_to_plain_text(child, formatter))
@@ -999,7 +1297,8 @@ fn block_to_plain_text(
                 .map(|child| block_to_plain_text(child, formatter))
                 .collect::<Vec<_>>()
                 .join("\n");
-            if let Some(prefix) = formatter.plain_text_block(kind, data) {
+            if let Some(prefix) = formatter.plain_text_block(BlockShapeKind::Container, kind, data)
+            {
                 if body.is_empty() {
                     prefix
                 } else {
@@ -1009,27 +1308,22 @@ fn block_to_plain_text(
                 body
             }
         }
-        ClipboardBlock::Table(table) => table
-            .rows
-            .iter()
-            .map(|row| {
-                row.cells
-                    .iter()
-                    .map(|cell| {
-                        cell.blocks
-                            .iter()
-                            .map(|inner| block_to_plain_text(inner, formatter))
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    })
-                    .collect::<Vec<_>>()
-                    .join("\t")
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
+        ClipboardBlock::Table(table) => table_to_plain_text(table, formatter),
+        ClipboardBlock::CustomGrid { kind, data, table } => {
+            let body = table_to_plain_text(table, formatter);
+            if let Some(prefix) = formatter.plain_text_block(BlockShapeKind::Grid, kind, data) {
+                if body.is_empty() {
+                    prefix
+                } else {
+                    format!("{prefix}\n{body}")
+                }
+            } else {
+                body
+            }
+        }
         ClipboardBlock::HorizontalRule => "---".into(),
         ClipboardBlock::Custom { kind, data } => formatter
-            .plain_text_block(kind, data)
+            .plain_text_block(BlockShapeKind::Leaf, kind, data)
             .unwrap_or_else(|| format!("[{kind}]")),
     }
 }
@@ -1207,7 +1501,7 @@ fn write_single_block_html(
             output.push_str("<hr>");
         }
         ClipboardBlock::Custom { kind, data } => {
-            if let Some(custom_html) = formatter.html_block(kind, data) {
+            if let Some(custom_html) = formatter.html_block(BlockShapeKind::Leaf, kind, data) {
                 output.push_str(&custom_html);
             } else {
                 let payload = serde_json::to_string(data).unwrap_or_else(|_| "null".into());
@@ -1218,7 +1512,7 @@ fn write_single_block_html(
                 output.push_str("\">");
                 push_escaped_html(
                     &formatter
-                        .plain_text_block(kind, data)
+                        .plain_text_block(BlockShapeKind::Leaf, kind, data)
                         .unwrap_or_else(|| format!("[{kind}]")),
                     output,
                 );
@@ -1231,30 +1525,45 @@ fn write_single_block_html(
             content,
             align,
         } => {
-            let payload = serde_json::to_string(data).unwrap_or_else(|_| "null".into());
-            output.push_str("<div data-gpui-rich-custom-text=\"");
-            push_escaped_html(kind, output);
-            output.push_str("\" data-gpui-rich-payload=\"");
-            push_escaped_html(&payload, output);
-            output.push('"');
-            write_align_style_attr(*align, output);
-            output.push('>');
-            write_inline_html(content, formatter, output);
-            output.push_str("</div>");
+            if let Some(custom_html) = formatter.html_block(BlockShapeKind::Text, kind, data) {
+                output.push_str(&custom_html);
+            } else {
+                let payload = serde_json::to_string(data).unwrap_or_else(|_| "null".into());
+                output.push_str("<div data-gpui-rich-custom-text=\"");
+                push_escaped_html(kind, output);
+                output.push_str("\" data-gpui-rich-payload=\"");
+                push_escaped_html(&payload, output);
+                output.push('"');
+                write_align_style_attr(*align, output);
+                output.push('>');
+                write_inline_html(content, formatter, output);
+                output.push_str("</div>");
+            }
         }
         ClipboardBlock::CustomContainer {
             kind,
             data,
             children,
         } => {
-            let payload = serde_json::to_string(data).unwrap_or_else(|_| "null".into());
-            output.push_str("<div data-gpui-rich-custom-container=\"");
-            push_escaped_html(kind, output);
-            output.push_str("\" data-gpui-rich-payload=\"");
-            push_escaped_html(&payload, output);
-            output.push_str("\">");
-            write_blocks_html(children, formatter, output);
-            output.push_str("</div>");
+            if let Some(custom_html) = formatter.html_block(BlockShapeKind::Container, kind, data) {
+                output.push_str(&custom_html);
+            } else {
+                let payload = serde_json::to_string(data).unwrap_or_else(|_| "null".into());
+                output.push_str("<div data-gpui-rich-custom-container=\"");
+                push_escaped_html(kind, output);
+                output.push_str("\" data-gpui-rich-payload=\"");
+                push_escaped_html(&payload, output);
+                output.push_str("\">");
+                write_blocks_html(children, formatter, output);
+                output.push_str("</div>");
+            }
+        }
+        ClipboardBlock::CustomGrid { kind, data, table } => {
+            if let Some(custom_html) = formatter.html_block(BlockShapeKind::Grid, kind, data) {
+                output.push_str(&custom_html);
+            } else {
+                write_single_block_html(&ClipboardBlock::Table(table.clone()), formatter, output);
+            }
         }
     }
 }
@@ -1372,7 +1681,7 @@ fn write_inline_object_html(
             ..
         } => {
             output.push_str("<img data-asset-id=\"");
-            push_escaped_html(asset_id, output);
+            push_escaped_html(asset_id.as_str(), output);
             output.push_str("\" alt=\"");
             push_escaped_html(alt, output);
             output.push_str(&format!(
@@ -1952,7 +2261,7 @@ impl HtmlFragmentParser {
             if let Some(block) = self.current_block.as_mut() {
                 block
                     .content
-                    .push_object(InlineObject::custom(custom_inline_kind, data), style);
+                    .push_object(InlineObject::raw_custom(custom_inline_kind, data), style);
             }
             if !self_closing {
                 self.skip_custom_inner_depth = 1;
@@ -2177,7 +2486,7 @@ impl HtmlFragmentParser {
                 if let Some(block) = self.current_block.as_mut() {
                     block.content.push_object(
                         InlineObject::Image {
-                            asset_id,
+                            asset_id: ImageAssetId::new(asset_id),
                             alt,
                             width_pt,
                             height_pt,

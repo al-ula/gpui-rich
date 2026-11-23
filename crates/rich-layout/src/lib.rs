@@ -249,6 +249,25 @@ mod tests {
 
     #[test]
     fn custom_block_and_inline_object_measure_via_shaper() {
+        struct BadgeSpec;
+        impl InlineSpec for BadgeSpec {
+            const KIND: &'static str = "badge";
+            type Data = String;
+        }
+
+        struct CalloutLeafSpec;
+        impl BlockSpec for CalloutLeafSpec {
+            const KIND: &'static str = "callout_leaf";
+            type Shape = block_shape::Leaf;
+            type Data = String;
+        }
+        struct CalloutSpec;
+        impl BlockSpec for CalloutSpec {
+            const KIND: &'static str = "callout";
+            type Shape = block_shape::Container;
+            type Data = String;
+        }
+
         struct CustomMetricShaper;
 
         impl TextShaper for CustomMetricShaper {
@@ -264,9 +283,7 @@ mod tests {
             }
 
             fn measure_inline_object(&mut self, object: &InlineObject, zoom: f32) -> InlineBoxMetrics {
-                if let InlineObject::Custom { kind, .. } = object
-                    && kind.as_ref() == "badge"
-                {
+                if object.read_data::<BadgeSpec>().is_ok() {
                     return InlineBoxMetrics {
                         width: 64.0 * zoom,
                         height: 20.0 * zoom,
@@ -283,7 +300,7 @@ mod tests {
                 max_width: f32,
                 zoom: f32,
             ) -> Size {
-                if kind == "callout_leaf" {
+                if kind == CalloutLeafSpec::KIND {
                     Size::new(max_width, 84.0 * zoom)
                 } else {
                     Size::new(max_width, 40.0 * zoom)
@@ -292,12 +309,13 @@ mod tests {
 
             fn measure_custom_chrome(
                 &mut self,
+                shape: BlockShapeKind,
                 kind: &str,
                 _data: &CustomPayload,
                 _max_width: f32,
                 zoom: f32,
             ) -> Insets {
-                if kind == "callout" {
+                if shape == BlockShapeKind::Container && kind == CalloutSpec::KIND {
                     Insets::new(28.0 * zoom, 12.0 * zoom, 10.0 * zoom, 16.0 * zoom)
                 } else {
                     Insets::xy(12.0 * zoom, 8.0 * zoom)
@@ -309,21 +327,14 @@ mod tests {
         let mut inline = InlineContent::empty();
         inline.push_text("Before ", InlineStyle::default());
         inline.push_object(
-            InlineObject::custom(
-                "badge",
-                CustomPayload::from_json(serde_json::json!({ "label": "PRO" })),
-            ),
+            InlineObject::custom::<BadgeSpec>("PRO".into()),
             InlineStyle::default(),
         );
         document.add_paragraph(inline, BlockStyle::default());
-        let leaf_id = document.add_custom_block(
-            "callout_leaf",
-            CustomPayload::from_json(serde_json::json!({ "title": "Note" })),
-        );
+        let leaf_id = document.add_leaf_block::<CalloutLeafSpec>("Note".into());
         let child_id = document.alloc_block_id();
-        let container_id = document.add_custom_container(
-            "callout",
-            CustomPayload::from_json(serde_json::json!({ "title": "Editable Callout" })),
+        let container_id = document.add_container_block::<CalloutSpec>(
+            "Editable Callout".into(),
             vec![BlockNode::new(
                 child_id,
                 BlockKind::paragraph(InlineContent::plain("Inside container")),
@@ -355,6 +366,112 @@ mod tests {
             .expect("expected hit inside custom container child");
         assert_eq!(hit.pos.leaf_block_id(), Some(child_id));
         assert_eq!(hit.pos.top_level_block_id(), Some(container_id));
+    }
+
+    #[test]
+    fn invalid_custom_metrics_fall_back_and_large_table_culls_offscreen_leaves() {
+        struct BadMetricShaper;
+        impl TextShaper for BadMetricShaper {
+            type Backend = MockBackend;
+            fn shape_segment(
+                &mut self,
+                text: &str,
+                font_size_px: f32,
+                runs: &[ShaperRunSpec],
+            ) -> ShapedSegment<Self::Backend> {
+                MockShaper.shape_segment(text, font_size_px, runs)
+            }
+            fn measure_inline_object(&mut self, _obj: &InlineObject, _zoom: f32) -> InlineBoxMetrics {
+                InlineBoxMetrics {
+                    width: f32::NAN,
+                    height: -10.0,
+                    valign: InlineVAlign::Middle,
+                }
+            }
+            fn measure_custom_block(
+                &mut self,
+                _kind: &str,
+                _data: &CustomPayload,
+                _max_width: f32,
+                _zoom: f32,
+            ) -> Size {
+                Size::new(f32::INFINITY, -5.0)
+            }
+            fn measure_custom_chrome(
+                &mut self,
+                _shape: BlockShapeKind,
+                _kind: &str,
+                _data: &CustomPayload,
+                _max_width: f32,
+                _zoom: f32,
+            ) -> Insets {
+                Insets::new(f32::NAN, -1.0, f32::INFINITY, 4.0)
+            }
+        }
+
+        struct BadLeafSpec;
+        impl BlockSpec for BadLeafSpec {
+            const KIND: &'static str = "bad_leaf";
+            type Shape = block_shape::Leaf;
+            type Data = ();
+        }
+        struct BadInlineSpec;
+        impl InlineSpec for BadInlineSpec {
+            const KIND: &'static str = "bad_inline";
+            type Data = ();
+        }
+
+        let mut doc = Document::new();
+        let mut inline = InlineContent::empty();
+        inline.push_object(InlineObject::custom::<BadInlineSpec>(()), InlineStyle::default());
+        doc.add_paragraph(inline, BlockStyle::default());
+        let leaf_id = doc.add_leaf_block::<BadLeafSpec>(());
+
+        let mut flow = FlowLayout::<MockBackend>::default();
+        let mut bad_shaper = BadMetricShaper;
+        let visible = flow.layout_visible_blocks(&doc, 0.0, 500.0, 500.0, 50.0, 1.0, &mut bad_shaper);
+        assert!(visible[0].layout.height.is_finite() && visible[0].layout.height > 0.0);
+        let leaf = visible.iter().find(|entry| entry.id == leaf_id).unwrap();
+        assert!(leaf.layout.width.is_finite() && leaf.layout.width > 0.0);
+        assert!(leaf.layout.height.is_finite() && leaf.layout.height > 0.0);
+
+        // Large table culling: only rows intersecting viewport + overscan are returned.
+        let mut table_doc = Document::new();
+        let table_id = table_doc.alloc_block_id();
+        let mut rows = Vec::new();
+        for row_index in 0..80 {
+            let cell_id = table_doc.alloc_block_id();
+            let para_id = table_doc.alloc_block_id();
+            rows.push(TableRow {
+                is_header: row_index == 0,
+                cells: vec![TableCell::simple(
+                    cell_id,
+                    vec![BlockNode::new(
+                        para_id,
+                        BlockKind::paragraph(InlineContent::plain(format!("Row {row_index}"))),
+                        BlockStyle::default(),
+                    )],
+                )],
+            });
+        }
+        table_doc.push_block(BlockNode::new(
+            table_id,
+            BlockKind::table(TableBlock {
+                columns: vec![ColumnSpec::Auto],
+                column_kinds: Default::default(),
+                rows,
+                border_style: TableBorderStyle::default(),
+            }),
+            BlockStyle::default(),
+        ));
+
+        let mut table_flow = FlowLayout::<MockBackend>::default();
+        let mut mock_shaper = MockShaper;
+        let table_visible =
+            table_flow.layout_visible_blocks(&table_doc, 0.0, 600.0, 200.0, 40.0, 1.0, &mut mock_shaper);
+        let culled = collect_visible_leaf_paragraphs_in_y_range(&table_visible, -40.0, 240.0);
+        assert!(!culled.is_empty());
+        assert!(culled.len() < 20);
     }
 
     #[test]

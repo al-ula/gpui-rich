@@ -125,11 +125,7 @@ impl RichDocumentView {
                 let mut first = first.clone();
                 first.kind = BlockKind::paragraph(InlineContent::plain(body));
                 first.bump_version();
-                let kind = BlockKind::container(
-                    rich_model::FOOTNOTE_BODY_KIND,
-                    rich_model::CustomPayload::empty(),
-                    vec![first],
-                );
+                let kind = rich_model::footnote_body_kind(vec![first]);
                 self.apply_transaction(
                     Transaction::new(vec![Step::SetBlockKind {
                         block_id: note.block_id,
@@ -176,11 +172,7 @@ impl RichDocumentView {
         );
         let note = BlockNode::new(
             block_id,
-            BlockKind::container(
-                rich_model::FOOTNOTE_BODY_KIND,
-                rich_model::CustomPayload::empty(),
-                vec![paragraph],
-            ),
+            rich_model::footnote_body_kind(vec![paragraph]),
             BlockStyle::default(),
         );
         let mut anchors = self.document.anchors.clone();

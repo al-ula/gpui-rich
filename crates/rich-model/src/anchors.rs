@@ -57,9 +57,17 @@ impl crate::Document {
 }
 
 pub fn footnote_reference(id: AnchorId) -> crate::inline::InlineObject {
-    crate::inline::InlineObject::custom(
+    crate::inline::InlineObject::raw_custom(
         FOOTNOTE_REFERENCE_KIND,
         crate::payload::CustomPayload::typed(FootnoteRefData { id }),
+    )
+}
+
+pub fn footnote_body_kind(children: Vec<crate::block::BlockNode>) -> crate::block::BlockKind {
+    crate::block::BlockKind::raw_container(
+        FOOTNOTE_BODY_KIND,
+        crate::payload::CustomPayload::empty(),
+        children,
     )
 }
 
@@ -73,6 +81,17 @@ pub fn footnote_reference_id(object: &crate::inline::InlineObject) -> Option<Anc
         }
         _ => None,
     }
+}
+
+pub fn footnote_reference_id_from_payload(
+    kind: &str,
+    data: &crate::payload::CustomPayload,
+) -> Option<AnchorId> {
+    if kind != FOOTNOTE_REFERENCE_KIND {
+        return None;
+    }
+    data.as_typed::<FootnoteRefData>()
+        .map(|reference| reference.id)
 }
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum AnchorCommand {

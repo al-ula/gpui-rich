@@ -1,11 +1,14 @@
 use crate::block::{
-    BlockId, BlockKind, BlockNode, ColumnSpec, ContainerTarget, Document, TableCell, TableRow,
+    BlockId, BlockKind, BlockNode, BlockShape, BlockShapeKind, BlockSpec, ColumnSpec,
+    ContainerTarget, Document, TableCell, TableRow,
 };
-use crate::inline::{InlineContent, InlineObject, InlineObjectId, StyleSpan};
+use crate::inline::{InlineContent, InlineObject, InlineObjectId, InlineSpec, StyleSpan};
+use crate::payload::CustomPayload;
 use crate::selection::{Affinity, DocPos, DocumentSelection, PathSegment};
-use crate::style::{BlockStyle, InlineStyle, NamedStyle, StyleId};
+use crate::style::{BlockStyle, InlineStyle, NamedStyle, SharedStr, StyleId};
 use smallvec::SmallVec;
 use std::ops::Range;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 /// Atomic, reversible document mutation step.
@@ -47,6 +50,16 @@ pub enum Step {
     SetBlockKind {
         block_id: BlockId,
         kind: BlockKind,
+    },
+    /// Replaces only the custom payload on `block_id` when its semantic kind and shape match.
+    ///
+    /// Preserves the block ID, style, width mode, and any inline content, children, or grid table.
+    /// Does not mark the change set as structural.
+    UpdateBlockData {
+        block_id: BlockId,
+        expected_kind: SharedStr,
+        expected_shape: BlockShapeKind,
+        data: CustomPayload,
     },
     InsertBlock {
         index: usize,
@@ -105,6 +118,31 @@ pub enum Step {
         block_id: BlockId,
         numbering: Option<crate::structure_edit::ListNumbering>,
     },
+}
+
+impl Step {
+    /// Builds a reversible, payload-only block update checked against [`BlockSpec`] `S`.
+    pub fn update_block_data<S: BlockSpec>(block_id: BlockId, data: S::Data) -> Self {
+        Self::UpdateBlockData {
+            block_id,
+            expected_kind: Arc::from(S::KIND),
+            expected_shape: S::Shape::KIND,
+            data: CustomPayload::typed(data),
+        }
+    }
+
+    /// Builds a reversible, checked inline object payload update using [`Step::UpdateInlineObject`].
+    pub fn update_inline_data<S: InlineSpec>(
+        block_id: BlockId,
+        object_id: InlineObjectId,
+        data: S::Data,
+    ) -> Self {
+        Self::UpdateInlineObject {
+            block_id,
+            object_id,
+            object: InlineObject::custom::<S>(data),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -351,6 +389,33 @@ impl Document {
                         });
                     }
                 }
+                Step::UpdateBlockData {
+                    block_id,
+                    expected_kind,
+                    expected_shape,
+                    data,
+                } => {
+                    let previous_data = self.find_block_mut(block_id).and_then(|block| {
+                        if block.kind.semantic_kind() != expected_kind.as_ref()
+                            || block.kind.shape_kind() != expected_shape
+                        {
+                            return None;
+                        }
+                        let previous = std::mem::replace(block.kind.data_mut(), data);
+                        block.bump_version();
+                        Some(previous)
+                    });
+                    if let Some(previous_data) = previous_data {
+                        change_set.mark_dirty(block_id);
+                        self.bump_ancestors_of_block(block_id, &mut change_set);
+                        inverse_steps.push(Step::UpdateBlockData {
+                            block_id,
+                            expected_kind,
+                            expected_shape,
+                            data: previous_data,
+                        });
+                    }
+                }
                 Step::InsertBlock { index, block } => {
                     let end = if crate::anchors::is_footnote_body(&block) {
                         self.blocks.len()
@@ -359,6 +424,7 @@ impl Document {
                     };
                     let clamped = index.min(end);
                     let id = block.id;
+                    self.advance_next_block_id_for_node(&block);
                     self.blocks.insert(clamped, block);
                     change_set.mark_dirty(id);
                     change_set.structure_changed = true;
@@ -386,6 +452,7 @@ impl Document {
                         index
                     };
                     let id = block.id;
+                    self.advance_next_block_id_for_node(&block);
                     let inserted_index = self.container_blocks_mut(target).map(|blocks| {
                         let clamped = index.min(blocks.len());
                         blocks.insert(clamped, block);
@@ -467,7 +534,10 @@ impl Document {
                     let previous = self
                         .find_block_mut(block_id)
                         .and_then(|block| {
-                            let prev = block.kind.inline_content_mut()?.update_object(object_id, object)?;
+                            let prev = block
+                                .kind
+                                .inline_content_mut()?
+                                .update_object_checked(object_id, object)?;
                             block.bump_version();
                             Some(prev)
                         });
@@ -520,7 +590,9 @@ impl Document {
                                     let InlineObject::Custom { kind, data } = &entry.object else {
                                         return false;
                                     };
-                                    let payload = data.as_json();
+                                    let Ok(payload) = data.as_json() else {
+                                        return false;
+                                    };
                                     match kind.as_ref() {
                                         crate::components::DROPDOWN_KIND => payload.get("definition_id")
                                             .and_then(serde_json::Value::as_str)
@@ -826,7 +898,7 @@ impl Document {
                 )
             } else {
                 (
-                    BlockKind::text(kind.clone(), data.clone(), trailing),
+                    BlockKind::raw_text(kind.clone(), data.clone(), trailing),
                     block.style.clone(),
                 )
             }
@@ -1049,7 +1121,7 @@ impl Document {
         Some(
             Transaction::new(vec![Step::SetBlockKind {
                 block_id: table_id,
-                kind: BlockKind::grid(kind.clone(), data.clone(), next_table),
+                kind: BlockKind::raw_grid(kind.clone(), data.clone(), next_table),
             }])
             .with_selections(selection_before.clone(), selection_before),
         )
@@ -1136,7 +1208,7 @@ impl Document {
         Some(
             Transaction::new(vec![Step::SetBlockKind {
                 block_id: table_id,
-                kind: BlockKind::grid(grid_kind, grid_data, next_table),
+                kind: BlockKind::raw_grid(grid_kind, grid_data, next_table),
             }])
             .with_selections(selection_before, selection_after),
         )
@@ -1246,7 +1318,7 @@ impl Document {
         Some(
             Transaction::new(vec![Step::SetBlockKind {
                 block_id: table_id,
-                kind: BlockKind::grid(grid_kind, grid_data, next_table),
+                kind: BlockKind::raw_grid(grid_kind, grid_data, next_table),
             }])
             .with_selections(selection_before, selection_after),
         )
@@ -1346,7 +1418,7 @@ impl Document {
         Some(
             Transaction::new(vec![Step::SetBlockKind {
                 block_id: table_id,
-                kind: BlockKind::grid(grid_kind, grid_data, next_table),
+                kind: BlockKind::raw_grid(grid_kind, grid_data, next_table),
             }])
             .with_selections(selection_before, selection_after),
         )
@@ -1440,7 +1512,7 @@ impl Document {
         Some(
             Transaction::new(vec![Step::SetBlockKind {
                 block_id: table_id,
-                kind: BlockKind::grid(grid_kind, grid_data, next_table),
+                kind: BlockKind::raw_grid(grid_kind, grid_data, next_table),
             }])
             .with_selections(selection_before, selection_after),
         )
@@ -1595,7 +1667,7 @@ impl Document {
         Some(
             Transaction::new(vec![Step::SetBlockKind {
                 block_id: table_id,
-                kind: BlockKind::grid(grid_kind, grid_data, next_table),
+                kind: BlockKind::raw_grid(grid_kind, grid_data, next_table),
             }])
             .with_selections(selection_before, selection_after),
         )
@@ -1682,7 +1754,7 @@ impl Document {
         Some(
             Transaction::new(vec![Step::SetBlockKind {
                 block_id: table_id,
-                kind: BlockKind::grid(grid_kind, grid_data, next_table),
+                kind: BlockKind::raw_grid(grid_kind, grid_data, next_table),
             }])
             .with_selections(selection_before, selection_after),
         )
