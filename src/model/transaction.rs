@@ -1,6 +1,7 @@
 use crate::model::block::{
-    BlockId, BlockKind, BlockNode, BlockShape, BlockShapeKind, BlockSpec, ColumnSpec,
-    ContainerTarget, Document, TableCell, TableRow,
+    BlockId, BlockKind, BlockNode, BlockShape, BlockShapeKind, BlockSpec, CodeBlockData,
+    ColumnSpec, ContainerTarget, Document, TableBlock, TableBorderStyle, TableCell, TableRow,
+    block_kinds,
 };
 use crate::model::inline::{InlineContent, InlineObject, InlineObjectId, InlineSpec, StyleSpan};
 use crate::model::payload::CustomPayload;
@@ -199,6 +200,16 @@ pub enum TableCellStep {
     MoveTo(DocPos),
     /// Reached the start or end boundary of the table.
     AtBoundary,
+}
+
+/// Result of a collapsed boundary deletion or block-exit request.
+///
+/// Distinguishes document mutations from non-destructive caret moves (for example pressing
+/// Backspace immediately after a table or non-empty code block enters it without modifying text).
+#[derive(Clone, Debug, PartialEq)]
+pub enum BoundaryDeleteOutcome {
+    Edit(Box<Transaction>),
+    MoveSelection(Box<DocumentSelection>),
 }
 
 #[derive(Clone, Debug)]
@@ -942,6 +953,46 @@ impl Document {
             );
         }
 
+        // Pressing Enter on an empty trailing child of a non-footnote container exits the container.
+        if inline.is_empty()
+            && let ContainerTarget::Container(container_id) = target
+            && let Some(container_block) = self.find_block(container_id)
+            && !crate::model::anchors::is_footnote_body(container_block)
+            && let Some(siblings) = self.container_blocks(target)
+            && block_index + 1 == siblings.len()
+            && let Some((parent_target, container_index)) = self.locate_block(container_id)
+        {
+            let lifted_block = BlockNode::new(
+                leaf_id,
+                BlockKind::paragraph(InlineContent::empty()),
+                BlockStyle::default(),
+            );
+            let mut steps = Vec::new();
+            let insert_index = if siblings.len() == 1 {
+                steps.push(Step::RemoveBlockIn {
+                    target: parent_target,
+                    index: container_index,
+                });
+                container_index
+            } else {
+                steps.push(Step::RemoveBlockIn {
+                    target,
+                    index: block_index,
+                });
+                container_index + 1
+            };
+            steps.push(Step::InsertBlockIn {
+                target: parent_target,
+                index: insert_index,
+                block: lifted_block,
+            });
+            let next_pos = self.doc_pos_for_container_child(parent_target, leaf_id, 0)?;
+            return Some(Transaction::new(steps).with_selections(
+                selection_before,
+                Some(DocumentSelection::caret(next_pos, Affinity::Downstream)),
+            ));
+        }
+
         let trailing = inline.slice(offset..inline.len());
         let new_block_id = self.alloc_block_id();
         let (trailing_kind, trailing_style) = if block.kind.is_paragraph() {
@@ -1020,13 +1071,13 @@ impl Document {
         ))
     }
 
-    /// Builds a container-aware transaction merging the block at `pos` into its preceding sibling
-    /// (used for Backspace at offset 0).
-    pub fn build_merge_with_previous_transaction(
+    /// Plans Backspace at offset 0 of `pos`, distinguishing destructive edits from safe
+    /// non-destructive caret entry into preceding tables, containers, or code blocks.
+    pub fn plan_backward_boundary_delete(
         &self,
         pos: &DocPos,
         selection_before: Option<DocumentSelection>,
-    ) -> Option<Transaction> {
+    ) -> Option<BoundaryDeleteOutcome> {
         let leaf_id = pos.leaf_block_id()?;
         let (target, block_index) = self.locate_block(leaf_id)?;
         let block = self.find_block(leaf_id)?;
@@ -1052,31 +1103,143 @@ impl Document {
             } else {
                 (BlockKind::paragraph(content.clone()), BlockStyle::default())
             };
-            return self.build_convert_block_transaction(
-                leaf_id,
-                new_kind,
-                new_style,
-                selection_before,
-                Some(DocumentSelection::caret(pos.clone(), Affinity::Downstream)),
-            );
+            return self
+                .build_convert_block_transaction(
+                    leaf_id,
+                    new_kind,
+                    new_style,
+                    selection_before,
+                    Some(DocumentSelection::caret(pos.clone(), Affinity::Downstream)),
+                )
+                .map(|transaction| BoundaryDeleteOutcome::Edit(Box::new(transaction)));
         }
         if block.kind.heading_data().is_some()
             && let Some(content) = block.kind.inline_content()
         {
-            return self.build_convert_block_transaction(
-                leaf_id,
-                BlockKind::paragraph(content.clone()),
-                BlockStyle::default(),
-                selection_before,
-                Some(DocumentSelection::caret(pos.clone(), Affinity::Downstream)),
-            );
+            return self
+                .build_convert_block_transaction(
+                    leaf_id,
+                    BlockKind::paragraph(content.clone()),
+                    BlockStyle::default(),
+                    selection_before,
+                    Some(DocumentSelection::caret(pos.clone(), Affinity::Downstream)),
+                )
+                .map(|transaction| BoundaryDeleteOutcome::Edit(Box::new(transaction)));
+        }
+        if block.kind.code_block_data().is_some()
+            && let Some(content) = block.kind.inline_content()
+        {
+            if content.is_empty() {
+                return self
+                    .build_convert_block_transaction(
+                        leaf_id,
+                        BlockKind::paragraph(InlineContent::empty()),
+                        BlockStyle::default(),
+                        selection_before,
+                        Some(DocumentSelection::caret(pos.clone(), Affinity::Downstream)),
+                    )
+                    .map(|transaction| BoundaryDeleteOutcome::Edit(Box::new(transaction)));
+            }
+            return None;
         }
 
         if block_index == 0 {
+            if let ContainerTarget::Container(container_id) = target
+                && let Some(container_block) = self.find_block(container_id)
+                && !crate::model::anchors::is_footnote_body(container_block)
+                && let Some(siblings) = self.container_blocks(target)
+                && let Some((parent_target, container_index)) = self.locate_block(container_id)
+            {
+                let lifted_block = block.clone();
+                let mut steps = Vec::new();
+                if siblings.len() == 1 {
+                    steps.push(Step::RemoveBlockIn {
+                        target: parent_target,
+                        index: container_index,
+                    });
+                } else {
+                    steps.push(Step::RemoveBlockIn { target, index: 0 });
+                }
+                steps.push(Step::InsertBlockIn {
+                    target: parent_target,
+                    index: container_index,
+                    block: lifted_block,
+                });
+                let next_pos = self.doc_pos_for_container_child(parent_target, leaf_id, 0)?;
+                return Some(BoundaryDeleteOutcome::Edit(Box::new(
+                    Transaction::new(steps).with_selections(
+                        selection_before,
+                        Some(DocumentSelection::caret(next_pos, Affinity::Downstream)),
+                    ),
+                )));
+            }
             return None;
         }
+
+        if target == ContainerTarget::Root && block_index >= self.content_end_index() {
+            return None;
+        }
+
         let siblings = self.container_blocks(target)?;
         let prev_block = siblings.get(block_index - 1)?;
+        match &prev_block.kind {
+            BlockKind::Leaf { .. } => {
+                let steps = vec![Step::RemoveBlockIn {
+                    target,
+                    index: block_index - 1,
+                }];
+                return Some(BoundaryDeleteOutcome::Edit(Box::new(
+                    Transaction::new(steps).with_selections(
+                        selection_before,
+                        Some(DocumentSelection::caret(pos.clone(), Affinity::Downstream)),
+                    ),
+                )));
+            }
+            BlockKind::Grid { .. } => {
+                let target_pos = self.last_text_pos_in_node(prev_block)?;
+                return Some(BoundaryDeleteOutcome::MoveSelection(Box::new(
+                    DocumentSelection::caret(target_pos, Affinity::Downstream),
+                )));
+            }
+            BlockKind::Container { .. } => {
+                if let Some(target_pos) = self.last_text_pos_in_node(prev_block) {
+                    return Some(BoundaryDeleteOutcome::MoveSelection(Box::new(
+                        DocumentSelection::caret(target_pos, Affinity::Downstream),
+                    )));
+                }
+                let steps = vec![Step::RemoveBlockIn {
+                    target,
+                    index: block_index - 1,
+                }];
+                return Some(BoundaryDeleteOutcome::Edit(Box::new(
+                    Transaction::new(steps).with_selections(
+                        selection_before,
+                        Some(DocumentSelection::caret(pos.clone(), Affinity::Downstream)),
+                    ),
+                )));
+            }
+            BlockKind::Text { .. } if prev_block.kind.code_block_data().is_some() => {
+                let prev_inline = prev_block.kind.inline_content()?;
+                if prev_inline.is_empty() {
+                    let steps = vec![Step::RemoveBlockIn {
+                        target,
+                        index: block_index - 1,
+                    }];
+                    return Some(BoundaryDeleteOutcome::Edit(Box::new(
+                        Transaction::new(steps).with_selections(
+                            selection_before,
+                            Some(DocumentSelection::caret(pos.clone(), Affinity::Downstream)),
+                        ),
+                    )));
+                }
+                let target_pos = self.doc_pos_for_block(prev_block.id, prev_inline.len())?;
+                return Some(BoundaryDeleteOutcome::MoveSelection(Box::new(
+                    DocumentSelection::caret(target_pos, Affinity::Downstream),
+                )));
+            }
+            BlockKind::Text { .. } => {}
+        }
+
         let prev_inline = prev_block.kind.inline_content()?;
         let current_inline = block.kind.inline_content()?;
         let join_offset = prev_inline.len();
@@ -1103,24 +1266,104 @@ impl Document {
         });
 
         let next_pos = self.doc_pos_for_block(prev_block.id, join_offset)?;
-        Some(Transaction::new(steps).with_selections(
-            selection_before,
-            Some(DocumentSelection::caret(next_pos, Affinity::Downstream)),
-        ))
+        Some(BoundaryDeleteOutcome::Edit(Box::new(
+            Transaction::new(steps).with_selections(
+                selection_before,
+                Some(DocumentSelection::caret(next_pos, Affinity::Downstream)),
+            ),
+        )))
     }
 
-    /// Builds a container-aware transaction merging the next sibling into the block at `pos`
-    /// (used for forward Delete at the end of a block).
-    pub fn build_merge_with_next_transaction(
+    /// Builds a container-aware transaction merging the block at `pos` into its preceding sibling
+    /// (used for Backspace at offset 0).
+    pub fn build_merge_with_previous_transaction(
         &self,
         pos: &DocPos,
         selection_before: Option<DocumentSelection>,
     ) -> Option<Transaction> {
+        match self.plan_backward_boundary_delete(pos, selection_before)? {
+            BoundaryDeleteOutcome::Edit(transaction) => Some(*transaction),
+            BoundaryDeleteOutcome::MoveSelection(_) => None,
+        }
+    }
+
+    /// Plans forward Delete at the end of `pos`, distinguishing destructive edits from safe
+    /// non-destructive caret entry into following tables, containers, or code blocks.
+    pub fn plan_forward_boundary_delete(
+        &self,
+        pos: &DocPos,
+        selection_before: Option<DocumentSelection>,
+    ) -> Option<BoundaryDeleteOutcome> {
         let leaf_id = pos.leaf_block_id()?;
         let (target, block_index) = self.locate_block(leaf_id)?;
         let siblings = self.container_blocks(target)?;
+        let current_block = siblings.get(block_index)?;
+        if current_block.kind.code_block_data().is_some() {
+            return None;
+        }
+        if target == ContainerTarget::Root && block_index + 1 >= self.content_end_index() {
+            return None;
+        }
         let next_block = siblings.get(block_index + 1)?;
-        let current_inline = siblings.get(block_index)?.kind.inline_content()?;
+        match &next_block.kind {
+            BlockKind::Leaf { .. } => {
+                let steps = vec![Step::RemoveBlockIn {
+                    target,
+                    index: block_index + 1,
+                }];
+                return Some(BoundaryDeleteOutcome::Edit(Box::new(
+                    Transaction::new(steps).with_selections(
+                        selection_before,
+                        Some(DocumentSelection::caret(pos.clone(), Affinity::Downstream)),
+                    ),
+                )));
+            }
+            BlockKind::Grid { .. } => {
+                let target_pos = self.first_text_pos_in_node(next_block)?;
+                return Some(BoundaryDeleteOutcome::MoveSelection(Box::new(
+                    DocumentSelection::caret(target_pos, Affinity::Downstream),
+                )));
+            }
+            BlockKind::Container { .. } => {
+                if let Some(target_pos) = self.first_text_pos_in_node(next_block) {
+                    return Some(BoundaryDeleteOutcome::MoveSelection(Box::new(
+                        DocumentSelection::caret(target_pos, Affinity::Downstream),
+                    )));
+                }
+                let steps = vec![Step::RemoveBlockIn {
+                    target,
+                    index: block_index + 1,
+                }];
+                return Some(BoundaryDeleteOutcome::Edit(Box::new(
+                    Transaction::new(steps).with_selections(
+                        selection_before,
+                        Some(DocumentSelection::caret(pos.clone(), Affinity::Downstream)),
+                    ),
+                )));
+            }
+            BlockKind::Text { .. } if next_block.kind.code_block_data().is_some() => {
+                let next_inline = next_block.kind.inline_content()?;
+                if next_inline.is_empty() {
+                    let steps = vec![Step::RemoveBlockIn {
+                        target,
+                        index: block_index + 1,
+                    }];
+                    return Some(BoundaryDeleteOutcome::Edit(Box::new(
+                        Transaction::new(steps).with_selections(
+                            selection_before,
+                            Some(DocumentSelection::caret(pos.clone(), Affinity::Downstream)),
+                        ),
+                    )));
+                }
+                let target_pos = self.doc_pos_for_block(next_block.id, 0)?;
+                return Some(BoundaryDeleteOutcome::MoveSelection(Box::new(
+                    DocumentSelection::caret(target_pos, Affinity::Downstream),
+                )));
+            }
+            BlockKind::Text { .. } => {}
+        }
+
+        let current_inline = current_block.kind.inline_content()?;
         let next_inline = next_block.kind.inline_content()?;
         let join_offset = current_inline.len();
 
@@ -1145,10 +1388,659 @@ impl Document {
             index: block_index + 1,
         });
 
+        Some(BoundaryDeleteOutcome::Edit(Box::new(
+            Transaction::new(steps).with_selections(
+                selection_before,
+                Some(DocumentSelection::caret(pos.clone(), Affinity::Downstream)),
+            ),
+        )))
+    }
+
+    /// Builds a container-aware transaction merging the next sibling into the block at `pos`
+    /// (used for forward Delete at the end of a block).
+    pub fn build_merge_with_next_transaction(
+        &self,
+        pos: &DocPos,
+        selection_before: Option<DocumentSelection>,
+    ) -> Option<Transaction> {
+        match self.plan_forward_boundary_delete(pos, selection_before)? {
+            BoundaryDeleteOutcome::Edit(transaction) => Some(*transaction),
+            BoundaryDeleteOutcome::MoveSelection(_) => None,
+        }
+    }
+
+    /// Exits a code block, non-footnote container, or table by moving to the next sibling text
+    /// block or inserting a fresh paragraph immediately after it.
+    pub fn plan_exit_block(
+        &mut self,
+        pos: &DocPos,
+        selection_before: Option<DocumentSelection>,
+    ) -> Option<BoundaryDeleteOutcome> {
+        let leaf_id = pos.leaf_block_id()?;
+        let exit_block_id = if self
+            .find_block(leaf_id)
+            .is_some_and(|block| block.kind.code_block_data().is_some())
+        {
+            leaf_id
+        } else {
+            pos.path
+                .iter()
+                .rev()
+                .skip(1)
+                .find_map(|segment| match *segment {
+                    PathSegment::Block(id) => self
+                        .find_block(id)
+                        .filter(|block| {
+                            matches!(block.kind, BlockKind::Container { .. })
+                                && !crate::model::anchors::is_footnote_body(block)
+                        })
+                        .map(|_| id),
+                    PathSegment::TableCell { table_id, .. } => Some(table_id),
+                })?
+        };
+
+        let (parent_target, block_index) = self.locate_block(exit_block_id)?;
+        let siblings = self.container_blocks(parent_target)?;
+        let next_index = block_index + 1;
+        let within_content =
+            parent_target != ContainerTarget::Root || next_index < self.content_end_index();
+        if within_content
+            && let Some(next_sibling) = siblings.get(next_index)
+            && next_sibling.kind.inline_content().is_some()
+        {
+            let target_pos = self.doc_pos_for_block(next_sibling.id, 0)?;
+            return Some(BoundaryDeleteOutcome::MoveSelection(Box::new(
+                DocumentSelection::caret(target_pos, Affinity::Downstream),
+            )));
+        }
+
+        let new_paragraph_id = self.alloc_block_id();
+        let new_paragraph = BlockNode::new(
+            new_paragraph_id,
+            BlockKind::paragraph(InlineContent::empty()),
+            BlockStyle::default(),
+        );
+        let next_pos = self.doc_pos_for_container_child(parent_target, new_paragraph_id, 0)?;
+        let transaction = Transaction::new(vec![Step::InsertBlockIn {
+            target: parent_target,
+            index: next_index,
+            block: new_paragraph,
+        }])
+        .with_selections(
+            selection_before,
+            Some(DocumentSelection::caret(next_pos, Affinity::Downstream)),
+        );
+        Some(BoundaryDeleteOutcome::Edit(Box::new(transaction)))
+    }
+
+    /// Toggles blockquote wrapping for `block_ids`: unwraps if all selected blocks are already
+    /// inside blockquotes, or wraps the contiguous sibling span in a new blockquote otherwise.
+    pub fn build_toggle_blockquote_transaction(
+        &mut self,
+        block_ids: &[BlockId],
+        selection_before: Option<DocumentSelection>,
+    ) -> Option<Transaction> {
+        if block_ids.is_empty() {
+            return None;
+        }
+
+        let enclosing_quotes: Vec<Option<BlockId>> = block_ids
+            .iter()
+            .map(|&block_id| self.enclosing_blockquote_id(block_id))
+            .collect();
+
+        if enclosing_quotes.iter().all(Option::is_some) {
+            let mut quote_id_order: Vec<BlockId> = Vec::new();
+            for quote_id in enclosing_quotes.into_iter().flatten() {
+                if !quote_id_order.contains(&quote_id) {
+                    quote_id_order.push(quote_id);
+                }
+            }
+            if quote_id_order.len() != 1 {
+                return None;
+            }
+            let quote_id = quote_id_order[0];
+            let quote_block = self.find_block(quote_id)?.clone();
+            let quote_children = quote_block.kind.children()?;
+            let (parent_target, quote_index) = self.locate_block(quote_id)?;
+
+            let mut min_child_index = usize::MAX;
+            let mut max_child_index = 0usize;
+            for &block_id in block_ids {
+                let child_index = quote_children
+                    .iter()
+                    .position(|child| child.id == block_id || contains_block_id(child, block_id))?;
+                min_child_index = min_child_index.min(child_index);
+                max_child_index = max_child_index.max(child_index);
+            }
+            if min_child_index > max_child_index || max_child_index >= quote_children.len() {
+                return None;
+            }
+
+            let before = quote_children[..min_child_index].to_vec();
+            let lifted = quote_children[min_child_index..=max_child_index].to_vec();
+            let after = quote_children[(max_child_index + 1)..].to_vec();
+
+            let mut steps = vec![Step::RemoveBlockIn {
+                target: parent_target,
+                index: quote_index,
+            }];
+            let mut insert_at = quote_index;
+            if !before.is_empty() {
+                steps.push(Step::InsertBlockIn {
+                    target: parent_target,
+                    index: insert_at,
+                    block: BlockNode::new(
+                        quote_id,
+                        BlockKind::blockquote(before),
+                        quote_block.style.clone(),
+                    ),
+                });
+                insert_at += 1;
+            }
+            for child in lifted {
+                steps.push(Step::InsertBlockIn {
+                    target: parent_target,
+                    index: insert_at,
+                    block: child,
+                });
+                insert_at += 1;
+            }
+            if !after.is_empty() {
+                let trailing_quote_id = self.alloc_block_id();
+                steps.push(Step::InsertBlockIn {
+                    target: parent_target,
+                    index: insert_at,
+                    block: BlockNode::new(
+                        trailing_quote_id,
+                        BlockKind::blockquote(after),
+                        quote_block.style,
+                    ),
+                });
+            }
+
+            let selection_after = selection_before
+                .clone()
+                .map(|selection| remove_path_segment_from_selection(selection, quote_id));
+            return Some(
+                Transaction::new(steps).with_selections(selection_before, selection_after),
+            );
+        }
+
+        let first_id = *block_ids.first()?;
+        let (target, first_index) = self.locate_block(first_id)?;
+        let siblings = self.container_blocks(target)?;
+        let mut min_index = first_index;
+        let mut max_index = first_index;
+        for &block_id in block_ids.iter().skip(1) {
+            let (other_target, other_index) = self.locate_block(block_id)?;
+            if other_target != target {
+                return None;
+            }
+            min_index = min_index.min(other_index);
+            max_index = max_index.max(other_index);
+        }
+        if target == ContainerTarget::Root && max_index >= self.content_end_index() {
+            return None;
+        }
+        let wrapped_slice = siblings.get(min_index..=max_index)?;
+        if wrapped_slice
+            .iter()
+            .any(crate::model::anchors::is_footnote_body)
+        {
+            return None;
+        }
+        let wrapped_ids: Vec<BlockId> = wrapped_slice.iter().map(|block| block.id).collect();
+        let wrapped_children = wrapped_slice.to_vec();
+        let quote_id = self.alloc_block_id();
+        let quote_block = BlockNode::new(
+            quote_id,
+            BlockKind::blockquote(wrapped_children),
+            default_blockquote_style(),
+        );
+
+        let mut steps = Vec::with_capacity(wrapped_ids.len() + 1);
+        for index in (min_index..=max_index).rev() {
+            steps.push(Step::RemoveBlockIn { target, index });
+        }
+        steps.push(Step::InsertBlockIn {
+            target,
+            index: min_index,
+            block: quote_block,
+        });
+
+        let selection_after = selection_before
+            .clone()
+            .map(|selection| insert_path_ancestor_in_selection(selection, &wrapped_ids, quote_id));
+        Some(Transaction::new(steps).with_selections(selection_before, selection_after))
+    }
+
+    /// Toggles code-block formatting for `block_ids`: converts a code block into sibling
+    /// paragraphs split by `\n`, or merges contiguous text siblings into one code block.
+    pub fn build_toggle_code_block_transaction(
+        &mut self,
+        block_ids: &[BlockId],
+        selection_before: Option<DocumentSelection>,
+    ) -> Option<Transaction> {
+        if block_ids.is_empty() {
+            return None;
+        }
+
+        if block_ids.len() == 1 {
+            let block_id = block_ids[0];
+            let block = self.find_block(block_id)?;
+            if block.kind.code_block_data().is_some() {
+                let text = block.kind.inline_content()?.text.clone();
+                let focus_offset = match selection_before.as_ref() {
+                    Some(DocumentSelection::Text { focus, .. })
+                        if focus.leaf_block_id() == Some(block_id) =>
+                    {
+                        focus.offset.min(text.len())
+                    }
+                    _ => text.len(),
+                };
+                let lines: Vec<&str> = text.split('\n').collect();
+                let (target, block_index) = self.locate_block(block_id)?;
+                let mut steps = vec![
+                    Step::SetBlockKind {
+                        block_id,
+                        kind: BlockKind::paragraph(InlineContent::plain(
+                            lines.first().copied().unwrap_or(""),
+                        )),
+                    },
+                    Step::SetBlockStyle {
+                        block_id,
+                        style: BlockStyle::default(),
+                    },
+                ];
+
+                let mut line_block_ids = Vec::with_capacity(lines.len());
+                line_block_ids.push(block_id);
+                for (line_offset, line) in lines.iter().enumerate().skip(1) {
+                    let new_id = self.alloc_block_id();
+                    line_block_ids.push(new_id);
+                    steps.push(Step::InsertBlockIn {
+                        target,
+                        index: block_index + line_offset,
+                        block: BlockNode::new(
+                            new_id,
+                            BlockKind::paragraph(InlineContent::plain(*line)),
+                            BlockStyle::default(),
+                        ),
+                    });
+                }
+
+                let mut remaining = focus_offset;
+                let mut target_line_index = 0usize;
+                for (line_index, line) in lines.iter().enumerate() {
+                    if remaining <= line.len() || line_index + 1 == lines.len() {
+                        target_line_index = line_index;
+                        break;
+                    }
+                    remaining = remaining.saturating_sub(line.len() + 1);
+                }
+                let caret_block_id = line_block_ids[target_line_index];
+                let caret_offset = remaining.min(lines[target_line_index].len());
+                let next_pos =
+                    self.doc_pos_for_container_child(target, caret_block_id, caret_offset)?;
+                return Some(Transaction::new(steps).with_selections(
+                    selection_before,
+                    Some(DocumentSelection::caret(next_pos, Affinity::Downstream)),
+                ));
+            }
+        }
+
+        let first_id = *block_ids.first()?;
+        let (target, first_index) = self.locate_block(first_id)?;
+        let siblings = self.container_blocks(target)?;
+        let mut min_index = first_index;
+        let mut max_index = first_index;
+        for &block_id in block_ids.iter().skip(1) {
+            let (other_target, other_index) = self.locate_block(block_id)?;
+            if other_target != target {
+                return None;
+            }
+            min_index = min_index.min(other_index);
+            max_index = max_index.max(other_index);
+        }
+        let slice = siblings.get(min_index..=max_index)?;
+        if !slice
+            .iter()
+            .all(|block| block.kind.inline_content().is_some())
+        {
+            return None;
+        }
+
+        let focus_target = match selection_before.as_ref() {
+            Some(DocumentSelection::Text { focus, .. }) => {
+                focus.leaf_block_id().map(|id| (id, focus.offset))
+            }
+            _ => None,
+        };
+        let mut joined = String::new();
+        let mut mapped_focus_offset = None;
+        for (offset_index, block) in slice.iter().enumerate() {
+            if offset_index > 0 {
+                joined.push('\n');
+            }
+            let text = &block.kind.inline_content()?.text;
+            if let Some((focus_id, focus_offset)) = focus_target
+                && focus_id == block.id
+            {
+                mapped_focus_offset = Some(joined.len() + focus_offset.min(text.len()));
+            }
+            joined.push_str(text);
+        }
+
+        let kept_id = slice.first()?.id;
+        let mut steps = vec![
+            Step::SetBlockKind {
+                block_id: kept_id,
+                kind: BlockKind::code_block(None, InlineContent::plain(joined.clone())),
+            },
+            Step::SetBlockStyle {
+                block_id: kept_id,
+                style: BlockStyle::named(StyleId::CODE_BLOCK),
+            },
+        ];
+        for index in ((min_index + 1)..=max_index).rev() {
+            steps.push(Step::RemoveBlockIn { target, index });
+        }
+        let caret_offset = mapped_focus_offset.unwrap_or(joined.len());
+        let next_pos = self.doc_pos_for_container_child(target, kept_id, caret_offset)?;
         Some(Transaction::new(steps).with_selections(
             selection_before,
-            Some(DocumentSelection::caret(pos.clone(), Affinity::Downstream)),
+            Some(DocumentSelection::caret(next_pos, Affinity::Downstream)),
         ))
+    }
+
+    /// Updates the language tag on a code block without altering its content or structure.
+    pub fn build_set_code_block_language_transaction(
+        &self,
+        block_id: BlockId,
+        language: Option<String>,
+        selection_before: Option<DocumentSelection>,
+    ) -> Option<Transaction> {
+        let block = self.find_block(block_id)?;
+        let current = block.kind.code_block_data()?;
+        let normalized = language
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty());
+        if current.language == normalized {
+            return None;
+        }
+        let step = Step::UpdateBlockData {
+            block_id,
+            expected_kind: Arc::from(block_kinds::CODE_BLOCK),
+            expected_shape: BlockShapeKind::Text,
+            data: CustomPayload::typed(CodeBlockData {
+                language: normalized,
+            }),
+        };
+        Some(
+            Transaction::new(vec![step])
+                .with_selections(selection_before.clone(), selection_before),
+        )
+    }
+
+    /// Inserts a horizontal rule at collapsed position `pos`, ensuring the caret lands in an
+    /// editable paragraph immediately after the rule.
+    pub fn build_insert_horizontal_rule_transaction(
+        &mut self,
+        pos: &DocPos,
+        selection_before: Option<DocumentSelection>,
+    ) -> Option<Transaction> {
+        let rule_id = self.alloc_block_id();
+        let rule_block = BlockNode::new(
+            rule_id,
+            BlockKind::horizontal_rule(),
+            default_horizontal_rule_style(),
+        );
+        self.build_insert_structural_block_transaction(pos, rule_block, None, selection_before)
+    }
+
+    /// Inserts a `rows × columns` table at collapsed position `pos`, ensuring a trailing paragraph
+    /// exists when inserted at the end of a container and placing the caret in cell `(0, 0)`.
+    pub fn build_insert_table_transaction(
+        &mut self,
+        pos: &DocPos,
+        rows: usize,
+        columns: usize,
+        with_header: bool,
+        selection_before: Option<DocumentSelection>,
+    ) -> Option<Transaction> {
+        let row_count = rows.max(1);
+        let col_count = columns.max(1);
+        let table_id = self.alloc_block_id();
+        let mut table_rows = Vec::with_capacity(row_count);
+        let mut first_cell_para_id = None;
+        for row_index in 0..row_count {
+            let mut cells = Vec::with_capacity(col_count);
+            for col_index in 0..col_count {
+                let cell_id = self.alloc_block_id();
+                let para_id = self.alloc_block_id();
+                if row_index == 0 && col_index == 0 {
+                    first_cell_para_id = Some(para_id);
+                }
+                cells.push(TableCell::simple(
+                    cell_id,
+                    vec![BlockNode::new(
+                        para_id,
+                        BlockKind::paragraph(InlineContent::empty()),
+                        BlockStyle::default(),
+                    )],
+                ));
+            }
+            table_rows.push(TableRow {
+                is_header: with_header && row_index == 0,
+                cells,
+            });
+        }
+        let table_block = BlockNode::new(
+            table_id,
+            BlockKind::table(TableBlock {
+                columns: vec![ColumnSpec::Auto; col_count],
+                column_kinds: Default::default(),
+                rows: table_rows,
+                border_style: TableBorderStyle::default(),
+            }),
+            BlockStyle::default(),
+        );
+        let caret_in_table = first_cell_para_id.map(|para_id| (table_id, para_id));
+        self.build_insert_structural_block_transaction(
+            pos,
+            table_block,
+            caret_in_table,
+            selection_before,
+        )
+    }
+
+    fn build_insert_structural_block_transaction(
+        &mut self,
+        pos: &DocPos,
+        inserted_block: BlockNode,
+        caret_in_table: Option<(BlockId, BlockId)>,
+        selection_before: Option<DocumentSelection>,
+    ) -> Option<Transaction> {
+        let leaf_id = pos.leaf_block_id()?;
+        let (target, block_index) = self.locate_block(leaf_id)?;
+        let block = self.find_block(leaf_id)?.clone();
+        let inline = block.kind.inline_content()?;
+        let offset = pos.offset.min(inline.len());
+        let siblings = self.container_blocks(target)?;
+
+        let mut steps = Vec::new();
+        let following_pos: DocPos;
+
+        if block.kind.code_block_data().is_some() || offset == inline.len() {
+            if inline.is_empty() && block.kind.is_paragraph() {
+                steps.push(Step::InsertBlockIn {
+                    target,
+                    index: block_index,
+                    block: inserted_block,
+                });
+                following_pos = self.doc_pos_for_container_child(target, leaf_id, 0)?;
+            } else {
+                steps.push(Step::InsertBlockIn {
+                    target,
+                    index: block_index + 1,
+                    block: inserted_block,
+                });
+                let next_sibling_index = block_index + 1;
+                let has_following_text = (target != ContainerTarget::Root
+                    || next_sibling_index < self.content_end_index())
+                    && siblings
+                        .get(next_sibling_index)
+                        .is_some_and(|sibling| sibling.kind.inline_content().is_some());
+                if has_following_text {
+                    let next_id = siblings.get(next_sibling_index)?.id;
+                    following_pos = self.doc_pos_for_container_child(target, next_id, 0)?;
+                } else {
+                    let trailing_id = self.alloc_block_id();
+                    steps.push(Step::InsertBlockIn {
+                        target,
+                        index: block_index + 2,
+                        block: BlockNode::new(
+                            trailing_id,
+                            BlockKind::paragraph(InlineContent::empty()),
+                            BlockStyle::default(),
+                        ),
+                    });
+                    following_pos = self.doc_pos_for_container_child(target, trailing_id, 0)?;
+                }
+            }
+        } else if offset == 0 {
+            steps.push(Step::InsertBlockIn {
+                target,
+                index: block_index,
+                block: inserted_block,
+            });
+            following_pos = self.doc_pos_for_container_child(target, leaf_id, 0)?;
+        } else {
+            let trailing_content = inline.slice(offset..inline.len());
+            let trailing_id = self.alloc_block_id();
+            if self.anchors.bookmarks().next().is_some() {
+                steps.push(Step::MapSplitAnchors {
+                    block_id: leaf_id,
+                    offset,
+                    new_block_id: trailing_id,
+                });
+            }
+            steps.push(Step::DeleteRange {
+                block_id: leaf_id,
+                range: offset..inline.len(),
+            });
+            steps.push(Step::InsertBlockIn {
+                target,
+                index: block_index + 1,
+                block: inserted_block,
+            });
+            steps.push(Step::InsertBlockIn {
+                target,
+                index: block_index + 2,
+                block: BlockNode::new(
+                    trailing_id,
+                    BlockKind::paragraph(trailing_content),
+                    BlockStyle::default(),
+                ),
+            });
+            following_pos = self.doc_pos_for_container_child(target, trailing_id, 0)?;
+        }
+
+        let caret_pos = if let Some((table_id, para_id)) = caret_in_table {
+            let mut path = self.path_for_container_target(target)?;
+            path.push(PathSegment::TableCell {
+                table_id,
+                row: 0,
+                col: 0,
+            });
+            path.push(PathSegment::Block(para_id));
+            DocPos { path, offset: 0 }
+        } else {
+            following_pos
+        };
+
+        Some(Transaction::new(steps).with_selections(
+            selection_before,
+            Some(DocumentSelection::caret(caret_pos, Affinity::Downstream)),
+        ))
+    }
+
+    fn path_for_container_target(
+        &self,
+        target: ContainerTarget,
+    ) -> Option<SmallVec<[PathSegment; 4]>> {
+        match target {
+            ContainerTarget::Root => Some(SmallVec::new()),
+            ContainerTarget::Container(container_id) => self.path_for_block(container_id),
+            ContainerTarget::TableCell { table_id, row, col } => {
+                let mut path = self.path_for_block(table_id)?;
+                path.pop();
+                path.push(PathSegment::TableCell { table_id, row, col });
+                Some(path)
+            }
+        }
+    }
+
+    fn doc_pos_for_container_child(
+        &self,
+        target: ContainerTarget,
+        block_id: BlockId,
+        offset: usize,
+    ) -> Option<DocPos> {
+        let mut path = self.path_for_container_target(target)?;
+        path.push(PathSegment::Block(block_id));
+        Some(DocPos { path, offset })
+    }
+
+    fn enclosing_blockquote_id(&self, block_id: BlockId) -> Option<BlockId> {
+        let path = self.path_for_block(block_id)?;
+        path.iter()
+            .rev()
+            .skip(1)
+            .find_map(|segment| match *segment {
+                PathSegment::Block(id) => self
+                    .find_block(id)
+                    .filter(|block| block.kind.semantic_kind() == block_kinds::BLOCKQUOTE)
+                    .map(|_| id),
+                PathSegment::TableCell { .. } => None,
+            })
+    }
+
+    fn first_text_pos_in_node(&self, node: &BlockNode) -> Option<DocPos> {
+        match &node.kind {
+            BlockKind::Text { .. } => self.doc_pos_for_block(node.id, 0),
+            BlockKind::Container { children, .. } => children
+                .iter()
+                .find_map(|child| self.first_text_pos_in_node(child)),
+            BlockKind::Grid { table, .. } => table.rows.iter().find_map(|row| {
+                row.cells.iter().find_map(|cell| {
+                    cell.blocks
+                        .iter()
+                        .find_map(|child| self.first_text_pos_in_node(child))
+                })
+            }),
+            BlockKind::Leaf { .. } => None,
+        }
+    }
+
+    fn last_text_pos_in_node(&self, node: &BlockNode) -> Option<DocPos> {
+        match &node.kind {
+            BlockKind::Text { content, .. } => self.doc_pos_for_block(node.id, content.len()),
+            BlockKind::Container { children, .. } => children
+                .iter()
+                .rev()
+                .find_map(|child| self.last_text_pos_in_node(child)),
+            BlockKind::Grid { table, .. } => table.rows.iter().rev().find_map(|row| {
+                row.cells.iter().rev().find_map(|cell| {
+                    cell.blocks
+                        .iter()
+                        .rev()
+                        .find_map(|child| self.last_text_pos_in_node(child))
+                })
+            }),
+            BlockKind::Leaf { .. } => None,
+        }
     }
 
     /// Builds a transaction converting `block_id` to `new_kind` and `new_style`.
@@ -1912,6 +2804,108 @@ impl Document {
                 None => break,
             }
         }
+    }
+}
+
+fn default_blockquote_style() -> BlockStyle {
+    BlockStyle {
+        indent_start_pt: 16.0,
+        space_before_pt: Some(6.0),
+        space_after_pt: Some(10.0),
+        ..BlockStyle::default()
+    }
+}
+
+fn default_horizontal_rule_style() -> BlockStyle {
+    BlockStyle {
+        space_before_pt: Some(10.0),
+        space_after_pt: Some(10.0),
+        ..BlockStyle::default()
+    }
+}
+
+fn contains_block_id(node: &BlockNode, target_id: BlockId) -> bool {
+    if node.id == target_id {
+        return true;
+    }
+    match &node.kind {
+        BlockKind::Container { children, .. } => children
+            .iter()
+            .any(|child| contains_block_id(child, target_id)),
+        BlockKind::Grid { table, .. } => table.rows.iter().any(|row| {
+            row.cells.iter().any(|cell| {
+                cell.blocks
+                    .iter()
+                    .any(|child| contains_block_id(child, target_id))
+            })
+        }),
+        BlockKind::Text { .. } | BlockKind::Leaf { .. } => false,
+    }
+}
+
+fn remove_path_segment_from_pos(mut pos: DocPos, removed_id: BlockId) -> DocPos {
+    pos.path
+        .retain(|segment| *segment != PathSegment::Block(removed_id));
+    pos
+}
+
+fn remove_path_segment_from_selection(
+    selection: DocumentSelection,
+    removed_id: BlockId,
+) -> DocumentSelection {
+    match selection {
+        DocumentSelection::Text {
+            anchor,
+            focus,
+            affinity,
+            goal_x,
+            stored_marks,
+        } => DocumentSelection::Text {
+            anchor: remove_path_segment_from_pos(anchor, removed_id),
+            focus: remove_path_segment_from_pos(focus, removed_id),
+            affinity,
+            goal_x,
+            stored_marks,
+        },
+        other => other,
+    }
+}
+
+fn insert_path_ancestor_in_pos(
+    mut pos: DocPos,
+    wrapped_ids: &[BlockId],
+    ancestor_id: BlockId,
+) -> DocPos {
+    if let Some(insert_at) = pos.path.iter().position(|segment| match *segment {
+        PathSegment::Block(id) | PathSegment::TableCell { table_id: id, .. } => {
+            wrapped_ids.contains(&id)
+        }
+    }) {
+        pos.path.insert(insert_at, PathSegment::Block(ancestor_id));
+    }
+    pos
+}
+
+fn insert_path_ancestor_in_selection(
+    selection: DocumentSelection,
+    wrapped_ids: &[BlockId],
+    ancestor_id: BlockId,
+) -> DocumentSelection {
+    match selection {
+        DocumentSelection::Text {
+            anchor,
+            focus,
+            affinity,
+            goal_x,
+            stored_marks,
+        } => DocumentSelection::Text {
+            anchor: insert_path_ancestor_in_pos(anchor, wrapped_ids, ancestor_id),
+            focus: insert_path_ancestor_in_pos(focus, wrapped_ids, ancestor_id),
+            affinity,
+            goal_x,
+            stored_marks,
+        },
+        other => other,
     }
 }
 

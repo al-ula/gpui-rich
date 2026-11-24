@@ -1535,3 +1535,317 @@ fn extension_command_wire_rejection_checked_decorations_and_ambiguous_codecs() {
         Err(CodecError::AmbiguousFileExtension { candidates, .. }) if candidates.len() == 2
     ));
 }
+
+#[test]
+fn boundary_ergonomics_exit_and_builtin_block_commands_roundtrip() {
+    // 1. Blockquote exit on empty trailing Enter, unwrap on first-child Backspace, and footnote isolation.
+    let mut doc = Document::new();
+    let first_quote_child = doc.alloc_block_id();
+    let second_quote_child = doc.alloc_block_id();
+    let quote_id = doc.add_blockquote(vec![
+        BlockNode::new(
+            first_quote_child,
+            BlockKind::paragraph(InlineContent::plain("Quoted")),
+            BlockStyle::default(),
+        ),
+        BlockNode::new(
+            second_quote_child,
+            BlockKind::paragraph(InlineContent::empty()),
+            BlockStyle::default(),
+        ),
+    ]);
+    let bookmark_id = doc.anchors.add_bookmark(
+        "q".to_owned(),
+        AnchorPosition {
+            block_id: first_quote_child,
+            offset: 2,
+        },
+        BoundaryAffinity::After,
+    );
+    let mut history = History::default();
+
+    let empty_pos = doc.doc_pos_for_block(second_quote_child, 0).unwrap();
+    let exit_tx = doc.build_split_block_transaction(&empty_pos, None).unwrap();
+    let applied_exit = doc.apply(exit_tx);
+    history.push_inverse(applied_exit.inverse);
+    assert_eq!(doc.blocks.len(), 2);
+    assert_eq!(doc.blocks[0].id, quote_id);
+    assert_eq!(doc.blocks[1].id, second_quote_child);
+    assert!(doc.blocks[1].kind.is_paragraph());
+
+    let first_pos = doc.doc_pos_for_block(first_quote_child, 0).unwrap();
+    let BoundaryDeleteOutcome::Edit(unwrap_tx) =
+        doc.plan_backward_boundary_delete(&first_pos, None).unwrap()
+    else {
+        panic!("expected unwrap edit");
+    };
+    let applied_unwrap = doc.apply(*unwrap_tx);
+    history.push_inverse(applied_unwrap.inverse);
+    assert!(doc.find_block(quote_id).is_none());
+    assert_eq!(doc.blocks[0].id, first_quote_child);
+    assert_eq!(
+        doc.anchors.bookmark(bookmark_id).unwrap().position,
+        AnchorPosition {
+            block_id: first_quote_child,
+            offset: 2,
+        }
+    );
+
+    // Undo restores the original 2-child blockquote cleanly.
+    history.undo(&mut doc).unwrap();
+    history.undo(&mut doc).unwrap();
+    assert_eq!(doc.blocks.len(), 1);
+    assert_eq!(
+        doc.container_blocks(ContainerTarget::Container(quote_id))
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // Footnote bodies are never unwrapped or exited on Enter/Backspace.
+    let footnote_para = doc.alloc_block_id();
+    let footnote_body = doc.alloc_block_id();
+    let footnote_id = doc.anchors.add_footnote_block(footnote_body);
+    doc.push_block(BlockNode::new(
+        footnote_body,
+        footnote_body_kind(vec![BlockNode::new(
+            footnote_para,
+            BlockKind::paragraph(InlineContent::empty()),
+            BlockStyle::default(),
+        )]),
+        BlockStyle::default(),
+    ));
+    let footnote_pos = doc.doc_pos_for_block(footnote_para, 0).unwrap();
+    assert!(
+        doc.plan_backward_boundary_delete(&footnote_pos, None)
+            .is_none()
+    );
+    assert!(doc.plan_exit_block(&footnote_pos, None).is_none());
+    assert_eq!(
+        doc.anchors.footnote(footnote_id).unwrap().block_id,
+        footnote_body
+    );
+
+    // 2. Horizontal rule deletion, non-destructive table/code entry, empty code conversion, and ExitBlock.
+    let mut doc = Document::new();
+    let before_id = doc.add_paragraph(InlineContent::plain("Before"), BlockStyle::default());
+    let rule_id = doc.add_horizontal_rule();
+    let middle_id = doc.add_paragraph(InlineContent::plain("Middle"), BlockStyle::default());
+    let code_id = doc.add_code_block(Some("rs".to_owned()), InlineContent::plain("let x = 1;"));
+    let after_code_id = doc.add_paragraph(InlineContent::plain("After"), BlockStyle::default());
+
+    let middle_start = doc.doc_pos_for_block(middle_id, 0).unwrap();
+    let BoundaryDeleteOutcome::Edit(del_rule_tx) = doc
+        .plan_backward_boundary_delete(&middle_start, None)
+        .unwrap()
+    else {
+        panic!("expected horizontal rule deletion");
+    };
+    let applied_rule = doc.apply(*del_rule_tx);
+    assert!(doc.find_block(rule_id).is_none());
+    doc.apply(applied_rule.inverse);
+    assert!(doc.find_block(rule_id).is_some());
+
+    // Forward Delete before horizontal rule removes it, and Undo restores it.
+    let before_end = doc.doc_pos_for_block(before_id, 6).unwrap();
+    let BoundaryDeleteOutcome::Edit(fwd_del_rule_tx) =
+        doc.plan_forward_boundary_delete(&before_end, None).unwrap()
+    else {
+        panic!("expected forward horizontal rule deletion");
+    };
+    let applied_fwd_rule = doc.apply(*fwd_del_rule_tx);
+    assert!(doc.find_block(rule_id).is_none());
+    doc.apply(applied_fwd_rule.inverse);
+    assert!(doc.find_block(rule_id).is_some());
+
+    // Backspace after non-empty code block moves caret into code block without mutating.
+    let after_code_start = doc.doc_pos_for_block(after_code_id, 0).unwrap();
+    let BoundaryDeleteOutcome::MoveSelection(moved) = doc
+        .plan_backward_boundary_delete(&after_code_start, None)
+        .unwrap()
+    else {
+        panic!("expected non-destructive move into code block");
+    };
+    assert_eq!(
+        *moved,
+        DocumentSelection::caret(
+            doc.doc_pos_for_block(code_id, 10).unwrap(),
+            Affinity::Downstream
+        )
+    );
+
+    // Non-empty code block Backspace at offset 0 is a no-op; empty code block converts to paragraph.
+    let code_start = doc.doc_pos_for_block(code_id, 0).unwrap();
+    assert!(
+        doc.plan_backward_boundary_delete(&code_start, None)
+            .is_none()
+    );
+    let BoundaryDeleteOutcome::MoveSelection(exited) =
+        doc.plan_exit_block(&code_start, None).unwrap()
+    else {
+        panic!("expected ExitBlock to move to existing following paragraph");
+    };
+    assert_eq!(
+        *exited,
+        DocumentSelection::caret(after_code_start.clone(), Affinity::Downstream)
+    );
+
+    let empty_code_id = doc.add_code_block(None, InlineContent::empty());
+    let empty_code_pos = doc.doc_pos_for_block(empty_code_id, 0).unwrap();
+    let BoundaryDeleteOutcome::Edit(insert_after_tx) =
+        doc.plan_exit_block(&empty_code_pos, None).unwrap()
+    else {
+        panic!("expected ExitBlock at document end to insert trailing paragraph");
+    };
+    doc.apply(*insert_after_tx);
+    assert!(doc.blocks.last().unwrap().kind.is_paragraph());
+
+    let BoundaryDeleteOutcome::Edit(convert_empty_code_tx) = doc
+        .plan_backward_boundary_delete(&empty_code_pos, None)
+        .unwrap()
+    else {
+        panic!("expected empty code block to convert to paragraph");
+    };
+    doc.apply(*convert_empty_code_tx);
+    assert!(doc.find_block(empty_code_id).unwrap().kind.is_paragraph());
+
+    // 3. Built-in block commands: ToggleBlockquote, ToggleCodeBlock, SetCodeBlockLanguage,
+    // InsertHorizontalRule, InsertTable, and InteractionPolicy gating.
+    let mut doc = Document::new();
+    let p1 = doc.add_paragraph(InlineContent::plain("Line 1"), BlockStyle::default());
+    let p2 = doc.add_paragraph(InlineContent::plain("Line 2"), BlockStyle::default());
+    let sel = Some(DocumentSelection::Text {
+        anchor: doc.doc_pos_for_block(p1, 0).unwrap(),
+        focus: doc.doc_pos_for_block(p2, 6).unwrap(),
+        affinity: Affinity::Downstream,
+        goal_x: None,
+        stored_marks: None,
+    });
+    let wrap_tx = doc
+        .build_toggle_blockquote_transaction(&[p1, p2], sel)
+        .unwrap();
+    doc.apply(wrap_tx);
+    assert_eq!(doc.blocks.len(), 1);
+    assert_eq!(doc.blocks[0].kind.semantic_kind(), block_kinds::BLOCKQUOTE);
+
+    let unwrap_tx = doc
+        .build_toggle_blockquote_transaction(&[p1, p2], None)
+        .unwrap();
+    doc.apply(unwrap_tx);
+    assert_eq!(doc.blocks.len(), 2);
+    assert_eq!(doc.blocks[0].id, p1);
+    assert_eq!(doc.blocks[1].id, p2);
+
+    let code_tx = doc
+        .build_toggle_code_block_transaction(&[p1, p2], None)
+        .unwrap();
+    doc.apply(code_tx);
+    assert_eq!(doc.blocks.len(), 1);
+    assert_eq!(
+        doc.find_block(p1)
+            .unwrap()
+            .kind
+            .inline_content()
+            .unwrap()
+            .text,
+        "Line 1\nLine 2"
+    );
+
+    let lang_tx = doc
+        .build_set_code_block_language_transaction(p1, Some("rust".to_owned()), None)
+        .unwrap();
+    doc.apply(lang_tx);
+    assert_eq!(
+        doc.find_block(p1)
+            .unwrap()
+            .kind
+            .code_block_data()
+            .unwrap()
+            .language
+            .as_deref(),
+        Some("rust")
+    );
+
+    let uncode_tx = doc
+        .build_toggle_code_block_transaction(&[p1], None)
+        .unwrap();
+    doc.apply(uncode_tx);
+    assert_eq!(doc.blocks.len(), 2);
+    assert_eq!(doc.blocks[0].kind.inline_content().unwrap().text, "Line 1");
+    assert_eq!(doc.blocks[1].kind.inline_content().unwrap().text, "Line 2");
+
+    let split_hr_pos = doc.doc_pos_for_block(p1, 4).unwrap();
+    let hr_tx = doc
+        .build_insert_horizontal_rule_transaction(&split_hr_pos, None)
+        .unwrap();
+    doc.apply(hr_tx);
+    assert!(doc.blocks[1].kind.is_horizontal_rule());
+    assert_eq!(doc.blocks[0].kind.inline_content().unwrap().text, "Line");
+    assert_eq!(doc.blocks[2].kind.inline_content().unwrap().text, " 1");
+
+    let table_pos = doc
+        .doc_pos_for_block(doc.blocks.last().unwrap().id, 6)
+        .unwrap();
+    let table_tx = doc
+        .build_insert_table_transaction(&table_pos, 2, 2, true, None)
+        .unwrap();
+    doc.apply(table_tx);
+    let table_index = doc
+        .blocks
+        .iter()
+        .position(|block| block.kind.table_block().is_some())
+        .unwrap();
+    let table_id = doc.blocks[table_index].id;
+    let after_table_id = doc.blocks[table_index + 1].id;
+    assert!(doc.blocks[table_index + 1].kind.is_paragraph());
+    let after_table_pos = doc.doc_pos_for_block(after_table_id, 0).unwrap();
+    let BoundaryDeleteOutcome::MoveSelection(entered_table) = doc
+        .plan_backward_boundary_delete(&after_table_pos, None)
+        .unwrap()
+    else {
+        panic!("expected Backspace after table to enter last cell");
+    };
+    assert!(matches!(
+        *entered_table,
+        DocumentSelection::Text { focus, .. }
+            if focus.path.iter().any(|seg| matches!(seg, PathSegment::TableCell { table_id: id, row: 1, col: 1 } if *id == table_id))
+    ));
+
+    let mut policy = InteractionPolicy::editable();
+    policy.editing.formatting.blocks = false;
+    policy.editing.tables.structure = false;
+    assert_eq!(
+        policy.check_command(&RichCommand::ToggleBlockquote, CommandSource::User),
+        Some(CommandOutcome::RejectedByPolicy)
+    );
+    assert_eq!(
+        policy.check_command(&RichCommand::ToggleCodeBlock, CommandSource::User),
+        Some(CommandOutcome::RejectedByPolicy)
+    );
+    assert_eq!(
+        policy.check_command(
+            &RichCommand::SetCodeBlockLanguage(Some("rs".to_owned())),
+            CommandSource::User
+        ),
+        Some(CommandOutcome::RejectedByPolicy)
+    );
+    assert_eq!(
+        policy.check_command(&RichCommand::InsertHorizontalRule, CommandSource::User),
+        Some(CommandOutcome::RejectedByPolicy)
+    );
+    assert_eq!(
+        policy.check_command(
+            &RichCommand::InsertTable {
+                rows: 2,
+                columns: 2,
+                with_header: true
+            },
+            CommandSource::User
+        ),
+        Some(CommandOutcome::RejectedByPolicy)
+    );
+    assert_eq!(
+        policy.check_command(&RichCommand::ExitBlock, CommandSource::User),
+        None
+    );
+}

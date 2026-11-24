@@ -330,6 +330,7 @@ pub enum RichCommand {
         unit: MoveUnit,
     },
     SplitBlock,
+    ExitBlock,
     InsertSoftBreak,
     Indent,
     Outdent,
@@ -345,6 +346,15 @@ pub enum RichCommand {
     },
     SetHeading(Option<u8>),
     ToggleList(ListKind),
+    ToggleBlockquote,
+    ToggleCodeBlock,
+    SetCodeBlockLanguage(Option<String>),
+    InsertHorizontalRule,
+    InsertTable {
+        rows: usize,
+        columns: usize,
+        with_header: bool,
+    },
     SetTextAlign(TextAlign),
     PasteHtml {
         html: String,
@@ -421,6 +431,7 @@ impl RichCommand {
             | Self::ResizeInlineImage { .. }
             | Self::Delete { .. }
             | Self::SplitBlock
+            | Self::ExitBlock
             | Self::InsertSoftBreak
             | Self::Indent
             | Self::Outdent
@@ -433,6 +444,11 @@ impl RichCommand {
             | Self::UpdateNamedStyle { .. }
             | Self::SetHeading(_)
             | Self::ToggleList(_)
+            | Self::ToggleBlockquote
+            | Self::ToggleCodeBlock
+            | Self::SetCodeBlockLanguage(_)
+            | Self::InsertHorizontalRule
+            | Self::InsertTable { .. }
             | Self::SetTextAlign(_)
             | Self::PasteHtml { .. }
             | Self::PasteFragment { .. }
@@ -481,6 +497,7 @@ impl RichCommand {
             Self::ResizeInlineImage { .. } => "rich.edit.resize_inline_image",
             Self::Delete { .. } => "rich.edit.delete",
             Self::SplitBlock => "rich.edit.split_block",
+            Self::ExitBlock => "rich.edit.exit_block",
             Self::InsertSoftBreak => "rich.edit.insert_soft_break",
             Self::Indent => "rich.edit.indent",
             Self::Outdent => "rich.edit.outdent",
@@ -493,6 +510,11 @@ impl RichCommand {
             Self::UpdateNamedStyle { .. } => "rich.format.update_named_style",
             Self::SetHeading(_) => "rich.format.set_heading",
             Self::ToggleList(_) => "rich.format.toggle_list",
+            Self::ToggleBlockquote => "rich.format.toggle_blockquote",
+            Self::ToggleCodeBlock => "rich.format.toggle_code_block",
+            Self::SetCodeBlockLanguage(_) => "rich.format.set_code_block_language",
+            Self::InsertHorizontalRule => "rich.edit.insert_horizontal_rule",
+            Self::InsertTable { .. } => "rich.table.insert",
             Self::SetTextAlign(_) => "rich.format.set_text_align",
             Self::PasteHtml { .. } => "rich.clipboard.paste_html",
             Self::PasteFragment { .. } => "rich.clipboard.paste_fragment",
@@ -561,6 +583,8 @@ pub struct FormattingFeatures {
     pub rich_styles: bool,
     pub headings: bool,
     pub lists: bool,
+    /// Blockquotes, code blocks, and horizontal rules.
+    pub blocks: bool,
     pub links: bool,
     pub clear: bool,
 }
@@ -572,6 +596,7 @@ impl FormattingFeatures {
         rich_styles: true,
         headings: true,
         lists: true,
+        blocks: true,
         links: true,
         clear: true,
     };
@@ -729,6 +754,10 @@ impl InteractionPolicy {
         self.editing.enabled && self.editing.formatting.enabled && self.editing.formatting.lists
     }
 
+    pub const fn can_format_blocks(&self) -> bool {
+        self.editing.enabled && self.editing.formatting.enabled && self.editing.formatting.blocks
+    }
+
     pub const fn can_apply_rich_styles(&self) -> bool {
         self.editing.enabled
             && self.editing.formatting.enabled
@@ -790,12 +819,17 @@ impl InteractionPolicy {
                 crate::model::StructureCommand::RestartOrderedList { .. }
                 | crate::model::StructureCommand::ContinueOrderedList { .. },
             ) => self.can_format_lists(),
+            RichCommand::ToggleBlockquote
+            | RichCommand::ToggleCodeBlock
+            | RichCommand::SetCodeBlockLanguage(_)
+            | RichCommand::InsertHorizontalRule => self.can_format_blocks(),
             RichCommand::PasteHtml { .. } | RichCommand::PasteFragment { .. } => {
                 self.can_paste_rich_text()
             }
             RichCommand::PasteText(_) => self.editing.plain_paste,
             RichCommand::SetTableColumns { .. } => self.can_resize_table_columns(),
-            RichCommand::InsertTableRow { .. }
+            RichCommand::InsertTable { .. }
+            | RichCommand::InsertTableRow { .. }
             | RichCommand::DeleteTableRow
             | RichCommand::InsertTableColumn { .. }
             | RichCommand::DeleteTableColumn

@@ -821,38 +821,147 @@ impl<B: GlyphBackend> FlowLayout<B> {
                 if let Some((table, origin)) = visible_blocks.iter().find_map(|visible| {
                     find_table_layout(&visible.layout, *table_id, Point::new(visible.x, visible.y))
                 }) {
-                    let (mut top, mut bottom, mut left, mut right) =
-                        (row_min, row_max, col_min, col_max);
-                    loop {
-                        let previous = (top, bottom, left, right);
-                        for cell in &table.cells {
-                            let last_row = cell.row + usize::from(cell.rowspan.max(1)) - 1;
-                            let last_col = cell.col + usize::from(cell.colspan.max(1)) - 1;
-                            if last_row >= top
-                                && cell.row <= bottom
-                                && last_col >= left
-                                && cell.col <= right
-                            {
-                                top = top.min(cell.row);
-                                bottom = bottom.max(last_row);
-                                left = left.min(cell.col);
-                                right = right.max(last_col);
-                            }
+                    rects.extend(table_selection_rects(
+                        table,
+                        origin,
+                        (row_min, row_max),
+                        (col_min, col_max),
+                    ));
+                }
+            }
+        }
+        rects
+    }
+
+    /// Computes canvas-space selection rectangles using the latest cached block layouts
+    /// (without requiring a [`TextShaper`] or active `prepaint` visible list).
+    pub fn cached_selection_rects(
+        &self,
+        selection: &DocumentSelection,
+        doc: &Document,
+        viewport_width: f32,
+        zoom: f32,
+    ) -> Vec<Rect> {
+        let mut rects = Vec::new();
+        match selection {
+            DocumentSelection::Text { anchor, focus, .. } => {
+                if anchor == focus {
+                    return rects;
+                }
+                let Some(anchor_leaf_id) = anchor.leaf_block_id() else {
+                    return rects;
+                };
+                let Some(focus_leaf_id) = focus.leaf_block_id() else {
+                    return rects;
+                };
+                let Some(&anchor_order) = self.leaf_order.get(&anchor_leaf_id) else {
+                    return rects;
+                };
+                let Some(&focus_order) = self.leaf_order.get(&focus_leaf_id) else {
+                    return rects;
+                };
+
+                let ((start_order, start_offset), (end_order, end_offset)) =
+                    if (anchor_order, anchor.offset) <= (focus_order, focus.offset) {
+                        ((anchor_order, anchor.offset), (focus_order, focus.offset))
+                    } else {
+                        ((focus_order, focus.offset), (anchor_order, anchor.offset))
+                    };
+
+                for ((top_index, block), visible) in doc
+                    .blocks
+                    .iter()
+                    .enumerate()
+                    .zip(doc.top_level_visibility())
+                {
+                    if !visible {
+                        continue;
+                    }
+                    let Some(layout) = self.cache.get_latest(block.id) else {
+                        continue;
+                    };
+                    let (block_x, _) = resolve_block_horizontal_span(
+                        viewport_width,
+                        &doc.config,
+                        block.width_mode,
+                        zoom,
+                    );
+                    let block_y = self.block_y(top_index);
+                    let mut leaf_paragraphs = Vec::new();
+                    collect_leaf_paragraphs(&layout, block_x, block_y, &mut leaf_paragraphs);
+
+                    for leaf in leaf_paragraphs {
+                        let Some(&leaf_order) = self.leaf_order.get(&leaf.block_id) else {
+                            continue;
+                        };
+                        if leaf_order < start_order || leaf_order > end_order {
+                            continue;
                         }
-                        if previous == (top, bottom, left, right) {
-                            break;
+                        let block_len = leaf
+                            .paragraph
+                            .lines
+                            .last()
+                            .map(|line| line.doc_range.end)
+                            .unwrap_or(0);
+                        let range = if start_order == end_order {
+                            start_offset..end_offset
+                        } else if leaf_order == start_order {
+                            start_offset..block_len
+                        } else if leaf_order == end_order {
+                            0..end_offset
+                        } else {
+                            0..block_len
+                        };
+                        let trailing = leaf_order < end_order;
+                        for rect in leaf.paragraph.selection_rects(range, trailing) {
+                            rects.push(rect.translate(leaf.origin_x, leaf.origin_y));
                         }
                     }
-                    rects.extend(
-                        table
-                            .cells
-                            .iter()
-                            .filter(|cell| {
-                                (top..=bottom).contains(&cell.row)
-                                    && (left..=right).contains(&cell.col)
-                            })
-                            .map(|cell| cell.rect.translate(origin.x, origin.y)),
-                    );
+                }
+            }
+            DocumentSelection::TableCells {
+                table_id,
+                anchor_cell,
+                focus_cell,
+            } => {
+                let Some(path) = doc.path_for_block(*table_id) else {
+                    return rects;
+                };
+                let Some(top_id) = path.first().map(|segment| match *segment {
+                    PathSegment::Block(id) => id,
+                    PathSegment::TableCell { table_id, .. } => table_id,
+                }) else {
+                    return rects;
+                };
+                let Some(top_index) = doc.top_level_index(top_id) else {
+                    return rects;
+                };
+                let Some(top_block) = doc.blocks.get(top_index) else {
+                    return rects;
+                };
+                let Some(layout) = self.cache.get_latest(top_id) else {
+                    return rects;
+                };
+                let (block_x, _) = resolve_block_horizontal_span(
+                    viewport_width,
+                    &doc.config,
+                    top_block.width_mode,
+                    zoom,
+                );
+                let block_y = self.block_y(top_index);
+                if let Some((table, origin)) =
+                    find_table_layout(&layout, *table_id, Point::new(block_x, block_y))
+                {
+                    let row_min = anchor_cell.0.min(focus_cell.0);
+                    let row_max = anchor_cell.0.max(focus_cell.0);
+                    let col_min = anchor_cell.1.min(focus_cell.1);
+                    let col_max = anchor_cell.1.max(focus_cell.1);
+                    rects.extend(table_selection_rects(
+                        table,
+                        origin,
+                        (row_min, row_max),
+                        (col_min, col_max),
+                    ));
                 }
             }
         }
@@ -1547,6 +1656,38 @@ fn hit_test_block_chrome<B: GlyphBackend>(
         }),
         _ => None,
     }
+}
+
+fn table_selection_rects<B: GlyphBackend>(
+    table: &crate::layout::block::TableLayout<B>,
+    origin: Point,
+    row_bounds: (usize, usize),
+    col_bounds: (usize, usize),
+) -> Vec<Rect> {
+    let (mut top, mut bottom) = row_bounds;
+    let (mut left, mut right) = col_bounds;
+    loop {
+        let previous = (top, bottom, left, right);
+        for cell in &table.cells {
+            let last_row = cell.row + usize::from(cell.rowspan.max(1)) - 1;
+            let last_col = cell.col + usize::from(cell.colspan.max(1)) - 1;
+            if last_row >= top && cell.row <= bottom && last_col >= left && cell.col <= right {
+                top = top.min(cell.row);
+                bottom = bottom.max(last_row);
+                left = left.min(cell.col);
+                right = right.max(last_col);
+            }
+        }
+        if previous == (top, bottom, left, right) {
+            break;
+        }
+    }
+    table
+        .cells
+        .iter()
+        .filter(|cell| (top..=bottom).contains(&cell.row) && (left..=right).contains(&cell.col))
+        .map(|cell| cell.rect.translate(origin.x, origin.y))
+        .collect()
 }
 
 fn rect_distance_sq(rect: Rect, point: Point) -> f32 {

@@ -407,6 +407,7 @@ impl RichDocumentView {
                 self.execute_delete(*direction, *unit, source, cx)
             }
             RichCommand::SplitBlock => self.execute_split_block(cx),
+            RichCommand::ExitBlock => self.execute_exit_block(cx),
             RichCommand::InsertSoftBreak => self.execute_insert_soft_break(cx),
             RichCommand::Indent | RichCommand::Outdent if self.active_table_context().is_some() => {
                 self.execute_navigate_table_cell(matches!(command, RichCommand::Indent), source, cx)
@@ -424,6 +425,17 @@ impl RichDocumentView {
             }
             RichCommand::SetHeading(level) => self.execute_set_heading(*level, cx),
             RichCommand::ToggleList(list_kind) => self.execute_toggle_list(*list_kind, cx),
+            RichCommand::ToggleBlockquote => self.execute_toggle_blockquote(cx),
+            RichCommand::ToggleCodeBlock => self.execute_toggle_code_block(cx),
+            RichCommand::SetCodeBlockLanguage(language) => {
+                self.execute_set_code_block_language(language.clone(), cx)
+            }
+            RichCommand::InsertHorizontalRule => self.execute_insert_horizontal_rule(cx),
+            RichCommand::InsertTable {
+                rows,
+                columns,
+                with_header,
+            } => self.execute_insert_table(*rows, *columns, *with_header, cx),
             RichCommand::SetTextAlign(align) => self.execute_set_text_align(*align, cx),
             RichCommand::PasteHtml { html, plain_text } => {
                 self.execute_paste_html(html, plain_text.as_deref(), source, cx)
@@ -941,18 +953,13 @@ impl RichDocumentView {
         match direction {
             MoveDirection::Backward | MoveDirection::Up => {
                 if offset == 0 {
-                    let Some(transaction) = self
+                    let Some(outcome) = self
                         .document
-                        .build_merge_with_previous_transaction(&focus, selection_before)
+                        .plan_backward_boundary_delete(&focus, selection_before)
                     else {
                         return CommandOutcome::NoOp;
                     };
-                    self.apply_transaction_grouped(
-                        transaction,
-                        Some(HistoryMergeGroup::Atomic),
-                        cx,
-                    );
-                    return CommandOutcome::Executed;
+                    return self.apply_boundary_delete_outcome(outcome, cx);
                 }
 
                 let start = match unit {
@@ -988,18 +995,13 @@ impl RichDocumentView {
             }
             MoveDirection::Forward | MoveDirection::Down => {
                 if offset >= inline.len() {
-                    let Some(transaction) = self
+                    let Some(outcome) = self
                         .document
-                        .build_merge_with_next_transaction(&focus, selection_before)
+                        .plan_forward_boundary_delete(&focus, selection_before)
                     else {
                         return CommandOutcome::NoOp;
                     };
-                    self.apply_transaction_grouped(
-                        transaction,
-                        Some(HistoryMergeGroup::Atomic),
-                        cx,
-                    );
-                    return CommandOutcome::Executed;
+                    return self.apply_boundary_delete_outcome(outcome, cx);
                 }
 
                 let end = match unit {
@@ -1034,7 +1036,33 @@ impl RichDocumentView {
         }
     }
 
-    fn execute_split_block(&mut self, cx: &mut Context<Self>) -> CommandOutcome {
+    fn apply_boundary_delete_outcome(
+        &mut self,
+        outcome: BoundaryDeleteOutcome,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        match outcome {
+            BoundaryDeleteOutcome::Edit(transaction) => {
+                self.apply_transaction_grouped(*transaction, Some(HistoryMergeGroup::Atomic), cx);
+                CommandOutcome::Executed
+            }
+            BoundaryDeleteOutcome::MoveSelection(selection) => {
+                if self.update_selection(Some(*selection), cx) {
+                    self.reset_caret_blink(cx);
+                    self.ensure_caret_visible();
+                    CommandOutcome::Executed
+                } else {
+                    CommandOutcome::NoOp
+                }
+            }
+        }
+    }
+
+    fn execute_delete_then(
+        &mut self,
+        cx: &mut Context<Self>,
+        build: impl FnOnce(&mut Document, &DocPos, Option<DocumentSelection>) -> Option<Transaction>,
+    ) -> CommandOutcome {
         self.ime_preedit = None;
         self.history.break_coalescing();
         let Some((anchor, focus, _)) = self.active_text_selection() else {
@@ -1043,37 +1071,31 @@ impl RichDocumentView {
         let selection_before = self.selection.clone();
 
         if anchor == focus {
-            let Some(transaction) = self
-                .document
-                .build_split_block_transaction(&focus, selection_before)
-            else {
+            let Some(transaction) = build(&mut self.document, &focus, selection_before) else {
                 return CommandOutcome::NoOp;
             };
             self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
             return CommandOutcome::Executed;
         }
 
-        // Delete active selection then split, combining both into one atomic undo entry.
         let anchor_scroll = self.flow.capture_anchor(self.scroll_y);
         let Some((delete_steps, caret_pos)) = self.document.delete_selection_steps(&anchor, &focus)
         else {
             return CommandOutcome::NoOp;
         };
         let applied_del = self.document.apply(Transaction::new(delete_steps));
-        let Some(split_tx) = self
-            .document
-            .build_split_block_transaction(&caret_pos, None)
-        else {
+        let Some(follow_up_tx) = build(&mut self.document, &caret_pos, None) else {
+            self.document.apply(applied_del.inverse);
             return CommandOutcome::NoOp;
         };
-        let next_selection = split_tx.selection_after.clone();
-        let applied_split = self.document.apply(split_tx);
+        let next_selection = follow_up_tx.selection_after.clone();
+        let applied_follow_up = self.document.apply(follow_up_tx);
 
-        let mut combined_inverse = applied_split.inverse.steps;
+        let mut combined_inverse = applied_follow_up.inverse.steps;
         combined_inverse.extend(applied_del.inverse.steps);
         let mut combined_change_set = applied_del.change_set;
-        combined_change_set.structure_changed |= applied_split.change_set.structure_changed;
-        for dirty in applied_split.change_set.dirty_blocks {
+        combined_change_set.structure_changed |= applied_follow_up.change_set.structure_changed;
+        for dirty in applied_follow_up.change_set.dirty_blocks {
             if !combined_change_set.dirty_blocks.contains(&dirty) {
                 combined_change_set.dirty_blocks.push(dirty);
             }
@@ -1096,6 +1118,104 @@ impl RichDocumentView {
         self.ensure_caret_visible();
         cx.notify();
         CommandOutcome::Executed
+    }
+
+    fn execute_split_block(&mut self, cx: &mut Context<Self>) -> CommandOutcome {
+        self.execute_delete_then(cx, |document, pos, selection_before| {
+            document.build_split_block_transaction(pos, selection_before)
+        })
+    }
+
+    fn execute_exit_block(&mut self, cx: &mut Context<Self>) -> CommandOutcome {
+        self.ime_preedit = None;
+        self.history.break_coalescing();
+        let Some((_, focus, _)) = self.active_text_selection() else {
+            return CommandOutcome::NoOp;
+        };
+        let selection_before = self.selection.clone();
+        let Some(outcome) = self.document.plan_exit_block(&focus, selection_before) else {
+            return CommandOutcome::NoOp;
+        };
+        self.apply_boundary_delete_outcome(outcome, cx)
+    }
+
+    fn execute_toggle_blockquote(&mut self, cx: &mut Context<Self>) -> CommandOutcome {
+        self.ime_preedit = None;
+        self.history.break_coalescing();
+        let block_ids = self.selected_leaf_block_ids();
+        let selection_before = self.selection.clone();
+        let Some(transaction) = self
+            .document
+            .build_toggle_blockquote_transaction(&block_ids, selection_before)
+        else {
+            return CommandOutcome::NoOp;
+        };
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+        CommandOutcome::Executed
+    }
+
+    fn execute_toggle_code_block(&mut self, cx: &mut Context<Self>) -> CommandOutcome {
+        self.ime_preedit = None;
+        self.history.break_coalescing();
+        let block_ids = self.selected_leaf_block_ids();
+        let selection_before = self.selection.clone();
+        let Some(transaction) = self
+            .document
+            .build_toggle_code_block_transaction(&block_ids, selection_before)
+        else {
+            return CommandOutcome::NoOp;
+        };
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+        CommandOutcome::Executed
+    }
+
+    fn execute_set_code_block_language(
+        &mut self,
+        language: Option<String>,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        self.ime_preedit = None;
+        self.history.break_coalescing();
+        let Some((_, focus, _)) = self.active_text_selection() else {
+            return CommandOutcome::NoOp;
+        };
+        let Some(block_id) = focus.leaf_block_id() else {
+            return CommandOutcome::NoOp;
+        };
+        let selection_before = self.selection.clone();
+        let Some(transaction) = self.document.build_set_code_block_language_transaction(
+            block_id,
+            language,
+            selection_before,
+        ) else {
+            return CommandOutcome::NoOp;
+        };
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+        CommandOutcome::Executed
+    }
+
+    fn execute_insert_horizontal_rule(&mut self, cx: &mut Context<Self>) -> CommandOutcome {
+        self.execute_delete_then(cx, |document, pos, selection_before| {
+            document.build_insert_horizontal_rule_transaction(pos, selection_before)
+        })
+    }
+
+    fn execute_insert_table(
+        &mut self,
+        rows: usize,
+        columns: usize,
+        with_header: bool,
+        cx: &mut Context<Self>,
+    ) -> CommandOutcome {
+        self.execute_delete_then(cx, |document, pos, selection_before| {
+            document.build_insert_table_transaction(
+                pos,
+                rows,
+                columns,
+                with_header,
+                selection_before,
+            )
+        })
     }
 
     fn execute_insert_soft_break(&mut self, cx: &mut Context<Self>) -> CommandOutcome {
@@ -2466,6 +2586,34 @@ impl RichDocumentView {
             .map(|item| item.kind)
     }
 
+    /// Returns `true` when the focused block is nested inside a blockquote container.
+    pub fn is_in_blockquote(&self) -> bool {
+        let Some((_, focus, _)) = self.active_text_selection() else {
+            return false;
+        };
+        focus
+            .path
+            .iter()
+            .rev()
+            .skip(1)
+            .any(|segment| match *segment {
+                PathSegment::Block(id) => self
+                    .document
+                    .find_block(id)
+                    .is_some_and(|block| block.kind.semantic_kind() == block_kinds::BLOCKQUOTE),
+                PathSegment::TableCell { .. } => false,
+            })
+    }
+
+    /// Returns the active code block's ID and optional language tag when the focus is inside a
+    /// code block.
+    pub fn active_code_block(&self) -> Option<(BlockId, Option<String>)> {
+        let (_, focus, _) = self.active_text_selection()?;
+        let block_id = focus.leaf_block_id()?;
+        let code = self.document.find_block(block_id)?.kind.code_block_data()?;
+        Some((block_id, code.language.clone()))
+    }
+
     fn execute_clear_formatting(&mut self, cx: &mut Context<Self>) -> CommandOutcome {
         self.ime_preedit = None;
         self.history.break_coalescing();
@@ -2749,6 +2897,31 @@ impl RichDocumentView {
         Some(SelectionValue::Uniform(first_level))
     }
 
+    /// Returns whether all selected blocks are inside a blockquote (`Uniform(true)` / `Uniform(false)`)
+    /// or span both quoted and unquoted blocks (`Mixed`).
+    pub fn selected_in_blockquote(&self) -> Option<SelectionValue<bool>> {
+        let block_ids = self.selected_leaf_block_ids();
+        let first_id = *block_ids.first()?;
+        let in_quote = |block_id: BlockId| {
+            self.document.path_for_block(block_id).is_some_and(|path| {
+                path.iter().rev().skip(1).any(|segment| match *segment {
+                    PathSegment::Block(id) => self
+                        .document
+                        .find_block(id)
+                        .is_some_and(|block| block.kind.semantic_kind() == block_kinds::BLOCKQUOTE),
+                    PathSegment::TableCell { .. } => false,
+                })
+            })
+        };
+        let first = in_quote(first_id);
+        for block_id in block_ids.into_iter().skip(1) {
+            if in_quote(block_id) != first {
+                return Some(SelectionValue::Mixed);
+            }
+        }
+        Some(SelectionValue::Uniform(first))
+    }
+
     pub(super) fn active_text_selection(
         &self,
     ) -> Option<(DocPos, DocPos, Option<crate::model::InlineStyle>)> {
@@ -2770,7 +2943,7 @@ impl RichDocumentView {
         }
     }
 
-    fn first_pos_in_table_cell(
+    pub(super) fn first_pos_in_table_cell(
         &self,
         table_id: BlockId,
         cell_coords: (usize, usize),

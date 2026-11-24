@@ -15,16 +15,16 @@ use crate::layout::{
     resolve_horizontal_metrics,
 };
 use crate::model::{
-    Affinity, BlockId, BlockKind, BlockNode, BlockSpec, BlockStyle, ChangeSet, ChipKind,
-    ClipboardBlock, ClipboardFragment, CodecError, ColumnSpec, CommandDecision, CommandEffectKind,
-    CommandMiddleware, CommandOutcome, CommandResolution, CommandSource, CrdtSyncBridge,
-    DecorationProvider, DocPos, Document, DocumentCodec, DocumentSelection, DynamicDocumentCodec,
-    Edges, Edit, EncodedDocument, ExtensionCommand, ExtensionInvocation, History,
-    HistoryMergeGroup, HorizontalLayout, ImageAssetId, InlineContent, InlineObject, InlineObjectId,
-    InlineSpec, InlineStyle, InteractionPolicy, LinkTarget, ListKind, MarkKind, MoveDirection,
-    MoveUnit, NamedStyle, NumberStyle, OBJECT_REPLACEMENT_UTF8_LEN, PathSegment, ReadOnly,
-    ResolvedCommand, ResolvedTextStyle, RgbaColor, RichCommand, SelectionValue, SharedStr, Step,
-    StyleId, SyncDelta, TextAlign, Transaction,
+    Affinity, BlockId, BlockKind, BlockNode, BlockSpec, BlockStyle, BoundaryDeleteOutcome,
+    ChangeSet, ChipKind, ClipboardBlock, ClipboardFragment, CodecError, ColumnSpec,
+    CommandDecision, CommandEffectKind, CommandMiddleware, CommandOutcome, CommandResolution,
+    CommandSource, CrdtSyncBridge, DecorationProvider, DocPos, Document, DocumentCodec,
+    DocumentSelection, DynamicDocumentCodec, Edges, Edit, EncodedDocument, ExtensionCommand,
+    ExtensionInvocation, History, HistoryMergeGroup, HorizontalLayout, ImageAssetId, InlineContent,
+    InlineObject, InlineObjectId, InlineSpec, InlineStyle, InteractionPolicy, LinkTarget, ListKind,
+    MarkKind, MoveDirection, MoveUnit, NamedStyle, NumberStyle, OBJECT_REPLACEMENT_UTF8_LEN,
+    PathSegment, ReadOnly, ResolvedCommand, ResolvedTextStyle, RgbaColor, RichCommand,
+    SelectionValue, SharedStr, Step, StyleId, SyncDelta, TextAlign, Transaction, block_kinds,
 };
 use gpui_kit::{
     App, Bounds, ClipboardItem, Context, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
@@ -869,6 +869,98 @@ impl RichDocumentView {
         self.scroll_x = self.scroll_x.clamp(0.0, max_scroll_x);
     }
 
+    /// Returns the last painted window-space bounds of the document viewport, or `None` before
+    /// the first layout pass.
+    pub fn viewport_bounds(&self) -> Option<Bounds<Pixels>> {
+        let width: f32 = self.last_viewport_bounds.size.width.into();
+        let height: f32 = self.last_viewport_bounds.size.height.into();
+        (width > 1.0 && height > 1.0).then_some(self.last_viewport_bounds)
+    }
+
+    /// Returns the window-space bounds of the active caret (or focus edge of a range selection)
+    /// using the latest cached block layout, suitable for anchoring popovers or slash menus.
+    pub fn caret_bounds(&self) -> Option<Bounds<Pixels>> {
+        let viewport = self.viewport_bounds()?;
+        let viewport_width: f32 = viewport.size.width.into();
+        let (focus, affinity) = match self.selection.as_ref()? {
+            DocumentSelection::Text {
+                focus, affinity, ..
+            } => (focus.clone(), *affinity),
+            DocumentSelection::TableCells {
+                table_id,
+                focus_cell,
+                ..
+            } => (
+                self.first_pos_in_table_cell(*table_id, *focus_cell)?,
+                Affinity::Downstream,
+            ),
+        };
+        let canvas_rect = self.flow.cached_caret_rect(
+            &focus,
+            affinity,
+            &self.document,
+            viewport_width,
+            self.zoom,
+        )?;
+        Some(self.canvas_rect_to_window(canvas_rect))
+    }
+
+    /// Returns window-space rectangles covering the active text or table-cell selection using
+    /// the latest cached block layouts.
+    pub fn selection_rects(&self) -> Vec<Bounds<Pixels>> {
+        let Some(viewport) = self.viewport_bounds() else {
+            return Vec::new();
+        };
+        let Some(selection) = self.selection.as_ref() else {
+            return Vec::new();
+        };
+        let viewport_width: f32 = viewport.size.width.into();
+        self.flow
+            .cached_selection_rects(selection, &self.document, viewport_width, self.zoom)
+            .into_iter()
+            .map(|rect| self.canvas_rect_to_window(rect))
+            .collect()
+    }
+
+    /// Returns the window-space bounding box of the active selection (falling back to
+    /// [`Self::caret_bounds`] when collapsed), suitable for anchoring floating toolbars.
+    pub fn selection_bounds(&self) -> Option<Bounds<Pixels>> {
+        let rects = self.selection_rects();
+        let Some(first) = rects.first() else {
+            return self.caret_bounds();
+        };
+        let mut min_x: f32 = first.origin.x.into();
+        let mut min_y: f32 = first.origin.y.into();
+        let mut max_x: f32 = min_x + f32::from(first.size.width);
+        let mut max_y: f32 = min_y + f32::from(first.size.height);
+        for rect in rects.iter().skip(1) {
+            let x: f32 = rect.origin.x.into();
+            let y: f32 = rect.origin.y.into();
+            let right = x + f32::from(rect.size.width);
+            let bottom = y + f32::from(rect.size.height);
+            min_x = min_x.min(x);
+            min_y = min_y.min(y);
+            max_x = max_x.max(right);
+            max_y = max_y.max(bottom);
+        }
+        Some(Bounds::new(
+            point(px(min_x), px(min_y)),
+            size(px((max_x - min_x).max(0.0)), px((max_y - min_y).max(0.0))),
+        ))
+    }
+
+    fn canvas_rect_to_window(&self, rect: Rect) -> Bounds<Pixels> {
+        let origin_x: f32 = self.last_viewport_bounds.origin.x.into();
+        let origin_y: f32 = self.last_viewport_bounds.origin.y.into();
+        Bounds::new(
+            point(
+                px(origin_x + rect.x - self.scroll_x),
+                px(origin_y + rect.y - self.scroll_y),
+            ),
+            size(px(rect.width), px(rect.height)),
+        )
+    }
+
     fn window_point_to_canvas(&self, position: GpuiPoint<Pixels>) -> Point {
         let origin_x: f32 = self.last_viewport_bounds.origin.x.into();
         let origin_y: f32 = self.last_viewport_bounds.origin.y.into();
@@ -1180,6 +1272,9 @@ impl Render for RichDocumentView {
             .on_action(cx.listener(|this, _: &Enter, _window, cx| {
                 this.dispatch_command(RichCommand::SplitBlock, cx);
             }))
+            .on_action(cx.listener(|this, _: &ExitBlock, _window, cx| {
+                this.dispatch_command(RichCommand::ExitBlock, cx);
+            }))
             .on_action(cx.listener(|this, _: &SoftBreak, _window, cx| {
                 this.dispatch_command(RichCommand::InsertSoftBreak, cx);
             }))
@@ -1233,6 +1328,15 @@ impl Render for RichDocumentView {
             }))
             .on_action(cx.listener(|this, _: &ToggleChecklist, _window, cx| {
                 this.dispatch_command(RichCommand::ToggleList(ListKind::Checklist), cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleBlockquote, _window, cx| {
+                this.dispatch_command(RichCommand::ToggleBlockquote, cx);
+            }))
+            .on_action(cx.listener(|this, _: &ToggleCodeBlock, _window, cx| {
+                this.dispatch_command(RichCommand::ToggleCodeBlock, cx);
+            }))
+            .on_action(cx.listener(|this, _: &InsertHorizontalRule, _window, cx| {
+                this.dispatch_command(RichCommand::InsertHorizontalRule, cx);
             }))
             .on_action(cx.listener(|this, _: &AlignLeft, _window, cx| {
                 this.dispatch_command(RichCommand::SetTextAlign(TextAlign::Left), cx);

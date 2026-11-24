@@ -679,3 +679,105 @@ fn interactive_checklist_code_copy_and_table_divider_hit_tests() {
     assert_eq!(divider.table_id, table_id);
     assert_eq!(divider.column_index, 0);
 }
+
+#[test]
+fn cached_selection_rects_match_visible_selection_for_text_and_tables() {
+    let mut doc = Document::new();
+    let p1 = doc.add_paragraph(
+        InlineContent::plain("First paragraph"),
+        BlockStyle::default(),
+    );
+    let p2 = doc.add_paragraph(
+        InlineContent::plain("Second paragraph"),
+        BlockStyle::default(),
+    );
+
+    let table_id = doc.alloc_block_id();
+    let cell_a = doc.alloc_block_id();
+    let cell_b = doc.alloc_block_id();
+    let cell_c = doc.alloc_block_id();
+    let cell_d = doc.alloc_block_id();
+    let p_a = doc.alloc_block_id();
+    let p_b = doc.alloc_block_id();
+    let p_c = doc.alloc_block_id();
+    let p_d = doc.alloc_block_id();
+    doc.push_block(BlockNode::new(
+        table_id,
+        BlockKind::table(TableBlock {
+            columns: vec![ColumnSpec::Ratio(1.0), ColumnSpec::Ratio(1.0)],
+            column_kinds: Default::default(),
+            rows: vec![
+                TableRow {
+                    is_header: true,
+                    cells: vec![
+                        TableCell::simple(
+                            cell_a,
+                            vec![BlockNode::new(
+                                p_a,
+                                BlockKind::paragraph(InlineContent::plain("A")),
+                                BlockStyle::default(),
+                            )],
+                        ),
+                        TableCell::simple(
+                            cell_b,
+                            vec![BlockNode::new(
+                                p_b,
+                                BlockKind::paragraph(InlineContent::plain("B")),
+                                BlockStyle::default(),
+                            )],
+                        ),
+                    ],
+                },
+                TableRow {
+                    is_header: false,
+                    cells: vec![
+                        TableCell::simple(
+                            cell_c,
+                            vec![BlockNode::new(
+                                p_c,
+                                BlockKind::paragraph(InlineContent::plain("C")),
+                                BlockStyle::default(),
+                            )],
+                        ),
+                        TableCell::simple(
+                            cell_d,
+                            vec![BlockNode::new(
+                                p_d,
+                                BlockKind::paragraph(InlineContent::plain("D")),
+                                BlockStyle::default(),
+                            )],
+                        ),
+                    ],
+                },
+            ],
+            border_style: TableBorderStyle::default(),
+        }),
+        BlockStyle::default(),
+    ));
+
+    let mut flow = FlowLayout::default();
+    let mut shaper = MockShaper;
+    let visible = flow.layout_visible_blocks(&doc, 0.0, 640.0, 600.0, 200.0, 1.0, &mut shaper);
+
+    let text_selection = DocumentSelection::Text {
+        anchor: doc.doc_pos_for_block(p1, 2).unwrap(),
+        focus: doc.doc_pos_for_block(p2, 6).unwrap(),
+        affinity: Affinity::Downstream,
+        goal_x: None,
+        stored_marks: None,
+    };
+    let visible_text_rects = flow.selection_rects_for_visible(&text_selection, &visible);
+    let cached_text_rects = flow.cached_selection_rects(&text_selection, &doc, 640.0, 1.0);
+    assert!(!cached_text_rects.is_empty());
+    assert_eq!(cached_text_rects, visible_text_rects);
+
+    let table_selection = DocumentSelection::TableCells {
+        table_id,
+        anchor_cell: (0, 0),
+        focus_cell: (1, 0),
+    };
+    let visible_table_rects = flow.selection_rects_for_visible(&table_selection, &visible);
+    let cached_table_rects = flow.cached_selection_rects(&table_selection, &doc, 640.0, 1.0);
+    assert_eq!(cached_table_rects.len(), 2);
+    assert_eq!(cached_table_rects, visible_table_rects);
+}
