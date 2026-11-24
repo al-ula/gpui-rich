@@ -22,7 +22,7 @@ pub use extension::{
     BlockRenderContext, BlockRenderer, CustomRenderOutput, DirectPaintCallback, EditCommandContext,
     ExtensionDiagnostic, ExtensionDiagnosticKind, ExtensionNamespace, ExtensionNodeTarget,
     ExtensionRegistrationError, ExtensionRegistry, InlineRenderContext, InlineRenderer,
-    ReadCommandContext, ReadCommandOutcome,
+    QueryContext, ReadCommandContext, ReadCommandOutcome,
 };
 pub use shaper::{
     FontResolver, GpuiGlyphBackend, GpuiShaper, clear_font_resolution_cache, resolve_font_family,
@@ -30,18 +30,19 @@ pub use shaper::{
 };
 pub use theme::{RichTheme, SmartChipColors, SmartChipPalette};
 pub use view::{
-    ActiveSmartChipPopover, ActiveTableContext, AlignCenter, AlignJustify, AlignLeft, AlignRight,
-    Backspace, BackspaceWord, ClearFormatting, ClearSelection, Copy, Cut, DecorationProviderId,
-    DecreaseFontSize, Delete, DeleteTableColumn, DeleteTableRow, DeleteWord, Enter,
-    ImageResizeCorner, ImePreedit, IncreaseFontSize, Indent, InsertTableColumnAfter,
-    InsertTableColumnBefore, InsertTableRowAbove, InsertTableRowBelow, MergeTableCells,
-    MiddlewareId, MoveDocEnd, MoveDocStart, MoveDown, MoveLeft, MoveLineEnd, MoveLineStart,
-    MoveRight, MoveUp, MoveWordLeft, MoveWordRight, Outdent, Paste, PastePlainText,
-    RICH_DOCUMENT_KEY_CONTEXT, Redo, RichDocumentEvent, RichDocumentView, SelectAll, SelectDocEnd,
-    SelectDocStart, SelectDown, SelectLeft, SelectLineEnd, SelectLineStart, SelectRight, SelectUp,
-    SelectWordLeft, SelectWordRight, SelectedInlineImage, SetHeading1, SetHeading2, SetHeading3,
-    SetParagraph, SoftBreak, SplitTableCell, ToggleBold, ToggleBulletList, ToggleChecklist,
-    ToggleDebugOverlay, ToggleInlineCode, ToggleItalic, ToggleStrikethrough, ToggleSubscript,
-    ToggleSuperscript, ToggleUnderline, Undo, ZoomIn, ZoomOut, ZoomReset,
-    register_default_keybindings,
+    ActiveSearchState, ActiveSmartChipPopover, ActiveTableContext, AlignCenter, AlignJustify,
+    AlignLeft, AlignRight, Backspace, BackspaceWord, CanExecute, CaretBounds, ClearFormatting,
+    ClearSelection, Copy, Cut, DecorationProviderId, DecreaseFontSize, Delete, DeleteTableColumn,
+    DeleteTableRow, DeleteWord, Enter, ExtensionDiagnostics, ImageResizeCorner, ImePreedit,
+    IncreaseFontSize, Indent, InsertTableColumnAfter, InsertTableColumnBefore, InsertTableRowAbove,
+    InsertTableRowBelow, MergeTableCells, MiddlewareId, MoveDocEnd, MoveDocStart, MoveDown,
+    MoveLeft, MoveLineEnd, MoveLineStart, MoveRight, MoveUp, MoveWordLeft, MoveWordRight, Outdent,
+    Paste, PastePlainText, RICH_DOCUMENT_KEY_CONTEXT, Redo, RichDocumentEvent, RichDocumentView,
+    SelectAll, SelectDocEnd, SelectDocStart, SelectDown, SelectLeft, SelectLineEnd,
+    SelectLineStart, SelectRight, SelectUp, SelectWordLeft, SelectWordRight, SelectedInlineImage,
+    SelectionBounds, SelectionRects, SetHeading1, SetHeading2, SetHeading3, SetParagraph,
+    SoftBreak, SplitTableCell, ToggleBold, ToggleBulletList, ToggleChecklist, ToggleDebugOverlay,
+    ToggleInlineCode, ToggleItalic, ToggleStrikethrough, ToggleSubscript, ToggleSuperscript,
+    ToggleUnderline, ToolbarSnapshot, ToolbarState, Undo, ViewQuery, ViewSnapshot, ViewState,
+    ViewportBounds, ZoomIn, ZoomOut, ZoomReset, register_default_keybindings,
 };

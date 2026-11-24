@@ -27,7 +27,7 @@ pub struct Footnote {
     pub id: AnchorId,
     pub block_id: BlockId,
 }
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct NumberedFootnote {
     pub id: AnchorId,
     pub number: u32,

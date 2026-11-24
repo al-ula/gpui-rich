@@ -47,12 +47,12 @@ impl Default for SearchOptions {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchMatch {
     pub block_id: BlockId,
     pub range: Range<usize>,
 }
-#[derive(Clone, Debug, PartialEq, Eq, Default)]
+#[derive(Clone, Debug, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct SearchState {
     pub query: String,
     pub options: SearchOptions,

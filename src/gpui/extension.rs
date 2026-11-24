@@ -81,14 +81,15 @@
 use crate::gpui::theme::RichTheme;
 use crate::layout::{InlineBoxMetrics, Insets, Size, pt_to_px};
 use crate::model::{
-    BlockId, BlockShape, BlockShapeKind, BlockSpec, ClipboardCustomFormatter, CommandEffectKind,
-    CommandResolution, CustomPayload, DROPDOWN_KIND, Document, DocumentSelection, Edit,
-    ExtensionCommand, ExtensionInvocation, FOOTNOTE_BODY_KIND, FOOTNOTE_REFERENCE_KIND,
-    InlineObjectId, InlineSpec, InlineVAlign, ListId, PLACEHOLDER_KIND, ReadOnly, RichCommand,
+    ActiveTableContext, BlockId, BlockShape, BlockShapeKind, BlockSpec, ClipboardCustomFormatter,
+    CommandEffectKind, CommandResolution, CustomPayload, DROPDOWN_KIND, Document,
+    DocumentSelection, Edit, ExtensionCommand, ExtensionInvocation, ExtensionQuery,
+    FOOTNOTE_BODY_KIND, FOOTNOTE_REFERENCE_KIND, InlineObjectId, InlineSpec, InlineVAlign,
+    InteractionPolicy, ListId, PLACEHOLDER_KIND, QueryError, ReadOnly, RichCommand, SearchState,
     SharedStr, Transaction, VARIABLE_KIND, block_kinds,
 };
 use gpui_kit::{AnyElement, App, Bounds, Pixels, Window};
-use std::any::TypeId;
+use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::fmt;
@@ -232,6 +233,7 @@ pub enum ExtensionNamespace {
     Block,
     Inline,
     Command,
+    Query,
 }
 
 impl fmt::Display for ExtensionNamespace {
@@ -240,6 +242,7 @@ impl fmt::Display for ExtensionNamespace {
             Self::Block => formatter.write_str("block"),
             Self::Inline => formatter.write_str("inline"),
             Self::Command => formatter.write_str("command"),
+            Self::Query => formatter.write_str("query"),
         }
     }
 }
@@ -347,6 +350,58 @@ impl<'document> ReadCommandContext<'document> {
     /// Borrows the current [`DocumentSelection`], if any.
     pub fn selection(&self) -> Option<&'document DocumentSelection> {
         self.selection
+    }
+}
+
+/// Read-only view context supplied to a registered [`ExtensionQuery`] handler.
+pub struct QueryContext<'view> {
+    document: &'view Document,
+    selection: Option<&'view DocumentSelection>,
+    policy: InteractionPolicy,
+    search_state: &'view SearchState,
+    table_context: Option<ActiveTableContext>,
+}
+
+impl<'view> QueryContext<'view> {
+    pub(crate) fn new(
+        document: &'view Document,
+        selection: Option<&'view DocumentSelection>,
+        policy: InteractionPolicy,
+        search_state: &'view SearchState,
+        table_context: Option<ActiveTableContext>,
+    ) -> Self {
+        Self {
+            document,
+            selection,
+            policy,
+            search_state,
+            table_context,
+        }
+    }
+
+    /// Borrows the current [`Document`] immutably.
+    pub fn document(&self) -> &'view Document {
+        self.document
+    }
+
+    /// Borrows the current [`DocumentSelection`], if any.
+    pub fn selection(&self) -> Option<&'view DocumentSelection> {
+        self.selection
+    }
+
+    /// Returns the view's active [`InteractionPolicy`].
+    pub const fn policy(&self) -> InteractionPolicy {
+        self.policy
+    }
+
+    /// Borrows the view's active [`SearchState`].
+    pub fn search_state(&self) -> &'view SearchState {
+        self.search_state
+    }
+
+    /// Returns the active [`ActiveTableContext`], if the selection is inside a table.
+    pub const fn active_table_context(&self) -> Option<ActiveTableContext> {
+        self.table_context
     }
 }
 
@@ -757,6 +812,7 @@ type ErasedReadHandler =
     Box<dyn Fn(&ExtensionInvocation, &ReadCommandContext<'_>) -> ReadCommandOutcome>;
 type ErasedEditHandler =
     Box<dyn Fn(&ExtensionInvocation, &mut EditCommandContext<'_>) -> Option<Transaction>>;
+type ErasedQueryHandler = Box<dyn Fn(&dyn Any, &QueryContext<'_>) -> Option<Box<dyn Any>>>;
 
 enum RegisteredCommandHandler {
     Read(ErasedReadHandler),
@@ -767,6 +823,12 @@ struct RegisteredCommand {
     type_id: TypeId,
     effect: CommandEffectKind,
     handler: RegisteredCommandHandler,
+}
+
+struct RegisteredQuery {
+    query_type_id: TypeId,
+    output_type_id: TypeId,
+    handler: ErasedQueryHandler,
 }
 
 fn is_reserved_block_kind(kind: &str) -> bool {
@@ -800,13 +862,18 @@ fn is_reserved_command_id(id: &str) -> bool {
     id.starts_with("rich.") || id.starts_with("anchor.")
 }
 
-/// Registry storing spec-bound [`BlockRenderer`]s, [`InlineRenderer`]s, and typed
-/// [`ExtensionCommand`] handlers in separate namespaces.
+fn is_reserved_query_id(id: &str) -> bool {
+    id.starts_with("rich.") || id.starts_with("anchor.")
+}
+
+/// Registry storing spec-bound [`BlockRenderer`]s, [`InlineRenderer`]s, typed
+/// [`ExtensionCommand`] handlers, and typed [`ExtensionQuery`] handlers in separate namespaces.
 #[derive(Default)]
 pub struct ExtensionRegistry {
     blocks: HashMap<&'static str, Rc<dyn ErasedBlockRenderer>>,
     inlines: HashMap<&'static str, Rc<dyn ErasedInlineRenderer>>,
     commands: HashMap<&'static str, RegisteredCommand>,
+    queries: HashMap<&'static str, RegisteredQuery>,
 }
 
 impl ExtensionRegistry {
@@ -986,6 +1053,77 @@ impl ExtensionRegistry {
         self.commands.remove(C::ID).is_some()
     }
 
+    /// Registers a read-only handler for a typed [`ExtensionQuery`] `Q`.
+    pub fn register_query<Q: ExtensionQuery>(
+        &mut self,
+        handler: impl Fn(&Q, &QueryContext<'_>) -> Q::Output + 'static,
+    ) -> Result<(), ExtensionRegistrationError> {
+        let key = Q::ID;
+        if key.trim().is_empty() {
+            return Err(ExtensionRegistrationError::EmptyKey {
+                namespace: ExtensionNamespace::Query,
+            });
+        }
+        if is_reserved_query_id(key) {
+            return Err(ExtensionRegistrationError::ReservedKey {
+                namespace: ExtensionNamespace::Query,
+                key,
+            });
+        }
+        if self.queries.contains_key(key) {
+            return Err(ExtensionRegistrationError::DuplicateKey {
+                namespace: ExtensionNamespace::Query,
+                key,
+            });
+        }
+        let erased: ErasedQueryHandler = Box::new(move |query, context| {
+            let typed = query.downcast_ref::<Q>()?;
+            Some(Box::new(handler(typed, context)))
+        });
+        self.queries.insert(
+            key,
+            RegisteredQuery {
+                query_type_id: TypeId::of::<Q>(),
+                output_type_id: TypeId::of::<Q::Output>(),
+                handler: erased,
+            },
+        );
+        Ok(())
+    }
+
+    /// Removes the registered handler for [`ExtensionQuery`] `Q`.
+    pub fn unregister_query<Q: ExtensionQuery>(&mut self) -> bool {
+        self.queries.remove(Q::ID).is_some()
+    }
+
+    /// Returns `true` when an extension query handler is registered for `id`.
+    pub fn has_query(&self, id: &str) -> bool {
+        self.queries.contains_key(id)
+    }
+
+    /// Executes a registered [`ExtensionQuery`] against `context`.
+    pub fn execute_extension_query<Q: ExtensionQuery>(
+        &self,
+        query: &Q,
+        context: &QueryContext<'_>,
+    ) -> Result<Q::Output, QueryError> {
+        let Some(entry) = self.queries.get(Q::ID) else {
+            return Err(QueryError::UnregisteredQuery);
+        };
+        if entry.query_type_id != TypeId::of::<Q>()
+            || entry.output_type_id != TypeId::of::<Q::Output>()
+        {
+            return Err(QueryError::MismatchedQueryType);
+        }
+        let Some(boxed) = (entry.handler)(query, context) else {
+            return Err(QueryError::MismatchedQueryType);
+        };
+        boxed
+            .downcast::<Q::Output>()
+            .map(|value| *value)
+            .map_err(|_| QueryError::MismatchedQueryType)
+    }
+
     /// Resolves `command` against registered command IDs, concrete Rust types, and effects.
     pub fn resolve_command(&self, command: &RichCommand) -> CommandResolution {
         match command {
@@ -1076,5 +1214,112 @@ impl ClipboardCustomFormatter for ExtensionRegistry {
 
     fn html_inline(&self, kind: &str, data: &CustomPayload) -> Option<String> {
         self.inlines.get(kind)?.html(data)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::{BlockStyle, InlineContent};
+
+    #[derive(Debug)]
+    struct ReservedQuery;
+    impl ExtensionQuery for ReservedQuery {
+        const ID: &'static str = "rich.query.custom";
+        type Output = usize;
+    }
+
+    #[derive(Debug)]
+    struct EmptyKeyQuery;
+    impl ExtensionQuery for EmptyKeyQuery {
+        const ID: &'static str = "   ";
+        type Output = usize;
+    }
+
+    #[derive(Debug)]
+    struct ParagraphCount {
+        min_len: usize,
+    }
+    impl ExtensionQuery for ParagraphCount {
+        const ID: &'static str = "acme.doc.paragraph_count";
+        type Output = usize;
+    }
+
+    #[derive(Debug)]
+    struct ConflictingParagraphCount;
+    impl ExtensionQuery for ConflictingParagraphCount {
+        const ID: &'static str = "acme.doc.paragraph_count";
+        type Output = String;
+    }
+
+    #[test]
+    fn extension_query_registry_enforces_keys_and_type_safety() {
+        let mut registry = ExtensionRegistry::new();
+        assert_eq!(
+            registry.register_query::<ReservedQuery>(|_, _| 0),
+            Err(ExtensionRegistrationError::ReservedKey {
+                namespace: ExtensionNamespace::Query,
+                key: ReservedQuery::ID,
+            })
+        );
+        assert_eq!(
+            registry.register_query::<EmptyKeyQuery>(|_, _| 0),
+            Err(ExtensionRegistrationError::EmptyKey {
+                namespace: ExtensionNamespace::Query,
+            })
+        );
+
+        let mut document = Document::new();
+        document.add_paragraph(InlineContent::plain("hi"), BlockStyle::default());
+        document.add_paragraph(InlineContent::plain("hello world"), BlockStyle::default());
+        let search = SearchState::default();
+        let context =
+            QueryContext::new(&document, None, InteractionPolicy::viewer(), &search, None);
+
+        assert_eq!(
+            registry.execute_extension_query(&ParagraphCount { min_len: 1 }, &context),
+            Err(QueryError::UnregisteredQuery)
+        );
+
+        registry
+            .register_query::<ParagraphCount>(|query, context| {
+                context
+                    .document()
+                    .blocks
+                    .iter()
+                    .filter(|block| {
+                        block
+                            .kind
+                            .inline_content()
+                            .is_some_and(|inline| inline.text.len() >= query.min_len)
+                    })
+                    .count()
+            })
+            .expect("register ParagraphCount");
+        assert!(registry.has_query(ParagraphCount::ID));
+
+        assert_eq!(
+            registry.register_query::<ParagraphCount>(|_, _| 0),
+            Err(ExtensionRegistrationError::DuplicateKey {
+                namespace: ExtensionNamespace::Query,
+                key: ParagraphCount::ID,
+            })
+        );
+
+        assert_eq!(
+            registry.execute_extension_query(&ParagraphCount { min_len: 5 }, &context),
+            Ok(1)
+        );
+        assert_eq!(
+            registry.execute_extension_query(&ConflictingParagraphCount, &context),
+            Err(QueryError::MismatchedQueryType)
+        );
+
+        assert!(registry.unregister_query::<ParagraphCount>());
+        assert!(!registry.has_query(ParagraphCount::ID));
+        assert_eq!(
+            registry.execute_extension_query(&ParagraphCount { min_len: 1 }, &context),
+            Err(QueryError::UnregisteredQuery)
+        );
     }
 }

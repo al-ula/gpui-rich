@@ -5,8 +5,8 @@ use crate::gpui::asset::{AssetProvider, LoadedAsset, decode_image_asset};
 use crate::gpui::element::RichDocumentElement;
 use crate::gpui::extension::{
     BlockRenderer, CommandExecutionResult, EditCommandContext, ExtensionDiagnostic,
-    ExtensionRegistrationError, ExtensionRegistry, InlineRenderer, ReadCommandContext,
-    ReadCommandOutcome,
+    ExtensionRegistrationError, ExtensionRegistry, InlineRenderer, QueryContext,
+    ReadCommandContext, ReadCommandOutcome,
 };
 use crate::gpui::shaper::{FontResolver, GpuiGlyphBackend, GpuiShaper};
 use crate::gpui::theme::RichTheme;
@@ -45,9 +45,11 @@ mod commands;
 pub(crate) mod components;
 mod input;
 mod navigation;
+mod queries;
 mod structure;
 mod table;
 
+pub use crate::model::ActiveTableContext;
 pub use actions::*;
 pub(crate) use input::image_resize_handle_rects;
 use input::{
@@ -55,6 +57,7 @@ use input::{
     next_grapheme_boundary, next_word_boundary, previous_grapheme_boundary, previous_word_boundary,
     table_cell_of,
 };
+pub use queries::*;
 
 const CARET_BLINK_PAUSE_DELAY: Duration = Duration::from_millis(500);
 const CARET_SCROLL_MARGIN_PX: f32 = 28.0;
@@ -449,44 +452,7 @@ impl RichDocumentView {
 
     /// Returns metadata describing the active table cell or selection, if any.
     pub fn active_table_context(&self) -> Option<ActiveTableContext> {
-        match self.selection.as_ref()? {
-            DocumentSelection::TableCells {
-                table_id,
-                anchor_cell,
-                focus_cell,
-            } => {
-                let table = self.document.find_block(*table_id)?.kind.table_block()?;
-                let (_, placements, occupancy) = table.resolve_grid();
-                let r_min = anchor_cell.0.min(focus_cell.0);
-                let c_min = anchor_cell.1.min(focus_cell.1);
-                let placement_idx = occupancy
-                    .get(r_min)
-                    .and_then(|row| row.get(c_min))
-                    .and_then(|slot| *slot)?;
-                let placement = placements.get(placement_idx)?;
-                Some(ActiveTableContext {
-                    table_id: *table_id,
-                    row: placement.row_index,
-                    visual_col: placement.visual_col,
-                    cell_index: placement.cell_index,
-                    can_merge: anchor_cell != focus_cell,
-                    can_split: placement.colspan > 1 || placement.rowspan > 1,
-                })
-            }
-            DocumentSelection::Text { focus, .. } => {
-                let (table_id, row, cell_index) = table_cell_of(focus)?;
-                let table = self.document.find_block(table_id)?.kind.table_block()?;
-                let placement = table.placement_for_stored_cell(row, cell_index)?;
-                Some(ActiveTableContext {
-                    table_id,
-                    row: placement.row_index,
-                    visual_col: placement.visual_col,
-                    cell_index: placement.cell_index,
-                    can_merge: false,
-                    can_split: placement.colspan > 1 || placement.rowspan > 1,
-                })
-            }
-        }
+        crate::model::query::compute_active_table_context(&self.document, self.selection.as_ref())
     }
 
     /// Builder method configuring a render-time [`FontResolver`] for mapping `(font_family, weight, italic)`

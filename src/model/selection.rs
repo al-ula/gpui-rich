@@ -89,7 +89,7 @@ impl DocumentSelection {
 
 /// Represents whether a formatting attribute has one uniform value across a selection
 /// or spans multiple distinct values.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SelectionValue<T> {
     /// Every covered span or block shares this exact value.
     Uniform(T),

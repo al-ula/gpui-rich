@@ -275,17 +275,6 @@ pub(crate) struct TableColumnDrag {
     pub initial_widths_px: Vec<f32>,
 }
 
-/// Describes the active table cell/selection context for host toolbars.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct ActiveTableContext {
-    pub table_id: BlockId,
-    pub row: usize,
-    pub visual_col: usize,
-    pub cell_index: usize,
-    pub can_merge: bool,
-    pub can_split: bool,
-}
-
 /// Host-observable events emitted by [`RichDocumentView`] via GPUI [`EventEmitter`].
 #[derive(Clone, Debug, PartialEq)]
 pub enum RichDocumentEvent {

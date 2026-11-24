@@ -7,16 +7,17 @@ use gpui_kit::{
 };
 use gpui_rich::gpui::{
     BlockRenderContext, BlockRenderer, CustomRenderOutput, InlineRenderContext, InlineRenderer,
-    MemoryAssetProvider, RichDocumentEvent, RichDocumentView, RichTheme,
+    MemoryAssetProvider, RichDocumentEvent, RichDocumentView, RichTheme, ToolbarState, ViewState,
 };
 use gpui_rich::layout::{InlineBoxMetrics, Insets, pt_to_px};
 use gpui_rich::model::{
     BaselineShift, BlockByteRange, BlockKind, BlockNode, BlockSpec, BlockStyle, BlockWidth,
     ChipKind, ColumnSpec, DecorationContext, DecorationProvider, DecorationWriter, Document, Edges,
-    FontWeight, HorizontalLayout, ImageAssetId, InlineContent, InlineDecorationStyle, InlineObject,
-    InlineSpec, InlineStyle, InlineVAlign, InteractionPolicy, ListId, ListKind, MarkKind,
-    MarkdownCodec, NumberStyle, PaperSpec, RgbaColor, RichCommand, SelectionValue, StyleId,
-    TableBlock, TableBorderStyle, TableCell, TableRow, TextAlign, UnderlineKind, block_shape,
+    ExportDocument, FontWeight, HorizontalLayout, ImageAssetId, InlineContent,
+    InlineDecorationStyle, InlineObject, InlineSpec, InlineStyle, InlineVAlign, InteractionPolicy,
+    ListId, ListKind, MarkKind, MarkdownCodec, NumberStyle, PaperSpec, RgbaColor, RichCommand,
+    SelectionValue, StyleId, TableBlock, TableBorderStyle, TableCell, TableRow, TextAlign,
+    UnderlineKind, block_shape,
 };
 use serde::{Deserialize, Serialize};
 
@@ -480,16 +481,12 @@ impl DocsViewerApp {
 impl Render for DocsViewerApp {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.ensure_fonts_loaded(window);
-        let (zoom, horizontal_layout, active_margins, debug_active, policy) = {
-            let view = self.document_view.read(cx);
-            (
-                view.zoom,
-                view.document.config.horizontal_layout,
-                view.document.config.active_margins_pt(),
-                view.debug_overlay,
-                view.policy(),
-            )
-        };
+        let view_state = self.document_view.read(cx).query(ViewState);
+        let zoom = view_state.zoom;
+        let horizontal_layout = view_state.horizontal_layout;
+        let active_margins = view_state.margins_pt;
+        let debug_active = view_state.debug_overlay;
+        let policy = view_state.policy;
         if !policy.editing.enabled {
             self.font_menu_open = false;
         }
@@ -807,32 +804,18 @@ impl Render for DocsViewerApp {
         let mut active_font_selection: Option<SelectionValue<gpui_rich::model::SharedStr>> = None;
 
         if policy.editing.enabled {
-            let (
-                bold_active,
-                italic_active,
-                underline_active,
-                strike_active,
-                code_active,
-                font_family,
-                font_size_pt,
-                heading_level,
-                list_kind,
-                text_align,
-            ) = {
-                let view = self.document_view.read(cx);
-                (
-                    view.is_mark_active(MarkKind::Bold),
-                    view.is_mark_active(MarkKind::Italic),
-                    view.is_mark_active(MarkKind::Underline),
-                    view.is_mark_active(MarkKind::Strikethrough),
-                    view.is_mark_active(MarkKind::InlineCode),
-                    view.selected_font_family(),
-                    view.selected_font_size_pt(),
-                    view.selected_heading_level(),
-                    view.active_list_kind(),
-                    view.selected_text_align(),
-                )
-            };
+            let toolbar_state = self.document_view.read(cx).query(ToolbarState);
+            let formatting = &toolbar_state.formatting;
+            let bold_active = formatting.is_mark_active(MarkKind::Bold);
+            let italic_active = formatting.is_mark_active(MarkKind::Italic);
+            let underline_active = formatting.is_mark_active(MarkKind::Underline);
+            let strike_active = formatting.is_mark_active(MarkKind::Strikethrough);
+            let code_active = formatting.is_mark_active(MarkKind::InlineCode);
+            let font_family = formatting.font_family.clone();
+            let font_size_pt = formatting.font_size_pt;
+            let heading_level = formatting.heading_level;
+            let list_kind = formatting.active_list_kind;
+            let text_align = formatting.text_align;
 
             let font_label = match &font_family {
                 Some(SelectionValue::Uniform(name)) => {
@@ -1151,8 +1134,10 @@ impl Render for DocsViewerApp {
                     Self::toolbar_button("fmt-export-md", "Copy MD", false, dark).on_mouse_down(
                         MouseButton::Left,
                         cx.listener(|this, _event, _window, cx| {
-                            let exported =
-                                this.document_view.read(cx).export_document(&MarkdownCodec);
+                            let exported = this
+                                .document_view
+                                .read(cx)
+                                .query(ExportDocument(&MarkdownCodec));
                             match exported {
                                 Ok(markdown) => {
                                     cx.write_to_clipboard(ClipboardItem::new_string(
@@ -1169,7 +1154,7 @@ impl Render for DocsViewerApp {
                         }),
                     ),
                 );
-            if let Some(table_ctx) = self.document_view.read(cx).active_table_context() {
+            if let Some(table_ctx) = toolbar_state.table {
                 format_bar = format_bar
                     .child(div().w(px(1.0)).h(px(16.0)).bg(toolbar_border).mx(px(2.0)))
                     .child(

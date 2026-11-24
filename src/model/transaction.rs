@@ -3063,4 +3063,8 @@ impl History {
     pub fn undo_len(&self) -> usize {
         self.undo_stack.len()
     }
+
+    pub fn redo_len(&self) -> usize {
+        self.redo_stack.len()
+    }
 }
