@@ -6,6 +6,12 @@ pub mod compiler;
 #[cfg(feature = "mermaid")]
 pub use compiler::BuiltInMermaidBackend;
 
+pub mod labels;
+pub use labels::{
+    MermaidLabelMatch, MermaidSvgLabel, SvgViewBox, extract_svg_labels,
+    find_editable_mermaid_label, normalize_label_text, parse_svg_view_box, replace_mermaid_label,
+};
+
 use crate::model::block::{BlockId, BlockSpec, block_shape};
 use crate::model::command::{Edit, ExtensionCommand, ReadOnly};
 use crate::model::query::ExtensionQuery;
@@ -205,6 +211,7 @@ pub trait MermaidBackend: Send + Sync + 'static {
 pub enum MermaidViewMode {
     #[default]
     Diagram,
+    Split,
     Source,
 }
 

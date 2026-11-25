@@ -1170,6 +1170,34 @@ fn verify_mermaid_extension_commands_and_policy(cx: &mut App) {
 
     draw_window(window, cx);
 
+    // Split view mode is ReadOnly, renders cleanly side-by-side, and toggles back to Diagram.
+    view.update(cx, |view, cx| {
+        assert_eq!(
+            view.dispatch_extension_command(
+                SetMermaidViewMode {
+                    block_id,
+                    mode: MermaidViewMode::Split,
+                },
+                cx,
+            ),
+            CommandOutcome::Executed
+        );
+        let status = view
+            .query_extension(&MermaidBlockStatusQuery { block_id })
+            .expect("mermaid status query in split mode")
+            .expect("status present");
+        assert_eq!(status.mode, MermaidViewMode::Split);
+    });
+    draw_window(window, cx);
+    assert_eq!(
+        JsonCodec
+            .encode(&view.read(cx).document)
+            .expect("json after split mode")
+            .into_string(),
+        snapshot_before_toggle
+    );
+    assert_eq!(view.read(cx).history.can_undo(), history_can_undo_before);
+
     // Update source & caption, then verify Undo restores the previous source cleanly.
     view.update(cx, |view, cx| {
         assert_eq!(

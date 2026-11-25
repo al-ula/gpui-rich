@@ -2027,7 +2027,7 @@ fn build_sample_document() -> Document {
         MermaidData::new(
             "flowchart LR\n    Doc[Document Tree] --> Flow[FlowLayout]\n    Flow --> Cache[Two-Tier SVG Cache]\n    Cache --> Canvas[GPUI Layer 4 Paint]",
         )
-        .with_caption("Built-in Mermaid diagram extension (click Edit or Source to inspect)"),
+        .with_caption("Built-in Mermaid diagram extension (click a label to edit directly, or switch to Split / Source)"),
     );
 
     let quote_child_id = document.alloc_block_id();

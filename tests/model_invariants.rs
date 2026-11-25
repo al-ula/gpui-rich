@@ -1930,32 +1930,91 @@ fn mermaid_spec_markdown_roundtrip_and_svg_dimensions() {
 
     #[cfg(feature = "mermaid")]
     {
-        use gpui_rich::model::{BuiltInMermaidBackend, MermaidBackend, MermaidThemePalette};
+        use gpui_rich::model::{
+            BuiltInMermaidBackend, MermaidBackend, MermaidThemePalette, extract_svg_labels,
+            find_editable_mermaid_label, replace_mermaid_label,
+        };
 
         let backend = BuiltInMermaidBackend::new();
+        let flowchart_source = "flowchart LR\nA[Input] -->|send| B[Output]";
         let light = backend
-            .render_svg(
-                "flowchart LR\nA[Input] --> B[Output]",
-                &MermaidThemePalette::light(),
-            )
+            .render_svg(flowchart_source, &MermaidThemePalette::light())
             .expect("compile light flowchart");
         assert!(light.svg.contains("<svg"));
         assert!(light.intrinsic_width > 0.0 && light.intrinsic_height > 0.0);
 
+        let (flow_vb, flow_labels) =
+            extract_svg_labels(&light.svg, light.intrinsic_width, light.intrinsic_height);
+        assert!(flow_vb.width > 0.0 && flow_vb.height > 0.0);
+        for expected in ["Input", "send", "Output"] {
+            let label = flow_labels
+                .iter()
+                .find(|candidate| candidate.text == expected)
+                .unwrap_or_else(|| {
+                    panic!(
+                        "expected extracted SVG label '{expected}', got: {:?}",
+                        flow_labels
+                            .iter()
+                            .map(|item| item.text.as_str())
+                            .collect::<Vec<_>>()
+                    )
+                });
+            assert!(label.width > 0.0 && label.height > 0.0);
+            assert!(
+                find_editable_mermaid_label(flowchart_source, &label.text, label.occurrence)
+                    .is_some(),
+                "SVG label '{expected}' must map to an editable source span"
+            );
+        }
+
+        let seq_source = "sequenceDiagram\nparticipant A as Alice\nAlice->>Bob: Hello";
         let dark = backend
-            .render_svg(
-                "sequenceDiagram\nAlice->>Bob: Hello",
-                &MermaidThemePalette::dark(),
-            )
+            .render_svg(seq_source, &MermaidThemePalette::dark())
             .expect("compile dark sequence diagram");
         assert!(dark.svg.contains("<svg"));
         assert!(dark.intrinsic_width > 0.0 && dark.intrinsic_height > 0.0);
+        let (_, seq_labels) =
+            extract_svg_labels(&dark.svg, dark.intrinsic_width, dark.intrinsic_height);
+        assert!(
+            seq_labels.iter().any(|label| label.text == "Hello"),
+            "sequence diagram message label must be extracted: {:?}",
+            seq_labels
+                .iter()
+                .map(|item| item.text.as_str())
+                .collect::<Vec<_>>()
+        );
 
         assert!(
             backend
                 .render_svg("   ", &MermaidThemePalette::light())
                 .is_err(),
             "empty source must fail cleanly"
+        );
+
+        // Source label rewriting handles bracketed nodes, quoting, duplicates, bare IDs, and sequence messages.
+        assert_eq!(
+            replace_mermaid_label(flowchart_source, "Input", 0, "Source [1]").as_deref(),
+            Some("flowchart LR\nA[\"Source [1]\"] -->|send| B[Output]")
+        );
+        assert_eq!(
+            replace_mermaid_label(flowchart_source, "send", 0, "dispatch").as_deref(),
+            Some("flowchart LR\nA[Input] -->|dispatch| B[Output]")
+        );
+        assert_eq!(
+            replace_mermaid_label("flowchart LR\nA[OK] --> B[OK]", "OK", 1, "Done").as_deref(),
+            Some("flowchart LR\nA[OK] --> B[Done]")
+        );
+        assert_eq!(
+            replace_mermaid_label("flowchart LR\nA --> B", "A", 0, "Start").as_deref(),
+            Some("flowchart LR\nA[Start] --> B")
+        );
+        assert_eq!(
+            replace_mermaid_label(seq_source, "Hello", 0, "Ping").as_deref(),
+            Some("sequenceDiagram\nparticipant A as Alice\nAlice->>Bob: Ping")
+        );
+        assert_eq!(
+            replace_mermaid_label(seq_source, "Alice", 0, "Client").as_deref(),
+            Some("sequenceDiagram\nparticipant A as Client\nAlice->>Bob: Hello")
         );
     }
 }

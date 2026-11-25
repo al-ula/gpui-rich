@@ -85,9 +85,9 @@ use crate::model::{
     ActiveTableContext, BlockId, BlockShape, BlockShapeKind, BlockSpec, ClipboardCustomFormatter,
     CommandEffectKind, CommandResolution, CustomPayload, DROPDOWN_KIND, Document,
     DocumentSelection, Edit, ExtensionCommand, ExtensionInvocation, ExtensionQuery,
-    FOOTNOTE_BODY_KIND, FOOTNOTE_REFERENCE_KIND, InlineObjectId, InlineSpec, InlineVAlign,
-    InteractionPolicy, ListId, PLACEHOLDER_KIND, QueryError, ReadOnly, RichCommand, SearchState,
-    SharedStr, Transaction, VARIABLE_KIND, block_kinds,
+    FOOTNOTE_BODY_KIND, FOOTNOTE_REFERENCE_KIND, HistoryMergeGroup, InlineObjectId, InlineSpec,
+    InlineVAlign, InteractionPolicy, ListId, PLACEHOLDER_KIND, QueryError, ReadOnly, RichCommand,
+    SearchState, SharedStr, Transaction, VARIABLE_KIND, block_kinds,
 };
 use gpui_kit::{AnyElement, App, Bounds, Context, Pixels, Window};
 use std::any::{Any, TypeId};
@@ -438,6 +438,7 @@ pub struct EditCommandContext<'document> {
     document: &'document Document,
     selection: Option<&'document DocumentSelection>,
     next_block_id: u64,
+    history_group: HistoryMergeGroup,
 }
 
 impl<'document> EditCommandContext<'document> {
@@ -449,6 +450,7 @@ impl<'document> EditCommandContext<'document> {
             document,
             selection,
             next_block_id: document.peek_next_block_id(),
+            history_group: HistoryMergeGroup::Atomic,
         }
     }
 
@@ -474,8 +476,17 @@ impl<'document> EditCommandContext<'document> {
         self.document.alloc_list_id()
     }
 
+    /// Configures the undo [`HistoryMergeGroup`] applied when the returned [`Transaction`] commits.
+    pub fn set_history_group(&mut self, history_group: HistoryMergeGroup) {
+        self.history_group = history_group;
+    }
+
     pub(crate) fn next_block_id(&self) -> u64 {
         self.next_block_id
+    }
+
+    pub(crate) fn history_group(&self) -> HistoryMergeGroup {
+        self.history_group
     }
 }
 
@@ -835,6 +846,7 @@ pub(crate) enum CommandExecutionResult {
     Edit {
         transaction: Option<Box<Transaction>>,
         next_block_id: u64,
+        history_group: HistoryMergeGroup,
     },
     Unregistered,
     Mismatched,
@@ -1202,6 +1214,7 @@ impl ExtensionRegistry {
                 CommandExecutionResult::Edit {
                     transaction,
                     next_block_id: context.next_block_id(),
+                    history_group: context.history_group(),
                 }
             }
         }

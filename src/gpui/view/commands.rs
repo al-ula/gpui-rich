@@ -167,6 +167,7 @@ impl RichDocumentView {
         if let Some(group) = history_group {
             self.history.push_inverse_grouped(applied.inverse, group);
         }
+        let had_next_selection = next_selection.is_some();
         if let Some(selection) = next_selection {
             self.update_selection(Some(selection), cx);
         }
@@ -174,7 +175,10 @@ impl RichDocumentView {
         self.resync_layout_with_anchor(anchor);
         self.notify_transaction_applied(applied.change_set.clone(), cx);
         self.reset_caret_blink(cx);
-        self.ensure_caret_visible();
+        // Avoid jumping scroll back to a stale parent caret while focus sits inside a hosted child.
+        if self.was_focused || had_next_selection {
+            self.ensure_caret_visible();
+        }
         cx.notify();
         applied.change_set
     }
@@ -2255,12 +2259,14 @@ impl RichDocumentView {
             CommandExecutionResult::Edit {
                 transaction: Some(transaction),
                 next_block_id,
+                history_group,
             } => {
                 if transaction.steps.is_empty() {
                     return CommandOutcome::NoOp;
                 }
                 self.document.reserve_block_ids_up_to(next_block_id);
-                let change_set = self.apply_transaction(*transaction, true, cx);
+                let change_set =
+                    self.apply_transaction_grouped(*transaction, Some(history_group), cx);
                 if change_set.dirty_blocks.is_empty() && !change_set.structure_changed {
                     CommandOutcome::NoOp
                 } else {

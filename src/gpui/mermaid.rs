@@ -1,11 +1,11 @@
 //! Built-in GPUI Mermaid diagram extension implementing [`ExtensionPlugin`] and
 //! [`BlockRenderer`] for [`MermaidSpec`] with two-tier async SVG compilation and rasterization,
-//! stale-while-revalidate zooming, host-supplied font rendering, and an ephemeral inline source
-//! editor.
+//! stale-while-revalidate zooming, host-supplied font rendering, live split editing, and direct
+//! in-place diagram text editing.
 
 mod editor;
 
-use self::editor::MermaidSourceEditor;
+use self::editor::{MermaidLabelEditor, MermaidSourceEditor};
 use crate::gpui::extension::{
     BlockRenderContext, BlockRenderer, CustomRenderOutput, ExtensionPlugin,
     ExtensionRegistrationError, ReadCommandOutcome,
@@ -14,18 +14,19 @@ use crate::gpui::theme::RichTheme;
 use crate::gpui::view::RichDocumentView;
 use crate::layout::{Size, pt_to_px};
 use crate::model::{
-    BlockId, BlockKind, BlockNode, BlockStyle, DocumentSelection, InsertMermaidDiagram,
-    InteractionPolicy, MermaidBackend, MermaidBlockStatus, MermaidBlockStatusQuery, MermaidData,
-    MermaidRenderError, MermaidRenderStatus, MermaidSpec, MermaidThemePalette, MermaidViewMode,
-    RgbaColor, SetMermaidCaption, SetMermaidViewMode, Step, ToggleMermaidViewMode, Transaction,
-    UpdateMermaidSource, hash_mermaid_source,
+    BlockId, BlockKind, BlockNode, BlockStyle, DocumentSelection, HistoryMergeGroup,
+    InsertMermaidDiagram, InteractionPolicy, MermaidBackend, MermaidBlockStatus,
+    MermaidBlockStatusQuery, MermaidData, MermaidRenderError, MermaidRenderStatus, MermaidSpec,
+    MermaidSvgLabel, MermaidThemePalette, MermaidViewMode, RgbaColor, SetMermaidCaption,
+    SetMermaidViewMode, Step, SvgViewBox, ToggleMermaidViewMode, Transaction, UpdateMermaidSource,
+    extract_svg_labels, find_editable_mermaid_label, hash_mermaid_source,
 };
 use gpui_kit::prelude::FluentBuilder;
 use gpui_kit::{
     App, AppContext, AssetSource, AsyncApp, ClipboardItem, Context, Corners, DevicePixels, Entity,
-    FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, ParentElement, ParsedSvg,
-    RenderImage, Size as GpuiSize, Styled, SvgRenderer, SvgSize, Task, WeakEntity, Window, canvas,
-    div, px,
+    FontWeight, Hsla, InteractiveElement, IntoElement, MouseButton, MouseMoveEvent, ParentElement,
+    ParsedSvg, RenderImage, Size as GpuiSize, Styled, SvgRenderer, SvgSize, Task, WeakEntity,
+    Window, canvas, div, px,
 };
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -33,17 +34,25 @@ use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
-const CODE_TOP_INSET_PT: f32 = 30.0;
-const DIAGRAM_TOP_INSET_PT: f32 = 26.0;
+const CARD_HEADER_HEIGHT_PT: f32 = 26.0;
 const CARD_PAD_X_PT: f32 = 12.0;
+const CARD_PAD_TOP_PT: f32 = 8.0;
 const CARD_PAD_BOTTOM_PT: f32 = 10.0;
 const CAPTION_HEIGHT_PT: f32 = 20.0;
 const PLACEHOLDER_BODY_HEIGHT_PT: f32 = 160.0;
 const ERROR_BODY_HEIGHT_PT: f32 = 112.0;
 const EDITOR_LINE_HEIGHT_PT: f32 = 19.5;
+const EDITOR_VERT_PADDING_PT: f32 = 18.0;
+const SPLIT_MIN_SIDE_BY_SIDE_WIDTH_PT: f32 = 360.0;
+const SPLIT_MIN_BODY_HEIGHT_PT: f32 = 180.0;
+const SPLIT_DIVIDER_HIT_PT: f32 = 7.0;
+const DEFAULT_SPLIT_RATIO: f32 = 0.5;
+const MIN_SPLIT_RATIO: f32 = 0.25;
+const MAX_SPLIT_RATIO: f32 = 0.75;
 const DEFAULT_MAX_HEIGHT_PT: f32 = 480.0;
 const DEFAULT_CACHE_CAPACITY: usize = 64;
 const COPY_FEEDBACK_DURATION: Duration = Duration::from_millis(1400);
+const LIVE_COMPILE_DEBOUNCE: Duration = Duration::from_millis(120);
 
 /// Configuration options for [`MermaidExtension`].
 #[derive(Clone)]
@@ -197,6 +206,9 @@ impl ExtensionPlugin for MermaidExtension {
                 return None;
             }
             data.source = command.source.clone();
+            context.set_history_group(HistoryMergeGroup::Typing {
+                block_id: command.block_id,
+            });
             Some(Transaction::new(vec![
                 Step::update_block_data::<MermaidSpec>(command.block_id, data),
             ]))
@@ -243,7 +255,7 @@ impl ExtensionPlugin for MermaidExtension {
             let mut runtime = toggle_mode_state.borrow_mut();
             let next = match runtime.view_mode(command.block_id) {
                 MermaidViewMode::Diagram => MermaidViewMode::Source,
-                MermaidViewMode::Source => MermaidViewMode::Diagram,
+                MermaidViewMode::Split | MermaidViewMode::Source => MermaidViewMode::Diagram,
             };
             runtime.set_view_mode(command.block_id, next);
             context.invalidate_block_layout(command.block_id);
@@ -300,6 +312,8 @@ enum CompiledDiagram {
     Ready {
         intrinsic_width: f32,
         intrinsic_height: f32,
+        view_box: SvgViewBox,
+        labels: Vec<MermaidSvgLabel>,
         parsed_svg: Arc<ParsedSvg>,
     },
     Error(MermaidRenderError),
@@ -315,12 +329,38 @@ struct RasterCacheEntry {
     image: Arc<RenderImage>,
 }
 
+#[derive(Clone)]
+struct LastValidDiagram {
+    image: Arc<RenderImage>,
+    intrinsic_width: f32,
+    intrinsic_height: f32,
+    view_box: SvgViewBox,
+    labels: Vec<MermaidSvgLabel>,
+}
+
+struct ActiveLabelEdit {
+    block_id: BlockId,
+    label_text: String,
+    occurrence: usize,
+    editor: Entity<MermaidLabelEditor>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct SplitDragState {
+    block_id: BlockId,
+    start_x: f32,
+    start_ratio: f32,
+    container_width: f32,
+}
+
 enum BackgroundRenderOutcome {
     Ready {
         compile_key: CompileKey,
         raster_key: RasterKey,
         intrinsic_width: f32,
         intrinsic_height: f32,
+        view_box: SvgViewBox,
+        labels: Vec<MermaidSvgLabel>,
         parsed_svg: Arc<ParsedSvg>,
         image: Arc<RenderImage>,
     },
@@ -339,10 +379,14 @@ struct MermaidRuntimeState {
     compile_cache: HashMap<CompileKey, CompileCacheEntry>,
     raster_cache: HashMap<RasterKey, RasterCacheEntry>,
     in_flight: HashMap<BlockId, (RasterKey, Task<()>)>,
+    last_valid_diagram: HashMap<BlockId, LastValidDiagram>,
     block_modes: HashMap<BlockId, MermaidViewMode>,
+    block_split_ratios: HashMap<BlockId, f32>,
+    split_drag: Option<SplitDragState>,
     block_theme_hash: HashMap<BlockId, u64>,
     block_measured_height: HashMap<BlockId, f32>,
     draft_editors: HashMap<BlockId, Entity<MermaidSourceEditor>>,
+    active_label_edit: Option<ActiveLabelEdit>,
     copied_block: Option<BlockId>,
     copy_reset_task: Option<Task<()>>,
 }
@@ -363,10 +407,14 @@ impl MermaidRuntimeState {
             compile_cache: HashMap::new(),
             raster_cache: HashMap::new(),
             in_flight: HashMap::new(),
+            last_valid_diagram: HashMap::new(),
             block_modes: HashMap::new(),
+            block_split_ratios: HashMap::new(),
+            split_drag: None,
             block_theme_hash: HashMap::new(),
             block_measured_height: HashMap::new(),
             draft_editors: HashMap::new(),
+            active_label_edit: None,
             copied_block: None,
             copy_reset_task: None,
         }
@@ -391,6 +439,34 @@ impl MermaidRuntimeState {
         } else {
             self.block_modes.insert(block_id, mode);
         }
+        if mode == MermaidViewMode::Source
+            && self
+                .active_label_edit
+                .as_ref()
+                .is_some_and(|edit| edit.block_id == block_id)
+        {
+            self.active_label_edit = None;
+        }
+        if mode != MermaidViewMode::Split
+            && self
+                .split_drag
+                .is_some_and(|drag| drag.block_id == block_id)
+        {
+            self.split_drag = None;
+        }
+    }
+
+    fn split_ratio(&self, block_id: BlockId) -> f32 {
+        self.block_split_ratios
+            .get(&block_id)
+            .copied()
+            .unwrap_or(DEFAULT_SPLIT_RATIO)
+            .clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO)
+    }
+
+    fn set_split_ratio(&mut self, block_id: BlockId, ratio: f32) {
+        let clamped = ratio.clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO);
+        self.block_split_ratios.insert(block_id, clamped);
     }
 
     fn lookup_compiled(&mut self, key: CompileKey) -> Option<&CompiledDiagram> {
@@ -510,6 +586,106 @@ struct MermaidBlockRenderer {
     state: Rc<RefCell<MermaidRuntimeState>>,
 }
 
+fn measure_source_body_height(source: &str, pane_width: f32, zoom: f32) -> f32 {
+    let pad_x = pt_to_px(CARD_PAD_X_PT, zoom);
+    let inner_w = (pane_width - 2.0 * pad_x).max(40.0);
+    let chars_per_line = (inner_w / pt_to_px(6.1, zoom)).floor().max(16.0) as usize;
+    let visual_lines = source
+        .split('\n')
+        .map(|line| line.chars().count().max(1).div_ceil(chars_per_line))
+        .sum::<usize>()
+        .clamp(3, 18) as f32;
+    pt_to_px(EDITOR_VERT_PADDING_PT, zoom) + visual_lines * pt_to_px(EDITOR_LINE_HEIGHT_PT, zoom)
+}
+
+fn measure_diagram_body_height(
+    runtime: &MermaidRuntimeState,
+    block_id: BlockId,
+    data: &MermaidData,
+    pane_width: f32,
+    zoom: f32,
+    preserve_last_valid_on_error: bool,
+) -> f32 {
+    let pad_x = pt_to_px(CARD_PAD_X_PT, zoom);
+    let pad_top = pt_to_px(CARD_PAD_TOP_PT, zoom);
+    let pad_bottom = pt_to_px(CARD_PAD_BOTTOM_PT, zoom);
+    let caption_h = if data
+        .caption
+        .as_deref()
+        .is_some_and(|caption| !caption.trim().is_empty())
+    {
+        pt_to_px(CAPTION_HEIGHT_PT, zoom)
+    } else {
+        0.0
+    };
+
+    let source_hash = hash_mermaid_source(&data.source);
+    let theme_hash = runtime
+        .block_theme_hash
+        .get(&block_id)
+        .copied()
+        .unwrap_or_else(|| MermaidThemePalette::light().fingerprint());
+    let max_body_w = (pane_width - 2.0 * pad_x).max(48.0);
+    let max_body_h = pt_to_px(
+        data.max_height_pt
+            .unwrap_or(runtime.config.default_max_height_pt)
+            .max(64.0),
+        zoom,
+    );
+
+    let body_h = match runtime.peek_compiled(CompileKey {
+        source_hash,
+        theme_hash,
+    }) {
+        Some(CompiledDiagram::Ready {
+            intrinsic_width,
+            intrinsic_height,
+            ..
+        }) => {
+            let (_, fitted_h) = fit_diagram_size(
+                *intrinsic_width,
+                *intrinsic_height,
+                max_body_w,
+                max_body_h,
+                zoom,
+            );
+            fitted_h
+        }
+        Some(CompiledDiagram::Error(_)) => {
+            if preserve_last_valid_on_error
+                && let Some(last_valid) = runtime.last_valid_diagram.get(&block_id)
+            {
+                let (_, fitted_h) = fit_diagram_size(
+                    last_valid.intrinsic_width,
+                    last_valid.intrinsic_height,
+                    max_body_w,
+                    max_body_h,
+                    zoom,
+                );
+                fitted_h + pt_to_px(22.0, zoom)
+            } else {
+                pt_to_px(ERROR_BODY_HEIGHT_PT, zoom)
+            }
+        }
+        None => {
+            if let Some(last_valid) = runtime.last_valid_diagram.get(&block_id) {
+                let (_, fitted_h) = fit_diagram_size(
+                    last_valid.intrinsic_width,
+                    last_valid.intrinsic_height,
+                    max_body_w,
+                    max_body_h,
+                    zoom,
+                );
+                fitted_h
+            } else {
+                pt_to_px(PLACEHOLDER_BODY_HEIGHT_PT, zoom)
+            }
+        }
+    };
+
+    pad_top + body_h + pad_bottom + caption_h
+}
+
 impl BlockRenderer for MermaidBlockRenderer {
     type Spec = MermaidSpec;
 
@@ -523,74 +699,41 @@ impl BlockRenderer for MermaidBlockRenderer {
     ) -> Size {
         let mut runtime = self.state.borrow_mut();
         let width = max_width.max(120.0);
-        let pad_x = pt_to_px(CARD_PAD_X_PT, zoom);
-        let pad_bottom = pt_to_px(CARD_PAD_BOTTOM_PT, zoom);
-        let caption_h = if data
-            .caption
-            .as_deref()
-            .is_some_and(|caption| !caption.trim().is_empty())
-        {
-            pt_to_px(CAPTION_HEIGHT_PT, zoom)
-        } else {
-            0.0
-        };
+        let header_h = pt_to_px(CARD_HEADER_HEIGHT_PT, zoom);
 
-        let height = match runtime.view_mode(block_id) {
-            MermaidViewMode::Source => {
-                let inner_w = (width - 2.0 * pad_x).max(40.0);
-                let chars_per_line = (inner_w / pt_to_px(6.1, zoom)).floor().max(16.0) as usize;
-                let visual_lines = data
-                    .source
-                    .split('\n')
-                    .map(|line| line.chars().count().max(1).div_ceil(chars_per_line))
-                    .sum::<usize>()
-                    .clamp(3, 18) as f32;
-                pt_to_px(CODE_TOP_INSET_PT, zoom)
-                    + visual_lines * pt_to_px(EDITOR_LINE_HEIGHT_PT, zoom)
-                    + pad_bottom
-            }
+        let body_height = match runtime.view_mode(block_id) {
+            MermaidViewMode::Source => measure_source_body_height(&data.source, width, zoom),
             MermaidViewMode::Diagram => {
-                let source_hash = hash_mermaid_source(&data.source);
-                let theme_hash = runtime
-                    .block_theme_hash
-                    .get(&block_id)
-                    .copied()
-                    .unwrap_or_else(|| MermaidThemePalette::light().fingerprint());
-                let max_body_w = (width - 2.0 * pad_x).max(48.0);
-                let max_body_h = pt_to_px(
-                    data.max_height_pt
-                        .unwrap_or(runtime.config.default_max_height_pt)
-                        .max(64.0),
-                    zoom,
-                );
-
-                let body_h = match runtime.peek_compiled(CompileKey {
-                    source_hash,
-                    theme_hash,
-                }) {
-                    Some(CompiledDiagram::Ready {
-                        intrinsic_width,
-                        intrinsic_height,
-                        ..
-                    }) => {
-                        let (_, fitted_h) = fit_diagram_size(
-                            *intrinsic_width,
-                            *intrinsic_height,
-                            max_body_w,
-                            max_body_h,
-                            zoom,
-                        );
-                        fitted_h
-                    }
-                    Some(CompiledDiagram::Error(_)) => pt_to_px(ERROR_BODY_HEIGHT_PT, zoom),
-                    None => pt_to_px(PLACEHOLDER_BODY_HEIGHT_PT, zoom),
-                };
-                pt_to_px(DIAGRAM_TOP_INSET_PT, zoom) + body_h + pad_bottom + caption_h
+                measure_diagram_body_height(&runtime, block_id, data, width, zoom, false)
+            }
+            MermaidViewMode::Split => {
+                let side_by_side = width >= pt_to_px(SPLIT_MIN_SIDE_BY_SIDE_WIDTH_PT, zoom);
+                if side_by_side {
+                    let divider_w = pt_to_px(SPLIT_DIVIDER_HIT_PT, zoom);
+                    let ratio = runtime.split_ratio(block_id);
+                    let left_w = ((width - divider_w) * ratio).max(100.0);
+                    let right_w = (width - divider_w - left_w).max(100.0);
+                    let source_h = measure_source_body_height(&data.source, left_w, zoom);
+                    let diagram_h =
+                        measure_diagram_body_height(&runtime, block_id, data, right_w, zoom, true);
+                    source_h
+                        .max(diagram_h)
+                        .max(pt_to_px(SPLIT_MIN_BODY_HEIGHT_PT, zoom))
+                } else {
+                    let source_h = measure_source_body_height(&data.source, width, zoom);
+                    let diagram_h =
+                        measure_diagram_body_height(&runtime, block_id, data, width, zoom, true);
+                    source_h + diagram_h + 1.0
+                }
             }
         };
 
+        let height = header_h + body_height;
         runtime.block_measured_height.insert(block_id, height);
-        Size::new(width, height.max(pt_to_px(CODE_TOP_INSET_PT + 18.0, zoom)))
+        Size::new(
+            width,
+            height.max(pt_to_px(CARD_HEADER_HEIGHT_PT + 32.0, zoom)),
+        )
     }
 
     fn render(
@@ -610,7 +753,7 @@ impl BlockRenderer for MermaidBlockRenderer {
             theme_hash,
         };
 
-        let (policy, parent_view, mode, copied) = {
+        let (policy, parent_view, mode, copied, split_ratio) = {
             let mut runtime = self.state.borrow_mut();
             runtime.block_theme_hash.insert(block_id, theme_hash);
             let parent = runtime.parent_view.clone();
@@ -620,10 +763,12 @@ impl BlockRenderer for MermaidBlockRenderer {
                 .unwrap_or_else(InteractionPolicy::viewer);
             let mode = runtime.view_mode(block_id);
             let copied = runtime.copied_block == Some(block_id);
-            (policy, parent, mode, copied)
+            let split_ratio = runtime.split_ratio(block_id);
+            (policy, parent, mode, copied, split_ratio)
         };
 
-        let editor_entity = if mode == MermaidViewMode::Source {
+        let needs_source_editor = matches!(mode, MermaidViewMode::Source | MermaidViewMode::Split);
+        let editor_entity = if needs_source_editor {
             let (entity, newly_created) = {
                 let mut runtime = self.state.borrow_mut();
                 if let Some(existing) = runtime.draft_editors.get(&block_id).cloned() {
@@ -649,7 +794,13 @@ impl BlockRenderer for MermaidBlockRenderer {
                 }
             };
             entity.update(cx, |editor, cx| {
-                editor.sync(theme, policy.editing.enabled, zoom, cx);
+                editor.sync(
+                    &context.data.source,
+                    theme,
+                    policy.editing.enabled,
+                    zoom,
+                    cx,
+                );
                 if newly_created && policy.editing.enabled {
                     editor.focus_editor(window, cx);
                 }
@@ -659,25 +810,50 @@ impl BlockRenderer for MermaidBlockRenderer {
             None
         };
 
+        let active_label_edit = {
+            let runtime = self.state.borrow();
+            runtime
+                .active_label_edit
+                .as_ref()
+                .filter(|edit| edit.block_id == block_id)
+                .map(|edit| {
+                    (
+                        edit.label_text.clone(),
+                        edit.occurrence,
+                        edit.editor.clone(),
+                    )
+                })
+        };
+        if let Some((_, _, label_editor)) = &active_label_edit {
+            label_editor.update(cx, |editor, cx| {
+                editor.sync(theme, zoom, cx);
+            });
+        }
+
+        let total_w: f32 = context.bounds.size.width.into();
+        let scale_factor = window.scale_factor().max(1.0);
+        let pad_x = pt_to_px(CARD_PAD_X_PT, zoom);
+        let max_body_h = pt_to_px(
+            context
+                .data
+                .max_height_pt
+                .unwrap_or_else(|| self.state.borrow().config.default_max_height_pt)
+                .max(64.0),
+            zoom,
+        );
+
         let body = match mode {
             MermaidViewMode::Source => {
                 let editor_entity = editor_entity.clone()?;
-                div().size_full().child(editor_entity).into_any_element()
+                div()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .w_full()
+                    .child(editor_entity)
+                    .into_any_element()
             }
             MermaidViewMode::Diagram => {
-                let total_w: f32 = context.bounds.size.width.into();
-                let pad_x = pt_to_px(CARD_PAD_X_PT, zoom);
                 let max_body_w = (total_w - 2.0 * pad_x).max(48.0);
-                let max_body_h = pt_to_px(
-                    context
-                        .data
-                        .max_height_pt
-                        .unwrap_or_else(|| self.state.borrow().config.default_max_height_pt)
-                        .max(64.0),
-                    zoom,
-                );
-                let scale_factor = window.scale_factor().max(1.0);
-
                 let render_visual = self.prepare_diagram_visual(
                     block_id,
                     &context.data.source,
@@ -687,9 +863,9 @@ impl BlockRenderer for MermaidBlockRenderer {
                     max_body_h,
                     zoom,
                     scale_factor,
+                    false,
                     cx,
                 );
-
                 build_diagram_body(
                     block_id,
                     &context.data.source,
@@ -698,21 +874,207 @@ impl BlockRenderer for MermaidBlockRenderer {
                     policy,
                     zoom,
                     theme,
+                    Rc::clone(&self.state),
                     parent_view.clone(),
+                    active_label_edit,
                 )
+            }
+            MermaidViewMode::Split => {
+                let editor_entity = editor_entity.clone()?;
+                let side_by_side = total_w >= pt_to_px(SPLIT_MIN_SIDE_BY_SIDE_WIDTH_PT, zoom);
+                let divider_w = pt_to_px(SPLIT_DIVIDER_HIT_PT, zoom);
+
+                let (left_w, diagram_pane_w) = if side_by_side {
+                    let usable_w = (total_w - divider_w).max(200.0);
+                    let lw = (usable_w * split_ratio).max(100.0);
+                    let rw = (usable_w - lw).max(100.0);
+                    (lw, rw)
+                } else {
+                    (total_w, total_w)
+                };
+
+                let max_body_w = (diagram_pane_w - 2.0 * pad_x).max(48.0);
+                let render_visual = self.prepare_diagram_visual(
+                    block_id,
+                    &context.data.source,
+                    palette,
+                    compile_key,
+                    max_body_w,
+                    max_body_h,
+                    zoom,
+                    scale_factor,
+                    true,
+                    cx,
+                );
+                let diagram_pane = build_diagram_body(
+                    block_id,
+                    &context.data.source,
+                    context.data.caption.as_deref(),
+                    render_visual,
+                    policy,
+                    zoom,
+                    theme,
+                    Rc::clone(&self.state),
+                    parent_view.clone(),
+                    active_label_edit,
+                );
+
+                if side_by_side {
+                    let drag_start_state = Rc::clone(&self.state);
+                    let drag_move_state = Rc::clone(&self.state);
+                    let drag_move_parent = parent_view.clone();
+                    let drag_end_state = Rc::clone(&self.state);
+                    let drag_end_out_state = Rc::clone(&self.state);
+                    let reset_state = Rc::clone(&self.state);
+                    let reset_parent = parent_view.clone();
+                    let container_usable_w = (total_w - divider_w).max(200.0);
+
+                    let divider = div()
+                        .id(("mermaid-split-divider", block_id.0))
+                        .w(px(divider_w))
+                        .h_full()
+                        .flex_none()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .cursor_col_resize()
+                        .hover(|style| style.bg(theme.accent.alpha(0.10)))
+                        .on_mouse_down(MouseButton::Left, move |event, _window, cx| {
+                            if event.click_count >= 2 {
+                                reset_state
+                                    .borrow_mut()
+                                    .set_split_ratio(block_id, DEFAULT_SPLIT_RATIO);
+                                if let Some(view) = reset_parent.upgrade() {
+                                    view.update(cx, |view, cx| {
+                                        view.invalidate_block_layout(block_id, cx);
+                                    });
+                                }
+                            } else {
+                                let start_x: f32 = event.position.x.into();
+                                let mut runtime = drag_start_state.borrow_mut();
+                                let start_ratio = runtime.split_ratio(block_id);
+                                runtime.split_drag = Some(SplitDragState {
+                                    block_id,
+                                    start_x,
+                                    start_ratio,
+                                    container_width: container_usable_w,
+                                });
+                            }
+                            cx.stop_propagation();
+                        })
+                        .child(div().w(px(1.0)).h_full().bg(theme.code_border));
+
+                    div()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .w_full()
+                        .flex()
+                        .flex_row()
+                        .on_mouse_move(move |event: &MouseMoveEvent, _window, cx| {
+                            let drag = {
+                                let runtime = drag_move_state.borrow();
+                                runtime
+                                    .split_drag
+                                    .filter(|active| active.block_id == block_id)
+                            };
+                            let Some(drag) = drag else {
+                                return;
+                            };
+                            if event.pressed_button != Some(MouseButton::Left) {
+                                drag_move_state.borrow_mut().split_drag = None;
+                                return;
+                            }
+                            let current_x: f32 = event.position.x.into();
+                            let delta_ratio =
+                                (current_x - drag.start_x) / drag.container_width.max(1.0);
+                            let next_ratio = (drag.start_ratio + delta_ratio)
+                                .clamp(MIN_SPLIT_RATIO, MAX_SPLIT_RATIO);
+                            let changed = {
+                                let mut runtime = drag_move_state.borrow_mut();
+                                let prev = runtime.split_ratio(block_id);
+                                if (prev - next_ratio).abs() > 0.004 {
+                                    runtime.set_split_ratio(block_id, next_ratio);
+                                    true
+                                } else {
+                                    false
+                                }
+                            };
+                            if changed && let Some(view) = drag_move_parent.upgrade() {
+                                view.update(cx, |view, cx| {
+                                    view.invalidate_block_layout(block_id, cx);
+                                });
+                            }
+                        })
+                        .on_mouse_up(MouseButton::Left, move |_event, _window, _cx| {
+                            let mut runtime = drag_end_state.borrow_mut();
+                            if runtime
+                                .split_drag
+                                .is_some_and(|active| active.block_id == block_id)
+                            {
+                                runtime.split_drag = None;
+                            }
+                        })
+                        .on_mouse_up_out(MouseButton::Left, move |_event, _window, _cx| {
+                            let mut runtime = drag_end_out_state.borrow_mut();
+                            if runtime
+                                .split_drag
+                                .is_some_and(|active| active.block_id == block_id)
+                            {
+                                runtime.split_drag = None;
+                            }
+                        })
+                        .child(
+                            div()
+                                .w(px(left_w))
+                                .h_full()
+                                .flex_none()
+                                .overflow_hidden()
+                                .child(editor_entity),
+                        )
+                        .child(divider)
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .h_full()
+                                .overflow_hidden()
+                                .bg(theme.surface_background.alpha(0.35))
+                                .child(diagram_pane),
+                        )
+                        .into_any_element()
+                } else {
+                    let source_h = measure_source_body_height(&context.data.source, total_w, zoom);
+                    div()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .w_full()
+                        .flex()
+                        .flex_col()
+                        .child(
+                            div()
+                                .w_full()
+                                .h(px(source_h))
+                                .flex_none()
+                                .overflow_hidden()
+                                .border_b_1()
+                                .border_color(theme.code_border)
+                                .child(editor_entity),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_h(px(0.0))
+                                .w_full()
+                                .overflow_hidden()
+                                .bg(theme.surface_background.alpha(0.35))
+                                .child(diagram_pane),
+                        )
+                        .into_any_element()
+                }
             }
         };
 
-        let floating_label = div()
-            .absolute()
-            .top(px(pt_to_px(5.5, zoom)))
-            .left(px(pt_to_px(10.0, zoom)))
-            .text_size(px(pt_to_px(8.5, zoom)))
-            .line_height(px(pt_to_px(8.5 * 1.25, zoom)))
-            .text_color(theme.muted_text)
-            .child("mermaid");
-
-        let floating_controls = build_overlay_controls(
+        let header = build_header_bar(
             block_id,
             &context.data.source,
             mode,
@@ -729,13 +1091,14 @@ impl BlockRenderer for MermaidBlockRenderer {
             .relative()
             .size_full()
             .overflow_hidden()
+            .flex()
+            .flex_col()
             .rounded(px(pt_to_px(5.0, zoom)))
             .border_1()
             .border_color(theme.code_border)
             .bg(theme.code_background)
+            .child(header)
             .child(body)
-            .child(floating_label)
-            .child(floating_controls)
             .into_any_element();
 
         Some(CustomRenderOutput::Element(card))
@@ -768,6 +1131,9 @@ enum DiagramVisual {
         image: Arc<RenderImage>,
         display_width: f32,
         display_height: f32,
+        view_box: SvgViewBox,
+        labels: Vec<MermaidSvgLabel>,
+        inline_error: Option<MermaidRenderError>,
     },
     Loading,
     Error(MermaidRenderError),
@@ -785,18 +1151,41 @@ impl MermaidBlockRenderer {
         max_body_h: f32,
         zoom: f32,
         scale_factor: f32,
+        live_split_mode: bool,
         cx: &mut App,
     ) -> DiagramVisual {
         let mut runtime = self.state.borrow_mut();
 
-        let (compiled_parsed, display_width, display_height) =
+        let (compiled_parsed, display_width, display_height, view_box, labels) =
             match runtime.lookup_compiled(compile_key) {
                 Some(CompiledDiagram::Error(error)) => {
-                    return DiagramVisual::Error(error.clone());
+                    let error = error.clone();
+                    if live_split_mode
+                        && let Some(last_valid) = runtime.last_valid_diagram.get(&block_id).cloned()
+                    {
+                        let (w, h) = fit_diagram_size(
+                            last_valid.intrinsic_width,
+                            last_valid.intrinsic_height,
+                            max_body_w,
+                            max_body_h,
+                            zoom,
+                        );
+                        return DiagramVisual::Image {
+                            image: last_valid.image,
+                            display_width: w,
+                            display_height: h,
+                            view_box: last_valid.view_box,
+                            labels: last_valid.labels,
+                            inline_error: Some(error),
+                        };
+                    }
+                    return DiagramVisual::Error(error);
                 }
                 Some(CompiledDiagram::Ready {
                     intrinsic_width,
                     intrinsic_height,
+                    view_box,
+                    labels,
                     parsed_svg,
                 }) => {
                     let (w, h) = fit_diagram_size(
@@ -807,12 +1196,26 @@ impl MermaidBlockRenderer {
                         zoom,
                     );
                     (
-                        Some((Arc::clone(parsed_svg), *intrinsic_width, *intrinsic_height)),
+                        Some((
+                            Arc::clone(parsed_svg),
+                            *intrinsic_width,
+                            *intrinsic_height,
+                            *view_box,
+                            labels.clone(),
+                        )),
                         w,
                         h,
+                        Some(*view_box),
+                        Some(labels.clone()),
                     )
                 }
-                None => (None, max_body_w, pt_to_px(PLACEHOLDER_BODY_HEIGHT_PT, zoom)),
+                None => (
+                    None,
+                    max_body_w,
+                    pt_to_px(PLACEHOLDER_BODY_HEIGHT_PT, zoom),
+                    None,
+                    None,
+                ),
             };
 
         let target_width_dev = quantize_device_px(display_width * scale_factor);
@@ -825,16 +1228,36 @@ impl MermaidBlockRenderer {
         };
 
         if let Some(image) = runtime.lookup_raster(raster_key) {
+            let resolved_view_box = view_box
+                .unwrap_or_else(|| SvgViewBox::new(0.0, 0.0, display_width, display_height));
+            let resolved_labels = labels.unwrap_or_default();
+            if let Some((_, intrinsic_width, intrinsic_height, vb, lbls)) = compiled_parsed {
+                runtime.last_valid_diagram.insert(
+                    block_id,
+                    LastValidDiagram {
+                        image: Arc::clone(&image),
+                        intrinsic_width,
+                        intrinsic_height,
+                        view_box: vb,
+                        labels: lbls,
+                    },
+                );
+            }
             return DiagramVisual::Image {
                 image,
                 display_width,
                 display_height,
+                view_box: resolved_view_box,
+                labels: resolved_labels,
+                inline_error: None,
             };
         }
 
-        // Keep the most recent RenderImage visible during zoom/resize while the new resolution
-        // rasterizes asynchronously.
-        let stale_image = runtime.stale_raster_for(compile_key.source_hash, compile_key.theme_hash);
+        // Keep the most recent RenderImage visible during zoom, resize, or live typing while the
+        // updated diagram compiles and rasterizes asynchronously.
+        let stale_same_source =
+            runtime.stale_raster_for(compile_key.source_hash, compile_key.theme_hash);
+        let last_valid_fallback = runtime.last_valid_diagram.get(&block_id).cloned();
 
         let already_in_flight = runtime
             .in_flight
@@ -846,8 +1269,17 @@ impl MermaidBlockRenderer {
             let owned_source = source.to_owned();
             let state_weak = Rc::downgrade(&self.state);
             let parent_view = runtime.parent_view.clone();
+            let debounce =
+                if live_split_mode && compiled_parsed.is_none() && last_valid_fallback.is_some() {
+                    Some(LIVE_COMPILE_DEBOUNCE)
+                } else {
+                    None
+                };
 
             let task = cx.spawn(async move |async_app: &mut AsyncApp| {
+                if let Some(delay) = debounce {
+                    async_app.background_executor().timer(delay).await;
+                }
                 let outcome = async_app
                     .background_executor()
                     .spawn(async move {
@@ -880,15 +1312,29 @@ impl MermaidBlockRenderer {
                                 raster_key,
                                 intrinsic_width,
                                 intrinsic_height,
+                                view_box,
+                                labels,
                                 parsed_svg,
                                 image,
                             } => {
                                 let was_compiled = runtime.peek_compiled(compile_key).is_some();
+                                runtime.last_valid_diagram.insert(
+                                    block_id,
+                                    LastValidDiagram {
+                                        image: Arc::clone(&image),
+                                        intrinsic_width,
+                                        intrinsic_height,
+                                        view_box,
+                                        labels: labels.clone(),
+                                    },
+                                );
                                 runtime.insert_compiled(
                                     compile_key,
                                     CompiledDiagram::Ready {
                                         intrinsic_width,
                                         intrinsic_height,
+                                        view_box,
+                                        labels,
                                         parsed_svg,
                                     },
                                 );
@@ -917,20 +1363,43 @@ impl MermaidBlockRenderer {
             runtime.in_flight.insert(block_id, (raster_key, task));
         }
 
-        match stale_image {
-            Some(image) => DiagramVisual::Image {
+        if let Some(image) = stale_same_source {
+            return DiagramVisual::Image {
                 image,
                 display_width,
                 display_height,
-            },
-            None => DiagramVisual::Loading,
+                view_box: view_box
+                    .unwrap_or_else(|| SvgViewBox::new(0.0, 0.0, display_width, display_height)),
+                labels: labels.unwrap_or_default(),
+                inline_error: None,
+            };
         }
+
+        if let Some(last_valid) = last_valid_fallback {
+            let (w, h) = fit_diagram_size(
+                last_valid.intrinsic_width,
+                last_valid.intrinsic_height,
+                max_body_w,
+                max_body_h,
+                zoom,
+            );
+            return DiagramVisual::Image {
+                image: last_valid.image,
+                display_width: w,
+                display_height: h,
+                view_box: last_valid.view_box,
+                labels: last_valid.labels,
+                inline_error: None,
+            };
+        }
+
+        DiagramVisual::Loading
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn run_background_compile_and_raster(
-    existing_parsed: Option<(Arc<ParsedSvg>, f32, f32)>,
+    existing_parsed: Option<(Arc<ParsedSvg>, f32, f32, SvgViewBox, Vec<MermaidSvgLabel>)>,
     source: String,
     palette: MermaidThemePalette,
     compile_key: CompileKey,
@@ -942,7 +1411,7 @@ fn run_background_compile_and_raster(
     backend: Arc<dyn MermaidBackend>,
     svg_renderer: SvgRenderer,
 ) -> BackgroundRenderOutcome {
-    let (parsed_svg, intrinsic_width, intrinsic_height) = match existing_parsed {
+    let (parsed_svg, intrinsic_width, intrinsic_height, view_box, labels) = match existing_parsed {
         Some(existing) => existing,
         None => {
             let svg = match backend.render_svg(&source, &palette) {
@@ -951,6 +1420,8 @@ fn run_background_compile_and_raster(
                     return BackgroundRenderOutcome::Error { compile_key, error };
                 }
             };
+            let (view_box, labels) =
+                extract_svg_labels(&svg.svg, svg.intrinsic_width, svg.intrinsic_height);
             let parsed = match svg_renderer.parse_svg(svg.svg.as_bytes()) {
                 Ok(parsed) => Arc::new(parsed),
                 Err(error) => {
@@ -962,7 +1433,13 @@ fn run_background_compile_and_raster(
                     };
                 }
             };
-            (parsed, svg.intrinsic_width, svg.intrinsic_height)
+            (
+                parsed,
+                svg.intrinsic_width,
+                svg.intrinsic_height,
+                view_box,
+                labels,
+            )
         }
     };
 
@@ -992,6 +1469,8 @@ fn run_background_compile_and_raster(
             raster_key,
             intrinsic_width,
             intrinsic_height,
+            view_box,
+            labels,
             parsed_svg,
             image,
         },
@@ -1012,7 +1491,7 @@ fn style_code_pill(
     div()
         .id(id)
         .h(px(pt_to_px(15.0, zoom)))
-        .px(px(pt_to_px(7.0, zoom)))
+        .px(px(pt_to_px(6.5, zoom)))
         .flex()
         .items_center()
         .justify_center()
@@ -1026,7 +1505,7 @@ fn style_code_pill(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn build_overlay_controls(
+fn build_header_bar(
     block_id: BlockId,
     source: &str,
     mode: MermaidViewMode,
@@ -1039,145 +1518,148 @@ fn build_overlay_controls(
     editor_entity: Option<Entity<MermaidSourceEditor>>,
 ) -> impl IntoElement {
     let show_copy = policy.can_copy_code();
-    let show_toggle = policy.editing.enabled || policy.can_copy_code();
-    let editing_source = mode == MermaidViewMode::Source && policy.editing.enabled;
-    let toggle_label = match (mode, policy.editing.enabled) {
-        (MermaidViewMode::Diagram, true) => "Edit",
-        (MermaidViewMode::Diagram, false) => "Source",
-        (MermaidViewMode::Source, _) => "Diagram",
-    };
-
+    let show_modes = policy.editing.enabled || policy.can_copy_code();
     let owned_source = source.to_owned();
     let copy_state = Rc::clone(&state);
     let copy_parent = parent_view.clone();
-    let copy_editor = editor_entity.clone();
+    let copy_editor = editor_entity;
+
+    let mode_pill = |id_prefix: &'static str,
+                     label: &'static str,
+                     target_mode: MermaidViewMode,
+                     active: bool| {
+        let (bg, border, fg) = if active {
+            (theme.accent.alpha(0.14), theme.accent, theme.accent)
+        } else {
+            (
+                theme.surface_background,
+                theme.code_border,
+                theme.muted_text,
+            )
+        };
+        let parent_for_mode = parent_view.clone();
+        style_code_pill((id_prefix, block_id.0), zoom, bg, border, fg)
+            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                if let Some(view) = parent_for_mode.upgrade() {
+                    view.update(cx, |view, cx| {
+                        view.dispatch_extension_command(
+                            SetMermaidViewMode {
+                                block_id,
+                                mode: target_mode,
+                            },
+                            cx,
+                        );
+                    });
+                }
+                cx.stop_propagation();
+            })
+            .child(label)
+    };
+
+    let show_divider = mode != MermaidViewMode::Diagram;
 
     div()
-        .absolute()
-        .top(px(pt_to_px(4.5, zoom)))
-        .right(px(pt_to_px(8.0, zoom)))
+        .w_full()
+        .h(px(pt_to_px(CARD_HEADER_HEIGHT_PT, zoom)))
+        .flex_none()
+        .px(px(pt_to_px(10.0, zoom)))
         .flex()
         .items_center()
-        .gap(px(pt_to_px(5.0, zoom)))
-        .when(show_copy, |row| {
-            let (bg, border, fg, label) = if copied {
-                (
-                    theme.accent.alpha(0.14),
-                    theme.accent,
-                    theme.accent,
-                    "Copied",
-                )
-            } else {
-                (
-                    theme.surface_background,
-                    theme.code_border,
-                    theme.muted_text,
-                    "Copy",
-                )
-            };
-            row.child(
-                style_code_pill(("mermaid-copy", block_id.0), zoom, bg, border, fg)
-                    .min_w(px(pt_to_px(44.0, zoom)))
-                    .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
-                        let text = copy_editor
-                            .as_ref()
-                            .map(|editor| editor.read(cx).current_source(cx))
-                            .unwrap_or_else(|| owned_source.clone());
-                        cx.write_to_clipboard(ClipboardItem::new_string(text));
-                        let weak_state = Rc::downgrade(&copy_state);
-                        let parent_for_timer = copy_parent.clone();
-                        let reset_task = cx.spawn(async move |async_app: &mut AsyncApp| {
-                            async_app
-                                .background_executor()
-                                .timer(COPY_FEEDBACK_DURATION)
-                                .await;
-                            async_app.update(|cx| {
-                                if let Some(state_rc) = weak_state.upgrade() {
-                                    let mut runtime = state_rc.borrow_mut();
-                                    if runtime.copied_block == Some(block_id) {
-                                        runtime.copied_block = None;
-                                    }
-                                    runtime.copy_reset_task = None;
+        .justify_between()
+        .when(show_divider, |bar| {
+            bar.border_b_1().border_color(theme.code_border)
+        })
+        .child(
+            div()
+                .text_size(px(pt_to_px(8.5, zoom)))
+                .line_height(px(pt_to_px(8.5 * 1.25, zoom)))
+                .text_color(theme.muted_text)
+                .child("mermaid"),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap(px(pt_to_px(4.0, zoom)))
+                .when(show_modes, |row| {
+                    row.child(mode_pill(
+                        "mermaid-mode-diagram",
+                        "Diagram",
+                        MermaidViewMode::Diagram,
+                        mode == MermaidViewMode::Diagram,
+                    ))
+                    .child(mode_pill(
+                        "mermaid-mode-split",
+                        "Split",
+                        MermaidViewMode::Split,
+                        mode == MermaidViewMode::Split,
+                    ))
+                    .child(mode_pill(
+                        "mermaid-mode-source",
+                        "Source",
+                        MermaidViewMode::Source,
+                        mode == MermaidViewMode::Source,
+                    ))
+                })
+                .when(show_copy, |row| {
+                    let (bg, border, fg, label) = if copied {
+                        (
+                            theme.accent.alpha(0.14),
+                            theme.accent,
+                            theme.accent,
+                            "Copied",
+                        )
+                    } else {
+                        (
+                            theme.surface_background,
+                            theme.code_border,
+                            theme.muted_text,
+                            "Copy",
+                        )
+                    };
+                    row.child(
+                        style_code_pill(("mermaid-copy", block_id.0), zoom, bg, border, fg)
+                            .min_w(px(pt_to_px(42.0, zoom)))
+                            .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
+                                let text = copy_editor
+                                    .as_ref()
+                                    .map(|editor| editor.read(cx).current_source(cx))
+                                    .unwrap_or_else(|| owned_source.clone());
+                                cx.write_to_clipboard(ClipboardItem::new_string(text));
+                                let weak_state = Rc::downgrade(&copy_state);
+                                let parent_for_timer = copy_parent.clone();
+                                let reset_task = cx.spawn(async move |async_app: &mut AsyncApp| {
+                                    async_app
+                                        .background_executor()
+                                        .timer(COPY_FEEDBACK_DURATION)
+                                        .await;
+                                    async_app.update(|cx| {
+                                        if let Some(state_rc) = weak_state.upgrade() {
+                                            let mut runtime = state_rc.borrow_mut();
+                                            if runtime.copied_block == Some(block_id) {
+                                                runtime.copied_block = None;
+                                            }
+                                            runtime.copy_reset_task = None;
+                                        }
+                                        if let Some(view) = parent_for_timer.upgrade() {
+                                            view.update(cx, |_, cx| cx.notify());
+                                        }
+                                    });
+                                });
+                                {
+                                    let mut runtime = copy_state.borrow_mut();
+                                    runtime.copied_block = Some(block_id);
+                                    runtime.copy_reset_task = Some(reset_task);
                                 }
-                                if let Some(view) = parent_for_timer.upgrade() {
+                                if let Some(view) = copy_parent.upgrade() {
                                     view.update(cx, |_, cx| cx.notify());
                                 }
-                            });
-                        });
-                        {
-                            let mut runtime = copy_state.borrow_mut();
-                            runtime.copied_block = Some(block_id);
-                            runtime.copy_reset_task = Some(reset_task);
-                        }
-                        if let Some(view) = copy_parent.upgrade() {
-                            view.update(cx, |_, cx| cx.notify());
-                        }
-                        cx.stop_propagation();
-                    })
-                    .child(label),
-            )
-        })
-        .when(editing_source, |row| {
-            let cancel_editor = editor_entity.clone();
-            let apply_editor = editor_entity.clone();
-            row.child(
-                style_code_pill(
-                    ("mermaid-source-cancel", block_id.0),
-                    zoom,
-                    theme.surface_background,
-                    theme.code_border,
-                    theme.muted_text,
-                )
-                .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
-                    if let Some(editor) = cancel_editor.as_ref() {
-                        editor.update(cx, |editor, cx| {
-                            editor.close_source_view(window, cx);
-                        });
-                    }
-                    cx.stop_propagation();
-                })
-                .child("Cancel"),
-            )
-            .child(
-                style_code_pill(
-                    ("mermaid-source-apply", block_id.0),
-                    zoom,
-                    theme.accent.alpha(0.14),
-                    theme.accent,
-                    theme.accent,
-                )
-                .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
-                    if let Some(editor) = apply_editor.as_ref() {
-                        editor.update(cx, |editor, cx| {
-                            editor.apply_draft(window, cx);
-                        });
-                    }
-                    cx.stop_propagation();
-                })
-                .child("Apply"),
-            )
-        })
-        .when(show_toggle && !editing_source, |row| {
-            let toggle_parent = parent_view.clone();
-            row.child(
-                style_code_pill(
-                    ("mermaid-toggle", block_id.0),
-                    zoom,
-                    theme.surface_background,
-                    theme.code_border,
-                    theme.muted_text,
-                )
-                .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
-                    if let Some(view) = toggle_parent.upgrade() {
-                        view.update(cx, |view, cx| {
-                            view.dispatch_extension_command(ToggleMermaidViewMode { block_id }, cx);
-                        });
-                    }
-                    cx.stop_propagation();
-                })
-                .child(toggle_label),
-            )
-        })
+                                cx.stop_propagation();
+                            })
+                            .child(label),
+                    )
+                }),
+        )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1189,22 +1671,32 @@ fn build_diagram_body(
     policy: InteractionPolicy,
     zoom: f32,
     theme: &RichTheme,
+    state: Rc<RefCell<MermaidRuntimeState>>,
     parent_view: WeakEntity<RichDocumentView>,
+    active_label_edit: Option<(String, usize, Entity<MermaidLabelEditor>)>,
 ) -> gpui_kit::AnyElement {
     let pad_x = pt_to_px(CARD_PAD_X_PT, zoom);
-    let pad_top = pt_to_px(DIAGRAM_TOP_INSET_PT, zoom);
+    let pad_top = pt_to_px(CARD_PAD_TOP_PT, zoom);
     let pad_bottom = pt_to_px(CARD_PAD_BOTTOM_PT, zoom);
     let clean_caption = caption
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(str::to_owned);
 
+    let mut footer_error: Option<MermaidRenderError> = None;
+
     let main_content = match visual {
         DiagramVisual::Image {
             image,
             display_width,
             display_height,
+            view_box,
+            labels,
+            inline_error,
         } => {
+            footer_error = inline_error;
+            let can_direct_edit = policy.editing.enabled && footer_error.is_none();
+
             let paint_element = canvas(
                 |_bounds, _window, _cx| (),
                 move |bounds, (), window, _cx| {
@@ -1225,13 +1717,157 @@ fn build_diagram_body(
             .w(px(display_width))
             .h(px(display_height));
 
+            let mut label_overlays: Vec<gpui_kit::AnyElement> = Vec::new();
+            if can_direct_edit {
+                let scale_x = display_width / view_box.width.max(1.0);
+                let scale_y = display_height / view_box.height.max(1.0);
+                let hit_pad = pt_to_px(2.5, zoom);
+
+                for (label_index, label) in labels.iter().enumerate() {
+                    let Some(matched) =
+                        find_editable_mermaid_label(source, &label.text, label.occurrence)
+                    else {
+                        continue;
+                    };
+
+                    let left = ((label.x - view_box.x) * scale_x - hit_pad)
+                        .clamp(0.0, (display_width - 12.0).max(0.0));
+                    let top = ((label.y - view_box.y) * scale_y - hit_pad)
+                        .clamp(0.0, (display_height - 12.0).max(0.0));
+                    let rect_w = (label.width * scale_x + hit_pad * 2.0)
+                        .clamp(16.0, (display_width - left).max(16.0));
+                    let rect_h = (label.height * scale_y + hit_pad * 2.0)
+                        .clamp(16.0, (display_height - top).max(16.0));
+
+                    let is_active =
+                        active_label_edit
+                            .as_ref()
+                            .is_some_and(|(active_text, active_occ, _)| {
+                                *active_text == label.text && *active_occ == label.occurrence
+                            });
+
+                    if is_active && let Some((_, _, active_editor)) = &active_label_edit {
+                        let min_editor_w = pt_to_px(108.0, zoom);
+                        let editor_w = (rect_w + pt_to_px(28.0, zoom))
+                            .max(min_editor_w)
+                            .min(display_width.max(min_editor_w));
+                        let editor_h = rect_h.max(pt_to_px(22.0, zoom));
+                        let center_x = left + rect_w * 0.5;
+                        let center_y = top + rect_h * 0.5;
+                        let editor_left = (center_x - editor_w * 0.5)
+                            .clamp(0.0, (display_width - editor_w).max(0.0));
+                        let editor_top = (center_y - editor_h * 0.5)
+                            .clamp(0.0, (display_height - editor_h).max(0.0));
+
+                        label_overlays.push(
+                            div()
+                                .absolute()
+                                .left(px(editor_left))
+                                .top(px(editor_top))
+                                .w(px(editor_w))
+                                .h(px(editor_h))
+                                .child(active_editor.clone())
+                                .into_any_element(),
+                        );
+                    } else {
+                        let click_state = Rc::clone(&state);
+                        let click_parent = parent_view.clone();
+                        let click_theme = theme.clone();
+                        let original_label = label.text.clone();
+                        let initial_text = matched.display_text;
+                        let occurrence = label.occurrence;
+                        let element_id = block_id
+                            .0
+                            .wrapping_mul(1024)
+                            .wrapping_add(label_index as u64);
+
+                        label_overlays.push(
+                            div()
+                                .id(("mermaid-label", element_id))
+                                .absolute()
+                                .left(px(left))
+                                .top(px(top))
+                                .w(px(rect_w))
+                                .h(px(rect_h))
+                                .rounded(px(pt_to_px(3.0, zoom)))
+                                .border_1()
+                                .border_color(Hsla::transparent_black())
+                                .cursor_text()
+                                .hover(|style| {
+                                    style
+                                        .bg(theme.accent.alpha(0.12))
+                                        .border_color(theme.accent.alpha(0.55))
+                                })
+                                .on_mouse_down(MouseButton::Left, move |_event, window, cx| {
+                                    let previous_editor = {
+                                        click_state
+                                            .borrow_mut()
+                                            .active_label_edit
+                                            .take()
+                                            .map(|edit| edit.editor)
+                                    };
+                                    if let Some(previous) = previous_editor {
+                                        previous.update(cx, |editor, cx| {
+                                            editor.commit(false, window, cx);
+                                        });
+                                    }
+
+                                    let dismiss_state = Rc::downgrade(&click_state);
+                                    let on_dismiss = Box::new(move |_cx: &mut App| {
+                                        if let Some(state_rc) = dismiss_state.upgrade() {
+                                            state_rc.borrow_mut().active_label_edit = None;
+                                        }
+                                    });
+                                    let label_for_edit = original_label.clone();
+                                    let text_for_edit = initial_text.clone();
+                                    let theme_for_edit = click_theme.clone();
+                                    let parent_for_edit = click_parent.clone();
+                                    let editor = cx.new(|cx| {
+                                        MermaidLabelEditor::new(
+                                            block_id,
+                                            label_for_edit,
+                                            text_for_edit,
+                                            occurrence,
+                                            &theme_for_edit,
+                                            zoom,
+                                            parent_for_edit,
+                                            on_dismiss,
+                                            window,
+                                            cx,
+                                        )
+                                    });
+                                    click_state.borrow_mut().active_label_edit =
+                                        Some(ActiveLabelEdit {
+                                            block_id,
+                                            label_text: original_label.clone(),
+                                            occurrence,
+                                            editor,
+                                        });
+                                    if let Some(view) = click_parent.upgrade() {
+                                        view.update(cx, |_, cx| cx.notify());
+                                    }
+                                    cx.stop_propagation();
+                                })
+                                .into_any_element(),
+                        );
+                    }
+                }
+            }
+
+            let diagram_stage = div()
+                .relative()
+                .w(px(display_width))
+                .h(px(display_height))
+                .child(paint_element)
+                .children(label_overlays);
+
             div()
                 .flex_1()
                 .w_full()
                 .flex()
                 .items_center()
                 .justify_center()
-                .child(paint_element)
+                .child(diagram_stage)
                 .into_any_element()
         }
         DiagramVisual::Loading => div()
@@ -1246,7 +1882,7 @@ fn build_diagram_body(
             .into_any_element(),
         DiagramVisual::Error(error) => {
             let snippet = source.lines().take(4).collect::<Vec<_>>().join("\n");
-            let edit_parent = parent_view.clone();
+            let split_parent = parent_view.clone();
             div()
                 .flex_1()
                 .w_full()
@@ -1269,19 +1905,19 @@ fn build_diagram_body(
                         .when(policy.editing.enabled, |row| {
                             row.child(
                                 style_code_pill(
-                                    ("mermaid-error-edit", block_id.0),
+                                    ("mermaid-error-split", block_id.0),
                                     zoom,
                                     theme.surface_background,
                                     theme.code_border,
                                     theme.muted_text,
                                 )
                                 .on_mouse_down(MouseButton::Left, move |_event, _window, cx| {
-                                    if let Some(view) = edit_parent.upgrade() {
+                                    if let Some(view) = split_parent.upgrade() {
                                         view.update(cx, |view, cx| {
                                             view.dispatch_extension_command(
                                                 SetMermaidViewMode {
                                                     block_id,
-                                                    mode: MermaidViewMode::Source,
+                                                    mode: MermaidViewMode::Split,
                                                 },
                                                 cx,
                                             );
@@ -1289,7 +1925,7 @@ fn build_diagram_body(
                                     }
                                     cx.stop_propagation();
                                 })
-                                .child("Edit Source"),
+                                .child("Open Split Editor"),
                             )
                         }),
                 )
@@ -1310,7 +1946,9 @@ fn build_diagram_body(
     };
 
     div()
-        .size_full()
+        .flex_1()
+        .min_h(px(0.0))
+        .w_full()
         .px(px(pad_x))
         .pt(px(pad_top))
         .pb(px(pad_bottom))
@@ -1320,6 +1958,21 @@ fn build_diagram_body(
         .justify_center()
         .gap(px(pt_to_px(4.0, zoom)))
         .child(main_content)
+        .when_some(footer_error, |container, error| {
+            container.child(
+                div()
+                    .w_full()
+                    .px(px(pt_to_px(6.0, zoom)))
+                    .py(px(pt_to_px(3.0, zoom)))
+                    .rounded(px(pt_to_px(3.0, zoom)))
+                    .border_1()
+                    .border_color(theme.code_border)
+                    .bg(theme.surface_background)
+                    .text_size(px(pt_to_px(8.0, zoom)))
+                    .text_color(theme.muted_text)
+                    .child(format!("Mermaid error: {error}")),
+            )
+        })
         .when_some(clean_caption, |container, text| {
             container.child(
                 div()
