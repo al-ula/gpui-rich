@@ -280,6 +280,7 @@ fn custom_block_and_inline_object_measure_via_shaper() {
 
         fn measure_custom_block(
             &mut self,
+            _block_id: BlockId,
             kind: &str,
             _data: &CustomPayload,
             max_width: f32,
@@ -378,6 +379,7 @@ fn invalid_custom_metrics_fall_back_and_large_table_culls_offscreen_leaves() {
         }
         fn measure_custom_block(
             &mut self,
+            _block_id: BlockId,
             _kind: &str,
             _data: &CustomPayload,
             _max_width: f32,
@@ -780,4 +782,80 @@ fn cached_selection_rects_match_visible_selection_for_text_and_tables() {
     let cached_table_rects = flow.cached_selection_rects(&table_selection, &doc, 640.0, 1.0);
     assert_eq!(cached_table_rects.len(), 2);
     assert_eq!(cached_table_rects, visible_table_rects);
+}
+
+#[test]
+fn flow_invalidate_block_remeasures_custom_leaf_without_version_bump() {
+    use gpui_rich::model::{MermaidData, MermaidSpec};
+    use std::cell::Cell;
+
+    struct StatefulLeafShaper<'a> {
+        height: &'a Cell<f32>,
+        target: BlockId,
+    }
+
+    impl TextShaper for StatefulLeafShaper<'_> {
+        type Backend = MockBackend;
+
+        fn shape_segment(
+            &mut self,
+            text: &str,
+            font_size_px: f32,
+            runs: &[ShaperRunSpec],
+        ) -> ShapedSegment<Self::Backend> {
+            MockShaper.shape_segment(text, font_size_px, runs)
+        }
+
+        fn measure_inline_object(&mut self, obj: &InlineObject, zoom: f32) -> InlineBoxMetrics {
+            MockShaper.measure_inline_object(obj, zoom)
+        }
+
+        fn measure_custom_block(
+            &mut self,
+            block_id: BlockId,
+            _kind: &str,
+            _data: &CustomPayload,
+            max_width: f32,
+            _zoom: f32,
+        ) -> Size {
+            if block_id == self.target {
+                Size::new(max_width, self.height.get())
+            } else {
+                Size::new(max_width, 40.0)
+            }
+        }
+    }
+
+    let mut doc = Document::new();
+    let diagram_id = doc.add_leaf_block::<MermaidSpec>(MermaidData::new("flowchart LR\nA-->B"));
+    let trailing_id = doc.add_paragraph(InlineContent::plain("After"), BlockStyle::default());
+    let initial_version = doc.blocks[0].version;
+
+    let dynamic_height = Cell::new(120.0f32);
+    let mut flow = FlowLayout::<MockBackend>::default();
+    let mut shaper = StatefulLeafShaper {
+        height: &dynamic_height,
+        target: diagram_id,
+    };
+
+    let first = flow.layout_visible_blocks(&doc, 0.0, 600.0, 600.0, 100.0, 1.0, &mut shaper);
+    let first_trailing_y = first
+        .iter()
+        .find(|entry| entry.id == trailing_id)
+        .unwrap()
+        .y;
+    assert!((first[0].layout.height - 120.0).abs() < 0.01);
+
+    // Non-mutating invalidation updates measured height and downstream y offsets without bumping version.
+    dynamic_height.set(280.0);
+    flow.invalidate_block(&doc, diagram_id);
+    let second = flow.layout_visible_blocks(&doc, 0.0, 600.0, 600.0, 100.0, 1.0, &mut shaper);
+    let second_trailing_y = second
+        .iter()
+        .find(|entry| entry.id == trailing_id)
+        .unwrap()
+        .y;
+    assert_eq!(doc.blocks[0].version, initial_version);
+    assert!((second[0].layout.height - 280.0).abs() < 0.01);
+    assert!((second_trailing_y - first_trailing_y - 160.0).abs() < 0.5);
 }

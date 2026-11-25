@@ -1849,3 +1849,113 @@ fn boundary_ergonomics_exit_and_builtin_block_commands_roundtrip() {
         None
     );
 }
+
+#[test]
+fn mermaid_spec_markdown_roundtrip_and_svg_dimensions() {
+    use gpui_rich::model::{
+        MarkdownCodecConfig, MermaidData, MermaidSpec, parse_svg_intrinsic_size,
+    };
+
+    let markdown = "# Architecture\n\n```mermaid\nflowchart LR\n    A[Start] --> B[End]\n```\n\n```rust\nfn main() {}\n```";
+    let decoded = MarkdownCodec.decode_raw(markdown).expect("decode markdown");
+    assert_eq!(decoded.blocks.len(), 3);
+    let mermaid = decoded.blocks[1]
+        .kind
+        .read_data::<MermaidSpec>()
+        .expect("fenced mermaid block must decode into MermaidSpec");
+    assert_eq!(mermaid.source, "flowchart LR\n    A[Start] --> B[End]");
+    assert!(decoded.blocks[2].kind.code_block_data().is_some());
+
+    let encoded = MarkdownCodec.encode(&decoded).expect("encode markdown");
+    assert!(
+        encoded
+            .as_str()
+            .contains("```mermaid\nflowchart LR\n    A[Start] --> B[End]\n```")
+    );
+    let roundtripped = MarkdownCodec.decode(&encoded).expect("re-decode markdown");
+    assert_eq!(
+        roundtripped.blocks[1]
+            .kind
+            .read_data::<MermaidSpec>()
+            .expect("roundtripped MermaidSpec")
+            .source,
+        "flowchart LR\n    A[Start] --> B[End]"
+    );
+
+    // Opt-out config keeps fenced mermaid blocks as plain CodeBlock nodes.
+    let plain_codec = MarkdownCodec::with_config(MarkdownCodecConfig {
+        mermaid_fences: false,
+    });
+    let plain_doc = plain_codec
+        .decode_raw(markdown)
+        .expect("decode markdown without mermaid fences");
+    assert_eq!(
+        plain_doc.blocks[1]
+            .kind
+            .code_block_data()
+            .and_then(|code| code.language.clone())
+            .as_deref(),
+        Some("mermaid")
+    );
+
+    // JSON round-trip preserves MermaidSpec payload including optional metadata.
+    let mut doc = Document::new();
+    doc.add_leaf_block::<MermaidSpec>(
+        MermaidData::new("sequenceDiagram\nA->>B: Ping")
+            .with_caption("Ping flow")
+            .with_max_height_pt(320.0),
+    );
+    let json = JsonCodec.encode(&doc).expect("encode json");
+    let json_doc = JsonCodec.decode(&json).expect("decode json");
+    let restored = json_doc.blocks[0]
+        .kind
+        .read_data::<MermaidSpec>()
+        .expect("restored MermaidSpec");
+    assert_eq!(restored.caption.as_deref(), Some("Ping flow"));
+    assert_eq!(restored.max_height_pt, Some(320.0));
+
+    // SVG dimension parsing prefers viewBox over percentage width and falls back to px/pt sizes.
+    assert_eq!(
+        parse_svg_intrinsic_size(r#"<svg width="100%" viewBox="0 0 320.5 180.25"></svg>"#),
+        Some((320.5, 180.25))
+    );
+    assert_eq!(
+        parse_svg_intrinsic_size(r#"<svg width="240px" height="120pt"></svg>"#),
+        Some((240.0, 160.0))
+    );
+    assert_eq!(
+        parse_svg_intrinsic_size(r#"<svg width="100%"></svg>"#),
+        None
+    );
+
+    #[cfg(feature = "mermaid")]
+    {
+        use gpui_rich::model::{BuiltInMermaidBackend, MermaidBackend, MermaidThemePalette};
+
+        let backend = BuiltInMermaidBackend::new();
+        let light = backend
+            .render_svg(
+                "flowchart LR\nA[Input] --> B[Output]",
+                &MermaidThemePalette::light(),
+            )
+            .expect("compile light flowchart");
+        assert!(light.svg.contains("<svg"));
+        assert!(light.intrinsic_width > 0.0 && light.intrinsic_height > 0.0);
+
+        let dark = backend
+            .render_svg(
+                "sequenceDiagram\nAlice->>Bob: Hello",
+                &MermaidThemePalette::dark(),
+            )
+            .expect("compile dark sequence diagram");
+        assert!(dark.svg.contains("<svg"));
+        assert!(dark.intrinsic_width > 0.0 && dark.intrinsic_height > 0.0);
+
+        assert!(
+            backend
+                .render_svg("   ", &MermaidThemePalette::light())
+                .is_err(),
+            "empty source must fail cleanly"
+        );
+    }
+}

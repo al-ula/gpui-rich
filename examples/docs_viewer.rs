@@ -15,9 +15,9 @@ use gpui_rich::model::{
     ChipKind, ColumnSpec, DecorationContext, DecorationProvider, DecorationWriter, Document, Edges,
     ExportDocument, FontWeight, HorizontalLayout, ImageAssetId, InlineContent,
     InlineDecorationStyle, InlineObject, InlineSpec, InlineStyle, InlineVAlign, InteractionPolicy,
-    ListId, ListKind, MarkKind, MarkdownCodec, NumberStyle, PaperSpec, RgbaColor, RichCommand,
-    SelectionValue, StyleId, TableBlock, TableBorderStyle, TableCell, TableRow, TextAlign,
-    UnderlineKind, block_shape,
+    ListId, ListKind, MarkKind, MarkdownCodec, MermaidData, MermaidSpec, NumberStyle, PaperSpec,
+    RgbaColor, RichCommand, SelectionValue, StyleId, TableBlock, TableBorderStyle, TableCell,
+    TableRow, TextAlign, UnderlineKind, block_shape,
 };
 use serde::{Deserialize, Serialize};
 
@@ -357,6 +357,10 @@ impl DocsViewerApp {
             }
             if let Err(error) = view.register_inline_renderer(StatusBadgeRenderer, cx) {
                 eprintln!("docs_viewer: failed to register status renderer: {error}");
+            }
+            #[cfg(feature = "mermaid")]
+            if let Err(error) = view.install_mermaid(cx) {
+                eprintln!("docs_viewer: failed to install mermaid extension: {error}");
             }
             view
         });
@@ -2017,6 +2021,13 @@ fn build_sample_document() -> Document {
             title: "Editable Custom Container Block".into(),
         },
         vec![callout_body],
+    );
+
+    document.add_leaf_block::<MermaidSpec>(
+        MermaidData::new(
+            "flowchart LR\n    Doc[Document Tree] --> Flow[FlowLayout]\n    Flow --> Cache[Two-Tier SVG Cache]\n    Cache --> Canvas[GPUI Layer 4 Paint]",
+        )
+        .with_caption("Built-in Mermaid diagram extension (click Edit or Source to inspect)"),
     );
 
     let quote_child_id = document.alloc_block_id();

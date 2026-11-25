@@ -8,12 +8,36 @@ mod docs_viewer;
 mod web_entry {
     use crate::docs_viewer::DocsViewerApp;
     use gpui_kit::web::{CanvasFontFallback, WebBackendPreference, WebPlatform};
-    use gpui_kit::{App, AppContext, Application, WindowOptions};
+    use gpui_kit::{App, AppContext, Application, AssetSource, SharedString, WindowOptions};
     use gpui_rich::gpui::{clear_font_resolution_cache, register_default_keybindings};
     use std::borrow::Cow;
     use std::rc::Rc;
+    use std::sync::Arc;
     use wasm_bindgen::JsCast;
     use wasm_bindgen::prelude::*;
+
+    struct HostFontAssetSource {
+        sans: Arc<[u8]>,
+        mono: Arc<[u8]>,
+    }
+
+    impl AssetSource for HostFontAssetSource {
+        fn load(&self, path: &str) -> gpui_kit::Result<Option<Cow<'static, [u8]>>> {
+            let bytes = match path {
+                "fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf" => Some(self.sans.as_ref()),
+                "fonts/lilex/Lilex-Regular.ttf" => Some(self.mono.as_ref()),
+                _ => None,
+            };
+            Ok(bytes.map(|slice| Cow::Owned(slice.to_vec())))
+        }
+
+        fn list(&self, _path: &str) -> gpui_kit::Result<Vec<SharedString>> {
+            Ok(vec![
+                SharedString::from("fonts/ibm-plex-sans/IBMPlexSans-Regular.ttf"),
+                SharedString::from("fonts/lilex/Lilex-Regular.ttf"),
+            ])
+        }
+    }
 
     fn hide_loading_overlay() {
         if let Some(window) = web_sys::window()
@@ -58,6 +82,13 @@ mod web_entry {
             ));
         }
 
+        let sans_asset: Arc<[u8]> = Arc::from(font_blobs[0].as_ref());
+        // `index.html` fetches IBMPlexMono-Regular at index 9 when available; fall back to sans.
+        let mono_asset: Arc<[u8]> = font_blobs
+            .get(9)
+            .map(|blob| Arc::from(blob.as_ref()))
+            .unwrap_or_else(|| Arc::clone(&sans_asset));
+
         // Single-threaded mode works on any static HTTP server without COOP/COEP headers.
         // EmojiAndCjk lets the browser Canvas 2D API supply emoji and CJK fallback glyphs.
         let platform = Rc::new(WebPlatform::new_with_backend_and_font_fallback(
@@ -65,7 +96,10 @@ mod web_entry {
             WebBackendPreference::Auto,
             CanvasFontFallback::EmojiAndCjk,
         ));
-        let application = Application::with_platform(platform);
+        let application = Application::with_platform(platform).with_assets(HostFontAssetSource {
+            sans: sans_asset,
+            mono: mono_asset,
+        });
 
         application.run(move |cx: &mut App| {
             gpui_kit::init(cx);

@@ -1,7 +1,7 @@
 use crate::layout::geometry::{Insets, Size, pt_to_px};
 use crate::model::{
-    BlockShapeKind, CustomPayload, FontWeight, InlineObject, InlineVAlign, ResolvedTextStyle,
-    RgbaColor, SharedStr, UnderlineKind,
+    BlockId, BlockShapeKind, CustomPayload, FontWeight, InlineObject, InlineVAlign,
+    ResolvedTextStyle, RgbaColor, SharedStr, UnderlineKind,
 };
 use std::fmt::Debug;
 use std::hash::Hash;
@@ -171,6 +171,7 @@ pub trait TextShaper {
     /// Measures a custom leaf block (`BlockKind::Leaf`) inside `max_width` pixels at `zoom`.
     fn measure_custom_block(
         &mut self,
+        _block_id: BlockId,
         _kind: &str,
         _data: &CustomPayload,
         max_width: f32,

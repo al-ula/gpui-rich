@@ -6,8 +6,8 @@ use crate::layout::{
     ShaperRunSpec, Size, TextShaper, is_valid_custom_insets, is_valid_custom_size, pt_to_px,
 };
 use crate::model::{
-    AnchorId, BlockShapeKind, ChipKind, ComponentStore, CustomPayload, DROPDOWN_KIND, InlineObject,
-    InlineVAlign, PLACEHOLDER_KIND, RgbaColor, VARIABLE_KIND, footnote_reference_id,
+    AnchorId, BlockId, BlockShapeKind, ChipKind, ComponentStore, CustomPayload, DROPDOWN_KIND,
+    InlineObject, InlineVAlign, PLACEHOLDER_KIND, RgbaColor, VARIABLE_KIND, footnote_reference_id,
 };
 use gpui_kit::{
     Font, FontFallbacks, FontFeatures, FontId, FontStyle, FontWeight as GpuiFontWeight, GlyphId,
@@ -646,6 +646,7 @@ impl TextShaper for GpuiShaper<'_, '_> {
 
     fn measure_custom_block(
         &mut self,
+        block_id: BlockId,
         kind: &str,
         data: &CustomPayload,
         max_width: f32,
@@ -655,7 +656,7 @@ impl TextShaper for GpuiShaper<'_, '_> {
             .extensions
             .and_then(|registry| registry.get_block(kind))
             && let BlockCallbackResult::Ok(measured) =
-                renderer.measure_leaf(data, max_width, zoom, self.window)
+                renderer.measure_leaf(block_id, data, max_width, zoom, self.window)
             && is_valid_custom_size(measured)
         {
             return measured;

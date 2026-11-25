@@ -339,6 +339,27 @@ impl<B: GlyphBackend> FlowLayout<B> {
         self.visibility.get(block_idx).copied().unwrap_or(false)
     }
 
+    /// Invalidates cached layout for `block_id` (and any enclosing top-level block) without
+    /// modifying [`Document`] or bumping block versions.
+    pub fn invalidate_block(&mut self, doc: &Document, block_id: BlockId) {
+        self.cache.invalidate_block(block_id);
+        if let Some(index) = self.id_to_index.get(&block_id).copied() {
+            if let Some(metric) = self.metrics.get_mut(index) {
+                metric.measured = false;
+            }
+            return;
+        }
+        for (index, top_block) in doc.blocks.iter().enumerate() {
+            if block_contains_id(top_block, block_id) {
+                self.cache.invalidate_block(top_block.id);
+                if let Some(metric) = self.metrics.get_mut(index) {
+                    metric.measured = false;
+                }
+                break;
+            }
+        }
+    }
+
     /// Synchronizes structural metadata and height estimates with `doc`.
     pub fn sync_document(&mut self, doc: &Document, viewport_width: f32, zoom: f32) {
         let horizontal = resolve_horizontal_metrics(viewport_width, &doc.config, zoom);
@@ -1696,6 +1717,27 @@ fn rect_distance_sq(rect: Rect, point: Point) -> f32 {
     let dx = point.x - clamped_x;
     let dy = point.y - clamped_y;
     dx * dx + dy * dy
+}
+
+fn block_contains_id(block: &BlockNode, target: BlockId) -> bool {
+    if block.id == target {
+        return true;
+    }
+    match &block.kind {
+        BlockKind::Container { children, .. } => children
+            .iter()
+            .any(|child| block_contains_id(child, target)),
+        BlockKind::Grid { table, .. } => table.rows.iter().any(|row| {
+            row.cells.iter().any(|cell| {
+                cell.id == target
+                    || cell
+                        .blocks
+                        .iter()
+                        .any(|child| block_contains_id(child, target))
+            })
+        }),
+        BlockKind::Text { .. } | BlockKind::Leaf { .. } => false,
+    }
 }
 
 fn estimate_block_metrics(

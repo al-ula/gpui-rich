@@ -699,7 +699,8 @@ pub fn layout_block<S: TextShaper>(
                     kind: BlockLayoutKind::HorizontalRule { rule_y: h * 0.5 },
                 }
             } else {
-                let raw_measured = shaper.measure_custom_block(kind, data, max_width, zoom);
+                let raw_measured =
+                    shaper.measure_custom_block(block.id, kind, data, max_width, zoom);
                 let measured = if is_valid_custom_size(raw_measured) {
                     raw_measured
                 } else {

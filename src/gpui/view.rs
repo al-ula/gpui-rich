@@ -5,7 +5,7 @@ use crate::gpui::asset::{AssetProvider, LoadedAsset, decode_image_asset};
 use crate::gpui::element::RichDocumentElement;
 use crate::gpui::extension::{
     BlockRenderer, CommandExecutionResult, EditCommandContext, ExtensionDiagnostic,
-    ExtensionRegistrationError, ExtensionRegistry, InlineRenderer, QueryContext,
+    ExtensionPlugin, ExtensionRegistrationError, ExtensionRegistry, InlineRenderer, QueryContext,
     ReadCommandContext, ReadCommandOutcome,
 };
 use crate::gpui::shaper::{FontResolver, GpuiGlyphBackend, GpuiShaper};
@@ -546,6 +546,22 @@ impl RichDocumentView {
     /// recent prepaint pass.
     pub fn extension_diagnostics(&self) -> &[ExtensionDiagnostic] {
         &self.extension_diagnostics
+    }
+
+    /// Installs an [`ExtensionPlugin`] bundle (renderers, commands, and queries) onto this view.
+    pub fn install_extension<P: ExtensionPlugin>(
+        &mut self,
+        plugin: P,
+        cx: &mut Context<Self>,
+    ) -> Result<(), ExtensionRegistrationError> {
+        plugin.install(self, cx)
+    }
+
+    /// Invalidates cached layout for `block_id` without modifying [`Document`] or undo history,
+    /// then schedules a repaint so stateful or async custom renderers can resize cleanly.
+    pub fn invalidate_block_layout(&mut self, block_id: BlockId, cx: &mut Context<Self>) {
+        self.flow.invalidate_block(&self.document, block_id);
+        cx.notify();
     }
 
     /// Registers a spec-bound [`BlockRenderer`], invalidates cached layouts, and schedules repaint.

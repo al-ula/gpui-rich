@@ -2238,11 +2238,20 @@ impl RichDocumentView {
             &self.document,
             self.selection.as_ref(),
         ) {
-            CommandExecutionResult::Read(ReadCommandOutcome::Executed) => {
+            CommandExecutionResult::Read {
+                outcome: ReadCommandOutcome::Executed,
+                invalidated_blocks,
+            } => {
+                for block_id in invalidated_blocks {
+                    self.flow.invalidate_block(&self.document, block_id);
+                }
                 cx.notify();
                 CommandOutcome::Executed
             }
-            CommandExecutionResult::Read(ReadCommandOutcome::NoOp) => CommandOutcome::NoOp,
+            CommandExecutionResult::Read {
+                outcome: ReadCommandOutcome::NoOp,
+                ..
+            } => CommandOutcome::NoOp,
             CommandExecutionResult::Edit {
                 transaction: Some(transaction),
                 next_block_id,

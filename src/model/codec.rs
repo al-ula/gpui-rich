@@ -34,6 +34,7 @@ use crate::model::clipboard::ClipboardFragment;
 use crate::model::inline::{
     ChipKind, ImageAssetId, InlineContent, InlineObject, InlineVAlign, OBJECT_REPLACEMENT_CHAR,
 };
+use crate::model::mermaid::{MERMAID_KIND, MermaidData, MermaidSpec};
 use crate::model::payload::CustomPayload;
 use crate::model::style::{
     BaselineShift, BlockStyle, FontWeight, InlineStyle, StyleId, TextAlign, UnderlineKind,
@@ -634,9 +635,78 @@ impl DocumentCodec for HtmlCodec {
     }
 }
 
+/// Configuration options for [`ConfigurableMarkdownCodec`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MarkdownCodecConfig {
+    /// When `true` (default), ```` ```mermaid ```` fenced blocks decode into [`MermaidSpec`] leaf
+    /// blocks and [`MermaidSpec`] blocks encode back to standard ```` ```mermaid ```` fences.
+    pub mermaid_fences: bool,
+}
+
+impl Default for MarkdownCodecConfig {
+    fn default() -> Self {
+        Self {
+            mermaid_fences: true,
+        }
+    }
+}
+
+/// Configurable GitHub-Flavored Markdown [`DocumentCodec`].
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ConfigurableMarkdownCodec {
+    pub config: MarkdownCodecConfig,
+}
+
+impl ConfigurableMarkdownCodec {
+    /// Creates a Markdown codec with explicit `config`.
+    pub const fn new(config: MarkdownCodecConfig) -> Self {
+        Self { config }
+    }
+}
+
+impl DocumentCodec for ConfigurableMarkdownCodec {
+    type Format = MarkdownFormat;
+
+    fn format_id(&self) -> &str {
+        "markdown"
+    }
+
+    fn mime_types(&self) -> &[&str] {
+        &["text/markdown", "text/x-markdown"]
+    }
+
+    fn file_extensions(&self) -> &[&str] {
+        &["md", "markdown"]
+    }
+
+    fn encode(&self, document: &Document) -> Result<EncodedDocument<Self::Format>, CodecError> {
+        let mut output = String::new();
+        encode_markdown_blocks(&document.blocks, "", self.config, &mut output)?;
+        Ok(EncodedDocument::from_raw(output))
+    }
+
+    fn decode(&self, input: &EncodedDocument<Self::Format>) -> Result<Document, CodecError> {
+        let normalized = input.as_str().replace("\r\n", "\n").replace('\r', "\n");
+        let lines: Vec<&str> = normalized.split('\n').collect();
+        let mut document = Document::new();
+        let blocks = parse_markdown_blocks(&lines, self.config, &mut document);
+        for block in blocks {
+            document.push_block(block);
+        }
+        Ok(document)
+    }
+}
+
 /// Built-in GitHub-Flavored Markdown [`DocumentCodec`].
 #[derive(Clone, Copy, Debug, Default)]
 pub struct MarkdownCodec;
+
+impl MarkdownCodec {
+    /// Returns a [`ConfigurableMarkdownCodec`] using `config`.
+    pub const fn with_config(config: MarkdownCodecConfig) -> ConfigurableMarkdownCodec {
+        ConfigurableMarkdownCodec::new(config)
+    }
+}
 
 impl DocumentCodec for MarkdownCodec {
     type Format = MarkdownFormat;
@@ -654,20 +724,11 @@ impl DocumentCodec for MarkdownCodec {
     }
 
     fn encode(&self, document: &Document) -> Result<EncodedDocument<Self::Format>, CodecError> {
-        let mut output = String::new();
-        encode_markdown_blocks(&document.blocks, "", &mut output)?;
-        Ok(EncodedDocument::from_raw(output))
+        ConfigurableMarkdownCodec::default().encode(document)
     }
 
     fn decode(&self, input: &EncodedDocument<Self::Format>) -> Result<Document, CodecError> {
-        let normalized = input.as_str().replace("\r\n", "\n").replace('\r', "\n");
-        let lines: Vec<&str> = normalized.split('\n').collect();
-        let mut document = Document::new();
-        let blocks = parse_markdown_blocks(&lines, &mut document);
-        for block in blocks {
-            document.push_block(block);
-        }
-        Ok(document)
+        ConfigurableMarkdownCodec::default().decode(input)
     }
 }
 
@@ -678,6 +739,7 @@ impl DocumentCodec for MarkdownCodec {
 fn encode_markdown_blocks(
     blocks: &[BlockNode],
     line_prefix: &str,
+    config: MarkdownCodecConfig,
     output: &mut String,
 ) -> Result<(), CodecError> {
     let mut ordered_counters: HashMap<(ListId, u8), usize> = HashMap::new();
@@ -795,14 +857,14 @@ fn encode_markdown_blocks(
             } => {
                 if kind.as_ref() == block_kinds::BLOCKQUOTE {
                     let nested_prefix = format!("{line_prefix}> ");
-                    encode_markdown_blocks(children, &nested_prefix, output)?;
+                    encode_markdown_blocks(children, &nested_prefix, config, output)?;
                 } else {
                     output.push_str(line_prefix);
                     let payload = serde_json::to_string(data)
                         .map_err(|error| CodecError::serialize("markdown", error.to_string()))?;
                     output.push_str(&format!("<!-- gpui-rich:{kind} {payload} -->\n"));
                     let nested_prefix = format!("{line_prefix}> ");
-                    encode_markdown_blocks(children, &nested_prefix, output)?;
+                    encode_markdown_blocks(children, &nested_prefix, config, output)?;
                 }
             }
             BlockKind::Grid { table, .. } => {
@@ -812,6 +874,19 @@ fn encode_markdown_blocks(
                 if kind.as_ref() == block_kinds::HORIZONTAL_RULE {
                     output.push_str(line_prefix);
                     output.push_str("---");
+                } else if config.mermaid_fences
+                    && kind.as_ref() == MERMAID_KIND
+                    && let Ok(mermaid) = data.try_as_typed::<MermaidData>()
+                {
+                    output.push_str(line_prefix);
+                    output.push_str("```mermaid\n");
+                    for line in mermaid.source.split('\n') {
+                        output.push_str(line_prefix);
+                        output.push_str(line);
+                        output.push('\n');
+                    }
+                    output.push_str(line_prefix);
+                    output.push_str("```");
                 } else {
                     output.push_str(line_prefix);
                     let payload = serde_json::to_string(data)
@@ -971,7 +1046,11 @@ fn encode_markdown_inline(content: &InlineContent) -> String {
 // Markdown Decoding (GFM)
 // ============================================================================
 
-fn parse_markdown_blocks(lines: &[&str], document: &mut Document) -> Vec<BlockNode> {
+fn parse_markdown_blocks(
+    lines: &[&str],
+    config: MarkdownCodecConfig,
+    document: &mut Document,
+) -> Vec<BlockNode> {
     let mut blocks = Vec::new();
     let mut index = 0usize;
     let mut active_list_id: Option<(bool, ListId)> = None;
@@ -1027,11 +1106,28 @@ fn parse_markdown_blocks(lines: &[&str], document: &mut Document) -> Vec<BlockNo
                 index += 1;
             }
             let id = document.alloc_block_id();
-            blocks.push(BlockNode::new(
-                id,
-                BlockKind::code_block(language, InlineContent::plain(code_lines.join("\n"))),
-                BlockStyle::named(StyleId::CODE_BLOCK),
-            ));
+            let code_body = code_lines.join("\n");
+            if config.mermaid_fences
+                && language
+                    .as_deref()
+                    .is_some_and(|lang| lang.eq_ignore_ascii_case("mermaid"))
+            {
+                blocks.push(BlockNode::new(
+                    id,
+                    BlockKind::leaf::<MermaidSpec>(MermaidData::new(code_body)),
+                    BlockStyle {
+                        space_before_pt: Some(6.0),
+                        space_after_pt: Some(10.0),
+                        ..BlockStyle::default()
+                    },
+                ));
+            } else {
+                blocks.push(BlockNode::new(
+                    id,
+                    BlockKind::code_block(language, InlineContent::plain(code_body)),
+                    BlockStyle::named(StyleId::CODE_BLOCK),
+                ));
+            }
             continue;
         }
 
@@ -1079,7 +1175,7 @@ fn parse_markdown_blocks(lines: &[&str], document: &mut Document) -> Vec<BlockNo
                     break;
                 }
             }
-            let mut children = parse_markdown_blocks(&quote_lines, document);
+            let mut children = parse_markdown_blocks(&quote_lines, config, document);
             if children.is_empty() {
                 let child_id = document.alloc_block_id();
                 children.push(BlockNode::new(

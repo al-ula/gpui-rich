@@ -9,6 +9,7 @@ const _: () = assert!(
 pub mod asset;
 pub mod element;
 pub mod extension;
+pub mod mermaid;
 pub mod shaper;
 pub mod theme;
 pub mod view;
@@ -21,9 +22,10 @@ pub use element::RichDocumentElement;
 pub use extension::{
     BlockRenderContext, BlockRenderer, CustomRenderOutput, DirectPaintCallback, EditCommandContext,
     ExtensionDiagnostic, ExtensionDiagnosticKind, ExtensionNamespace, ExtensionNodeTarget,
-    ExtensionRegistrationError, ExtensionRegistry, InlineRenderContext, InlineRenderer,
-    QueryContext, ReadCommandContext, ReadCommandOutcome,
+    ExtensionPlugin, ExtensionRegistrationError, ExtensionRegistry, InlineRenderContext,
+    InlineRenderer, QueryContext, ReadCommandContext, ReadCommandOutcome,
 };
+pub use mermaid::{MermaidConfig, MermaidExtension};
 pub use shaper::{
     FontResolver, GpuiGlyphBackend, GpuiShaper, clear_font_resolution_cache, resolve_font_family,
     rgba_to_hsla, to_gpui_font,

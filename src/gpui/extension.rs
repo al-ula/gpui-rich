@@ -79,6 +79,7 @@
 //! ```
 
 use crate::gpui::theme::RichTheme;
+use crate::gpui::view::RichDocumentView;
 use crate::layout::{InlineBoxMetrics, Insets, Size, pt_to_px};
 use crate::model::{
     ActiveTableContext, BlockId, BlockShape, BlockShapeKind, BlockSpec, ClipboardCustomFormatter,
@@ -88,7 +89,7 @@ use crate::model::{
     InteractionPolicy, ListId, PLACEHOLDER_KIND, QueryError, ReadOnly, RichCommand, SearchState,
     SharedStr, Transaction, VARIABLE_KIND, block_kinds,
 };
-use gpui_kit::{AnyElement, App, Bounds, Pixels, Window};
+use gpui_kit::{AnyElement, App, Bounds, Context, Pixels, Window};
 use std::any::{Any, TypeId};
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -138,6 +139,7 @@ pub trait BlockRenderer: 'static {
     /// Measures a custom leaf block (`block_shape::Leaf`) inside `max_width` pixels at `zoom`.
     fn measure_leaf(
         &self,
+        _block_id: BlockId,
         _data: &<Self::Spec as BlockSpec>::Data,
         max_width: f32,
         zoom: f32,
@@ -225,6 +227,16 @@ pub trait InlineRenderer: 'static {
     fn html(&self, _data: &<Self::Spec as InlineSpec>::Data) -> Option<String> {
         None
     }
+}
+
+/// Bundle of renderers, commands, and queries installed atomically onto a [`RichDocumentView`].
+pub trait ExtensionPlugin {
+    /// Registers this extension's renderers, commands, and queries on `view`.
+    fn install(
+        self,
+        view: &mut RichDocumentView,
+        cx: &mut Context<RichDocumentView>,
+    ) -> Result<(), ExtensionRegistrationError>;
 }
 
 /// Namespace within [`ExtensionRegistry`].
@@ -329,6 +341,7 @@ pub enum ReadCommandOutcome {
 pub struct ReadCommandContext<'document> {
     document: &'document Document,
     selection: Option<&'document DocumentSelection>,
+    invalidated_blocks: RefCell<Vec<BlockId>>,
 }
 
 impl<'document> ReadCommandContext<'document> {
@@ -339,6 +352,7 @@ impl<'document> ReadCommandContext<'document> {
         Self {
             document,
             selection,
+            invalidated_blocks: RefCell::new(Vec::new()),
         }
     }
 
@@ -350,6 +364,18 @@ impl<'document> ReadCommandContext<'document> {
     /// Borrows the current [`DocumentSelection`], if any.
     pub fn selection(&self) -> Option<&'document DocumentSelection> {
         self.selection
+    }
+
+    /// Marks `block_id` for non-mutating layout re-measurement after this read command completes.
+    pub fn invalidate_block_layout(&self, block_id: BlockId) {
+        let mut blocks = self.invalidated_blocks.borrow_mut();
+        if !blocks.contains(&block_id) {
+            blocks.push(block_id);
+        }
+    }
+
+    pub(crate) fn take_invalidated_blocks(&self) -> Vec<BlockId> {
+        std::mem::take(&mut *self.invalidated_blocks.borrow_mut())
     }
 }
 
@@ -565,6 +591,7 @@ pub(crate) trait ErasedBlockRenderer {
     fn clear_cache(&self);
     fn measure_leaf(
         &self,
+        block_id: BlockId,
         data: &CustomPayload,
         max_width: f32,
         zoom: f32,
@@ -618,6 +645,7 @@ impl<R: BlockRenderer> ErasedBlockRenderer for BlockRendererAdapter<R> {
 
     fn measure_leaf(
         &self,
+        block_id: BlockId,
         data: &CustomPayload,
         max_width: f32,
         zoom: f32,
@@ -627,7 +655,8 @@ impl<R: BlockRenderer> ErasedBlockRenderer for BlockRendererAdapter<R> {
             return BlockCallbackResult::Invalid(detail);
         }
         match self.cache.with_resolved(data, |typed| {
-            self.renderer.measure_leaf(typed, max_width, zoom, window)
+            self.renderer
+                .measure_leaf(block_id, typed, max_width, zoom, window)
         }) {
             Ok(size) => BlockCallbackResult::Ok(size),
             Err(message) => {
@@ -799,7 +828,10 @@ impl<R: InlineRenderer> ErasedInlineRenderer for InlineRendererAdapter<R> {
 }
 
 pub(crate) enum CommandExecutionResult {
-    Read(ReadCommandOutcome),
+    Read {
+        outcome: ReadCommandOutcome,
+        invalidated_blocks: Vec<BlockId>,
+    },
     Edit {
         transaction: Option<Box<Transaction>>,
         next_block_id: u64,
@@ -1158,7 +1190,11 @@ impl ExtensionRegistry {
         match &entry.handler {
             RegisteredCommandHandler::Read(handler) => {
                 let context = ReadCommandContext::new(document, selection);
-                CommandExecutionResult::Read(handler(invocation, &context))
+                let outcome = handler(invocation, &context);
+                CommandExecutionResult::Read {
+                    outcome,
+                    invalidated_blocks: context.take_invalidated_blocks(),
+                }
             }
             RegisteredCommandHandler::Edit(handler) => {
                 let mut context = EditCommandContext::new(document, selection);

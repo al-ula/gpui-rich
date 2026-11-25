@@ -162,6 +162,7 @@ impl BlockRenderer for SameNameBlockRenderer {
 
     fn measure_leaf(
         &self,
+        _block_id: BlockId,
         _data: &SameNameBlockData,
         max_width: f32,
         zoom: f32,
@@ -405,6 +406,7 @@ impl BlockRenderer for CountingLeafRenderer {
 
     fn measure_leaf(
         &self,
+        _block_id: BlockId,
         data: &CountingPayload,
         max_width: f32,
         zoom: f32,
@@ -1075,6 +1077,176 @@ fn verify_large_table_decoration_culling(cx: &mut App) {
     );
 }
 
+fn verify_mermaid_extension_commands_and_policy(cx: &mut App) {
+    use gpui_rich::gpui::MermaidExtension;
+    use gpui_rich::model::{
+        InsertMermaidDiagram, MermaidBackend, MermaidBlockStatusQuery, MermaidRenderError,
+        MermaidSpec, MermaidSvg, MermaidThemePalette, MermaidViewMode, SetMermaidCaption,
+        SetMermaidViewMode, ToggleMermaidViewMode, UpdateMermaidSource,
+    };
+
+    struct StubMermaidBackend;
+
+    impl MermaidBackend for StubMermaidBackend {
+        fn render_svg(
+            &self,
+            source: &str,
+            _palette: &MermaidThemePalette,
+        ) -> Result<MermaidSvg, MermaidRenderError> {
+            if source.trim().is_empty() {
+                return Err(MermaidRenderError::new("empty"));
+            }
+            Ok(MermaidSvg::from_svg_with_fallback(
+                r##"<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 200 100"><rect width="200" height="100" fill="#4f46e5"/></svg>"##,
+                200.0,
+                100.0,
+            ))
+        }
+    }
+
+    let mut document = Document::new();
+    document.add_paragraph(InlineContent::plain("Intro"), BlockStyle::default());
+
+    let view_slot: Rc<RefCell<Option<Entity<RichDocumentView>>>> = Rc::new(RefCell::new(None));
+    let view_capture = Rc::clone(&view_slot);
+    let (window, _) = gpui_kit::open_window(
+        fixed_window_options(640.0, 480.0),
+        cx,
+        move |_window, cx| {
+            let view = cx.new(|cx| {
+                let mut view = RichDocumentView::new(document, cx);
+                view.set_policy(InteractionPolicy::editable(), cx);
+                view.install_mermaid_with(MermaidExtension::with_backend(StubMermaidBackend), cx)
+                    .expect("install mermaid extension");
+                view
+            });
+            *view_capture.borrow_mut() = Some(view.clone());
+            view
+        },
+    )
+    .expect("open mermaid test window");
+    let view = view_slot.borrow().clone().expect("mermaid view");
+
+    // Insert a diagram block via typed Edit command.
+    let block_id = view.update(cx, |view, cx| {
+        assert_eq!(
+            view.dispatch_extension_command(
+                InsertMermaidDiagram::new("flowchart LR\nA-->B").with_caption("Initial"),
+                cx,
+            ),
+            CommandOutcome::Executed
+        );
+        assert_eq!(view.document.blocks.len(), 2);
+        view.document.blocks[1].id
+    });
+
+    draw_window(window, cx);
+
+    // Toggle view mode is ReadOnly and must not mutate document or add undo history.
+    let snapshot_before_toggle = JsonCodec
+        .encode(&view.read(cx).document)
+        .expect("json before toggle")
+        .into_string();
+    let history_can_undo_before = view.read(cx).history.can_undo();
+    view.update(cx, |view, cx| {
+        assert_eq!(
+            view.dispatch_extension_command(ToggleMermaidViewMode { block_id }, cx),
+            CommandOutcome::Executed
+        );
+        let status = view
+            .query_extension(&MermaidBlockStatusQuery { block_id })
+            .expect("mermaid status query")
+            .expect("status present");
+        assert_eq!(status.mode, MermaidViewMode::Source);
+    });
+    assert_eq!(
+        JsonCodec
+            .encode(&view.read(cx).document)
+            .expect("json after toggle")
+            .into_string(),
+        snapshot_before_toggle
+    );
+    assert_eq!(view.read(cx).history.can_undo(), history_can_undo_before);
+
+    draw_window(window, cx);
+
+    // Update source & caption, then verify Undo restores the previous source cleanly.
+    view.update(cx, |view, cx| {
+        assert_eq!(
+            view.dispatch_extension_command(
+                UpdateMermaidSource {
+                    block_id,
+                    source: "flowchart TD\nX-->Y".to_owned(),
+                },
+                cx,
+            ),
+            CommandOutcome::Executed
+        );
+        assert_eq!(
+            view.dispatch_extension_command(
+                SetMermaidCaption {
+                    block_id,
+                    caption: Some("Updated".to_owned()),
+                },
+                cx,
+            ),
+            CommandOutcome::Executed
+        );
+        let updated = view
+            .document
+            .find_block(block_id)
+            .expect("updated block")
+            .kind
+            .read_data::<MermaidSpec>()
+            .expect("mermaid data");
+        assert_eq!(updated.source, "flowchart TD\nX-->Y");
+        assert_eq!(updated.caption.as_deref(), Some("Updated"));
+
+        assert_eq!(
+            view.dispatch_command(RichCommand::Undo, cx),
+            CommandOutcome::Executed
+        );
+        assert_eq!(
+            view.dispatch_command(RichCommand::Undo, cx),
+            CommandOutcome::Executed
+        );
+        let restored = view
+            .document
+            .find_block(block_id)
+            .expect("restored block")
+            .kind
+            .read_data::<MermaidSpec>()
+            .expect("restored mermaid data");
+        assert_eq!(restored.source, "flowchart LR\nA-->B");
+        assert_eq!(restored.caption.as_deref(), Some("Initial"));
+    });
+
+    // Viewer policy blocks UpdateMermaidSource while permitting SetMermaidViewMode.
+    view.update(cx, |view, cx| {
+        view.set_policy(InteractionPolicy::viewer(), cx);
+        assert_eq!(
+            view.dispatch_extension_command(
+                UpdateMermaidSource {
+                    block_id,
+                    source: "flowchart TD\nBlocked".to_owned(),
+                },
+                cx,
+            ),
+            CommandOutcome::RejectedReadOnly
+        );
+        assert_eq!(
+            view.dispatch_extension_command(
+                SetMermaidViewMode {
+                    block_id,
+                    mode: MermaidViewMode::Diagram,
+                },
+                cx,
+            ),
+            CommandOutcome::Executed
+        );
+    });
+}
+
 #[test]
 fn gpui_extension_type_safety_end_to_end() {
     let app = gpui_kit::platform::headless();
@@ -1090,6 +1262,7 @@ fn gpui_extension_type_safety_end_to_end() {
             verify_two_views_badge_policy_middleware_and_clipboard(cx);
             verify_payload_cache_unknown_fields_and_diagnostics(cx);
             verify_large_table_decoration_culling(cx);
+            verify_mermaid_extension_commands_and_policy(cx);
         }));
         if let Err(payload) = sync_result {
             let message = payload
