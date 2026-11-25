@@ -3030,6 +3030,31 @@ impl History {
         self.coalescing_broken = false;
     }
 
+    /// Merges the top two undo entries into a single atomic entry so sequential compound actions
+    /// (such as deleting a slash trigger and applying a block command) undo in one step.
+    pub fn merge_last_two_into_atomic(&mut self) -> bool {
+        if self.undo_stack.len() < 2 {
+            return false;
+        }
+        let Some(newer) = self.undo_stack.pop() else {
+            return false;
+        };
+        let Some(older) = self.undo_stack.last_mut() else {
+            self.undo_stack.push(newer);
+            return false;
+        };
+        let mut combined_steps = newer.inverse.steps;
+        combined_steps.append(&mut older.inverse.steps);
+        older.inverse.steps = combined_steps;
+        if newer.inverse.selection_before.is_some() {
+            older.inverse.selection_before = newer.inverse.selection_before;
+        }
+        older.group = HistoryMergeGroup::Atomic;
+        older.timestamp = newer.timestamp;
+        self.coalescing_broken = true;
+        true
+    }
+
     pub fn undo(&mut self, doc: &mut Document) -> Option<(ChangeSet, Option<DocumentSelection>)> {
         let entry = self.undo_stack.pop()?;
         self.coalescing_broken = true;

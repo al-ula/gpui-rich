@@ -1,13 +1,17 @@
 //! Demo GPUI application showcasing the non-paginated `gpui-rich` renderer.
 
 use gpui_kit::{
-    App, AppContext, ClipboardItem, Context, Entity, ImageFormat, InteractiveElement, IntoElement,
-    MouseButton, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled,
-    Subscription, Window, div, px, rgb,
+    App, AppContext, BoxShadow, ClipboardItem, Context, Entity, FontWeight as GpuiFontWeight,
+    ImageFormat, InteractiveElement, IntoElement, MouseButton, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Subscription, WeakEntity, Window, div, point, px, rgb,
 };
 use gpui_rich::gpui::{
-    BlockRenderContext, BlockRenderer, CustomRenderOutput, InlineRenderContext, InlineRenderer,
-    MemoryAssetProvider, RichDocumentEvent, RichDocumentView, RichTheme, ToolbarState, ViewState,
+    BlockRenderContext, BlockRenderer, CompletionAccept, CompletionAcceptKeys,
+    CompletionBlockScope, CompletionDetail, CompletionItem, CompletionProvider,
+    CompletionQueryContext, CompletionQueryResult, CompletionTrigger, CustomRenderOutput,
+    InlineRenderContext, InlineRenderer, MemoryAssetProvider, OverlayAnchor, OverlayDismissPolicy,
+    OverlayId, OverlayPlacement, OverlaySpec, OverlayZLayer, RichDocumentEvent, RichDocumentView,
+    RichTheme, ToolbarState, ViewState, fuzzy_match_label, inline_preview_suffix,
 };
 use gpui_rich::layout::{InlineBoxMetrics, Insets, pt_to_px};
 use gpui_rich::model::{
@@ -343,6 +347,468 @@ pub struct DocsViewerApp {
     status_message: SharedString,
 }
 
+struct DocsSlashCompletionProvider {
+    triggers: [CompletionTrigger; 2],
+}
+
+impl DocsSlashCompletionProvider {
+    fn new() -> Self {
+        Self {
+            triggers: [CompletionTrigger::prefix("/"), CompletionTrigger::Manual],
+        }
+    }
+}
+
+impl CompletionProvider for DocsSlashCompletionProvider {
+    fn id(&self) -> &'static str {
+        "docs_viewer.slash"
+    }
+
+    fn triggers(&self) -> &[CompletionTrigger] {
+        &self.triggers
+    }
+
+    fn block_scope(&self) -> CompletionBlockScope {
+        CompletionBlockScope::ProseOnly
+    }
+
+    fn priority(&self) -> i32 {
+        10
+    }
+
+    fn header_title(&self) -> Option<&str> {
+        Some("Slash Commands")
+    }
+
+    fn query(
+        &self,
+        context: &CompletionQueryContext<'_>,
+        _view: WeakEntity<RichDocumentView>,
+        _cx: &mut App,
+    ) -> CompletionQueryResult {
+        struct SlashEntry {
+            id: &'static str,
+            label: &'static str,
+            subtitle: &'static str,
+            badge: &'static str,
+            command: RichCommand,
+            detail: Option<CompletionDetail>,
+        }
+
+        let entries = [
+            SlashEntry {
+                id: "heading-1",
+                label: "Heading 1",
+                subtitle: "Large section title",
+                badge: "H1",
+                command: RichCommand::SetHeading(Some(1)),
+                detail: None,
+            },
+            SlashEntry {
+                id: "heading-2",
+                label: "Heading 2",
+                subtitle: "Subsection heading",
+                badge: "H2",
+                command: RichCommand::SetHeading(Some(2)),
+                detail: None,
+            },
+            SlashEntry {
+                id: "heading-3",
+                label: "Heading 3",
+                subtitle: "Minor section heading",
+                badge: "H3",
+                command: RichCommand::SetHeading(Some(3)),
+                detail: None,
+            },
+            SlashEntry {
+                id: "bullet-list",
+                label: "Bullet List",
+                subtitle: "Start an unordered bullet list",
+                badge: "list",
+                command: RichCommand::ToggleList(ListKind::Bullet),
+                detail: None,
+            },
+            SlashEntry {
+                id: "checklist",
+                label: "Checklist",
+                subtitle: "Interactive task list with checkboxes",
+                badge: "todo",
+                command: RichCommand::ToggleList(ListKind::Checklist),
+                detail: None,
+            },
+            SlashEntry {
+                id: "blockquote",
+                label: "Blockquote",
+                subtitle: "Indented callout quotation",
+                badge: "quote",
+                command: RichCommand::ToggleBlockquote,
+                detail: None,
+            },
+            SlashEntry {
+                id: "code-block",
+                label: "Code Block",
+                subtitle: "Monospace block with syntax highlighting",
+                badge: "```",
+                command: RichCommand::ToggleCodeBlock,
+                detail: Some(
+                    CompletionDetail::new(
+                        "Code Block",
+                        "Creates a syntax-highlighted monospace block with built-in copy support.",
+                    )
+                    .with_preview("fn main() {\n    println!(\"hello\");\n}"),
+                ),
+            },
+            SlashEntry {
+                id: "table",
+                label: "Table (3×3)",
+                subtitle: "Insert a 3-column table with header row",
+                badge: "table",
+                command: RichCommand::InsertTable {
+                    rows: 3,
+                    columns: 3,
+                    with_header: true,
+                },
+                detail: Some(
+                    CompletionDetail::new(
+                        "Structured Table",
+                        "Inserts a resizable 3×3 grid table with a styled header row.",
+                    )
+                    .with_preview("| Column 1 | Column 2 | Column 3 |"),
+                ),
+            },
+        ];
+
+        let mut items = Vec::new();
+        for entry in entries {
+            if let Some((score, indices)) = fuzzy_match_label(context.query, entry.label) {
+                let mut item = CompletionItem::new(
+                    entry.id,
+                    entry.label,
+                    CompletionAccept::command(entry.command),
+                )
+                .with_subtitle(entry.subtitle)
+                .with_badge(entry.badge)
+                .with_match(score, indices);
+                if let Some(detail) = entry.detail {
+                    item = item.with_detail(detail);
+                }
+                items.push(item);
+            }
+        }
+        CompletionQueryResult::Ready(items)
+    }
+}
+
+struct DocsMentionCompletionProvider {
+    triggers: [CompletionTrigger; 1],
+}
+
+impl DocsMentionCompletionProvider {
+    fn new() -> Self {
+        Self {
+            triggers: [CompletionTrigger::prefix_with_spaces("@")],
+        }
+    }
+}
+
+impl CompletionProvider for DocsMentionCompletionProvider {
+    fn id(&self) -> &'static str {
+        "docs_viewer.mentions"
+    }
+
+    fn triggers(&self) -> &[CompletionTrigger] {
+        &self.triggers
+    }
+
+    fn block_scope(&self) -> CompletionBlockScope {
+        CompletionBlockScope::ProseOnly
+    }
+
+    fn header_title(&self) -> Option<&str> {
+        Some("People & Chips")
+    }
+
+    fn query(
+        &self,
+        context: &CompletionQueryContext<'_>,
+        view: WeakEntity<RichDocumentView>,
+        cx: &mut App,
+    ) -> CompletionQueryResult {
+        let local_people = [
+            ("alex", "Alex Rivera", "Core Layout · Recent", "local"),
+            ("sam", "Sam Patel", "Renderer · Recent", "local"),
+        ];
+        let mut initial = Vec::new();
+        for (id, name, subtitle, badge) in local_people {
+            if let Some((score, indices)) = fuzzy_match_label(context.query, name) {
+                initial.push(
+                    CompletionItem::new(
+                        id,
+                        name,
+                        CompletionAccept::replace_inline_object(InlineObject::SmartChip {
+                            kind: ChipKind::Person,
+                            label: name.to_owned(),
+                            accent: None,
+                        }),
+                    )
+                    .with_subtitle(subtitle)
+                    .with_badge(badge)
+                    .with_match(score, indices),
+                );
+            }
+        }
+
+        let query_owned = context.query.to_owned();
+        let session_id = context.session_id;
+        let query_revision = context.query_revision;
+        let provider_id = self.id();
+        let mut remote_items = initial.clone();
+
+        cx.spawn(async move |cx| {
+            cx.background_executor()
+                .timer(std::time::Duration::from_millis(90))
+                .await;
+            let directory = [
+                (
+                    "alice",
+                    "Alice Chen",
+                    "Design Systems · alice@acme.dev",
+                    "dir",
+                ),
+                (
+                    "diego",
+                    "Diego Morales",
+                    "Text Shaping · diego@acme.dev",
+                    "dir",
+                ),
+                ("mina", "Mina Park", "Product · mina@acme.dev", "dir"),
+            ];
+            for (id, name, subtitle, badge) in directory {
+                if let Some((score, indices)) = fuzzy_match_label(&query_owned, name) {
+                    remote_items.push(
+                        CompletionItem::new(
+                            id,
+                            name,
+                            CompletionAccept::replace_inline_object(InlineObject::SmartChip {
+                                kind: ChipKind::Person,
+                                label: name.to_owned(),
+                                accent: None,
+                            }),
+                        )
+                        .with_subtitle(subtitle)
+                        .with_badge(badge)
+                        .with_match(score + 4, indices),
+                    );
+                }
+            }
+            if view
+                .update(cx, |document_view, cx| {
+                    document_view.update_completion_items(
+                        session_id,
+                        query_revision,
+                        provider_id,
+                        remote_items,
+                        true,
+                        cx,
+                    );
+                })
+                .is_err()
+            {
+                // View was dropped before the simulated directory lookup completed.
+            }
+        })
+        .detach();
+
+        CompletionQueryResult::Pending { initial }
+    }
+}
+
+struct RustCodeCompletionProvider {
+    triggers: [CompletionTrigger; 2],
+}
+
+impl RustCodeCompletionProvider {
+    fn new() -> Self {
+        Self {
+            triggers: [CompletionTrigger::word_prefix(2), CompletionTrigger::Manual],
+        }
+    }
+}
+
+impl CompletionProvider for RustCodeCompletionProvider {
+    fn id(&self) -> &'static str {
+        "docs_viewer.rust_symbols"
+    }
+
+    fn triggers(&self) -> &[CompletionTrigger] {
+        &self.triggers
+    }
+
+    fn block_scope(&self) -> CompletionBlockScope {
+        CompletionBlockScope::CodeBlocks {
+            language: Some("rust".into()),
+        }
+    }
+
+    fn accept_keys(&self) -> CompletionAcceptKeys {
+        CompletionAcceptKeys::TabOrSelectedEnter
+    }
+
+    fn header_title(&self) -> Option<&str> {
+        Some("Rust Symbols")
+    }
+
+    fn query(
+        &self,
+        context: &CompletionQueryContext<'_>,
+        _view: WeakEntity<RichDocumentView>,
+        _cx: &mut App,
+    ) -> CompletionQueryResult {
+        let symbols: [(&str, &str, &str, Option<&str>); 8] = [
+            ("return", "keyword", "kw", None),
+            (
+                "retain",
+                "fn(&mut self, f: F)",
+                "method",
+                Some("Retains only the elements specified by the predicate."),
+            ),
+            (
+                "Result",
+                "enum Result<T, E>",
+                "type",
+                Some("Type used for returning and propagating recoverable errors."),
+            ),
+            (
+                "Option",
+                "enum Option<T>",
+                "type",
+                Some("Represents an optional value: Some(T) or None."),
+            ),
+            ("struct", "keyword", "kw", None),
+            ("impl", "keyword", "kw", None),
+            ("match", "keyword", "kw", None),
+            ("pub fn", "snippet", "snip", None),
+        ];
+
+        let mut items = Vec::new();
+        for (label, subtitle, badge, docs) in symbols {
+            if let Some((score, indices)) = fuzzy_match_label(context.query, label) {
+                let mut item =
+                    CompletionItem::new(label, label, CompletionAccept::replace_text(label))
+                        .with_subtitle(subtitle)
+                        .with_badge(badge)
+                        .with_match(score, indices);
+                if let Some(preview) = inline_preview_suffix(context.query, label) {
+                    item = item.with_inline_preview(preview);
+                }
+                if let Some(description) = docs {
+                    item = item.with_detail(
+                        CompletionDetail::new(label, description).with_preview(subtitle),
+                    );
+                }
+                items.push(item);
+            }
+        }
+        CompletionQueryResult::Ready(items)
+    }
+}
+
+const SELECTION_BUBBLE_OVERLAY_ID: &str = "docs_viewer.selection_bubble";
+
+fn sync_selection_bubble_overlay(view: &mut RichDocumentView, cx: &mut Context<RichDocumentView>) {
+    let overlay_id = OverlayId::new(SELECTION_BUBBLE_OVERLAY_ID);
+    let show = view.policy().editing.enabled
+        && matches!(
+            &view.selection,
+            Some(gpui_rich::model::DocumentSelection::Text { anchor, focus, .. }) if anchor != focus
+        );
+    if !show {
+        view.remove_overlay(&overlay_id, cx);
+        return;
+    }
+
+    let spec = OverlaySpec::new(
+        overlay_id,
+        OverlayAnchor::Selection,
+        |context, _window, _cx| {
+            let theme = context.theme;
+            let build_btn = |id: &'static str, label: &'static str, cmd: RichCommand| {
+                let view = context.view.clone();
+                div()
+                    .id(id)
+                    .px(px(7.0))
+                    .py(px(3.0))
+                    .rounded(px(5.0))
+                    .text_size(px(11.5))
+                    .font_weight(GpuiFontWeight::SEMIBOLD)
+                    .text_color(theme.text)
+                    .cursor_pointer()
+                    .hover(|style| style.bg(theme.code_background))
+                    .on_mouse_down(MouseButton::Left, move |_, _window, cx| {
+                        cx.stop_propagation();
+                        let command = cmd.clone();
+                        view.update(cx, |this, cx| {
+                            this.dispatch_command(command, cx);
+                        });
+                    })
+                    .child(label)
+            };
+
+            div()
+                .px(px(5.0))
+                .py(px(4.0))
+                .rounded(px(8.0))
+                .bg(theme.surface_background)
+                .border_1()
+                .border_color(theme.paper_border)
+                .shadow(vec![BoxShadow {
+                    color: theme.paper_shadow,
+                    offset: point(px(0.0), px(4.0)),
+                    blur_radius: px(12.0),
+                    spread_radius: px(0.0),
+                    inset: false,
+                }])
+                .flex()
+                .items_center()
+                .gap(px(2.0))
+                .child(build_btn(
+                    "bubble-bold",
+                    "B",
+                    RichCommand::ToggleMark(MarkKind::Bold),
+                ))
+                .child(build_btn(
+                    "bubble-italic",
+                    "I",
+                    RichCommand::ToggleMark(MarkKind::Italic),
+                ))
+                .child(build_btn(
+                    "bubble-underline",
+                    "U",
+                    RichCommand::ToggleMark(MarkKind::Underline),
+                ))
+                .child(build_btn(
+                    "bubble-code",
+                    "</>",
+                    RichCommand::ToggleMark(MarkKind::InlineCode),
+                ))
+                .child(build_btn(
+                    "bubble-highlight",
+                    "Highlight",
+                    RichCommand::SetInlineStyle(InlineStyle {
+                        background: Some(RgbaColor::rgb(254, 240, 138)),
+                        ..InlineStyle::default()
+                    }),
+                ))
+                .into_any_element()
+        },
+    )
+    .with_placement(OverlayPlacement::above_center())
+    .with_z_layer(OverlayZLayer::Interactive)
+    .with_dismiss_policy(OverlayDismissPolicy::selection_toolbar());
+
+    view.set_overlay(spec, cx);
+}
+
 impl DocsViewerApp {
     pub fn new(cx: &mut Context<Self>) -> Self {
         let assets = MemoryAssetProvider::new();
@@ -361,11 +827,28 @@ impl DocsViewerApp {
             if let Err(error) = view.install_mermaid(cx) {
                 eprintln!("docs_viewer: failed to install mermaid extension: {error}");
             }
+            if let Err(error) = view.install_emoji(cx) {
+                eprintln!("docs_viewer: failed to install emoji extension: {error}");
+            }
+            if let Err(error) =
+                view.register_completion_provider(DocsSlashCompletionProvider::new())
+            {
+                eprintln!("docs_viewer: failed to register slash completions: {error}");
+            }
+            if let Err(error) =
+                view.register_completion_provider(DocsMentionCompletionProvider::new())
+            {
+                eprintln!("docs_viewer: failed to register mention completions: {error}");
+            }
+            if let Err(error) = view.register_completion_provider(RustCodeCompletionProvider::new())
+            {
+                eprintln!("docs_viewer: failed to register rust completions: {error}");
+            }
             view
         });
         let event_subscription = cx.subscribe(
             &document_view,
-            |this, _view, event: &RichDocumentEvent, cx| match event {
+            |this, view, event: &RichDocumentEvent, cx| match event {
                 RichDocumentEvent::LinkActivated { href } => {
                     this.status_message = format!("Link: {href}").into();
                     cx.notify();
@@ -384,6 +867,9 @@ impl DocsViewerApp {
                     cx.notify();
                 }
                 RichDocumentEvent::SelectionChanged { .. } => {
+                    view.update(cx, |document_view, cx| {
+                        sync_selection_bubble_overlay(document_view, cx);
+                    });
                     cx.notify();
                 }
                 RichDocumentEvent::CommandExecuted { .. } => {}
@@ -715,6 +1201,7 @@ impl Render for DocsViewerApp {
                         this.status_message = SharedString::from("Viewer");
                         this.document_view.update(cx, |view, cx| {
                             view.set_policy(InteractionPolicy::viewer(), cx);
+                            sync_selection_bubble_overlay(view, cx);
                         });
                     }),
                 ),
@@ -732,6 +1219,7 @@ impl Render for DocsViewerApp {
                         this.status_message = SharedString::from("Editable");
                         this.document_view.update(cx, |view, cx| {
                             view.set_policy(InteractionPolicy::editable(), cx);
+                            sync_selection_bubble_overlay(view, cx);
                         });
                     }),
                 ),
@@ -749,6 +1237,7 @@ impl Render for DocsViewerApp {
                         this.status_message = SharedString::from("Static Preview");
                         this.document_view.update(cx, |view, cx| {
                             view.set_policy(InteractionPolicy::static_preview(), cx);
+                            sync_selection_bubble_overlay(view, cx);
                         });
                     }),
                 ),

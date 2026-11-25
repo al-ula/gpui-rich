@@ -18,6 +18,7 @@ impl RichDocumentView {
         } else {
             (raw_x, raw_y)
         };
+        self.dismiss_overlays_where(|spec| spec.dismiss.on_scroll, cx);
         self.dispatch_command(RichCommand::ScrollBy { delta_x, delta_y }, cx);
     }
 
@@ -28,6 +29,7 @@ impl RichDocumentView {
         cx: &mut Context<Self>,
     ) {
         window.focus(&self.focus_handle, cx);
+        self.dismiss_overlays_where(|spec| spec.dismiss.on_outside_click, cx);
         self.ime_preedit = None;
         self.history.break_coalescing();
         let canvas_point = self.window_point_to_canvas(event.position);

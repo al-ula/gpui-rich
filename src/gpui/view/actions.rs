@@ -81,6 +81,7 @@ actions!(
         DeleteTableColumn,
         MergeTableCells,
         SplitTableCell,
+        TriggerCompletion,
     ]
 );
 
@@ -89,6 +90,7 @@ pub fn register_default_keybindings(cx: &mut App) {
     let context = Some(RICH_DOCUMENT_KEY_CONTEXT);
     let mut bindings = vec![
         KeyBinding::new("escape", ClearSelection, context),
+        KeyBinding::new("ctrl-space", TriggerCompletion, context),
         KeyBinding::new("left", MoveLeft, context),
         KeyBinding::new("right", MoveRight, context),
         KeyBinding::new("up", MoveUp, context),

@@ -2,11 +2,15 @@
 //! policy gating, theming, host events, keyboard navigation, IME input, and core editing.
 
 use crate::gpui::asset::{AssetProvider, LoadedAsset, decode_bundled_image, decode_image_asset};
+use crate::gpui::completion::CompletionManager;
 use crate::gpui::element::RichDocumentElement;
 use crate::gpui::extension::{
     BlockRenderer, CommandExecutionResult, EditCommandContext, ExtensionDiagnostic,
     ExtensionPlugin, ExtensionRegistrationError, ExtensionRegistry, InlineRenderer, QueryContext,
     ReadCommandContext, ReadCommandOutcome,
+};
+use crate::gpui::overlay::{
+    OverlayId, OverlayKeyAction, OverlayKeyResult, OverlayRegistry, OverlaySpec,
 };
 use crate::gpui::shaper::{FontResolver, GpuiGlyphBackend, GpuiShaper};
 use crate::gpui::theme::RichTheme;
@@ -98,6 +102,8 @@ pub struct RichDocumentView {
     pub(crate) image_resize_drag: Option<ImageResizeDrag>,
     pub(crate) hovered_image_handle: Option<ImageResizeCorner>,
     pub(crate) active_chip_popover: Option<ActiveSmartChipPopover>,
+    pub(crate) overlays: OverlayRegistry,
+    pub(crate) completion: CompletionManager,
     pub(crate) hovered_column_divider: Option<TableColumnDividerHit>,
     pub(crate) table_column_drag: Option<TableColumnDrag>,
     asset_provider: Option<Arc<dyn AssetProvider>>,
@@ -158,6 +164,8 @@ impl RichDocumentView {
             image_resize_drag: None,
             hovered_image_handle: None,
             active_chip_popover: None,
+            overlays: OverlayRegistry::default(),
+            completion: CompletionManager::default(),
             hovered_column_divider: None,
             table_column_drag: None,
             asset_provider: None,
@@ -293,6 +301,68 @@ impl RichDocumentView {
     pub fn dismiss_chip_popover(&mut self, cx: &mut Context<Self>) {
         if self.active_chip_popover.take().is_some() {
             cx.notify();
+        }
+    }
+
+    /// Registers or replaces an anchored Layer A overlay identified by [`OverlaySpec::id`].
+    pub fn set_overlay(&mut self, spec: OverlaySpec, cx: &mut Context<Self>) {
+        self.overlays.set(spec);
+        cx.notify();
+    }
+
+    /// Removes the anchored Layer A overlay matching `id`, returning true when one was active.
+    pub fn remove_overlay(&mut self, id: &OverlayId, cx: &mut Context<Self>) -> bool {
+        if self.overlays.remove(id) {
+            cx.notify();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Returns true when an anchored Layer A overlay with `id` is currently registered.
+    pub fn has_overlay(&self, id: &OverlayId) -> bool {
+        self.overlays.contains(id)
+    }
+
+    /// Removes all registered Layer A overlays.
+    pub fn clear_overlays(&mut self, cx: &mut Context<Self>) {
+        let had_completion = self.completion.active_session.take().is_some();
+        if self.overlays.clear() || had_completion {
+            cx.notify();
+        }
+    }
+
+    pub(crate) fn dismiss_overlays_where(
+        &mut self,
+        mut should_dismiss: impl FnMut(&OverlaySpec) -> bool,
+        cx: &mut Context<Self>,
+    ) {
+        if self.overlays.retain(|spec| !should_dismiss(spec)) {
+            if !self.overlays.contains(&OverlayId::new(
+                crate::gpui::overlay::COMPLETION_MENU_OVERLAY_ID,
+            )) {
+                self.completion.active_session = None;
+            }
+            cx.notify();
+        }
+    }
+
+    fn route_overlay_key(
+        &mut self,
+        action: OverlayKeyAction,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> OverlayKeyResult {
+        if self.ime_preedit.is_some() {
+            return OverlayKeyResult::PassThrough;
+        }
+        let Some(handler) = self.overlays.top_key_handler() else {
+            return OverlayKeyResult::PassThrough;
+        };
+        match handler.try_borrow_mut() {
+            Ok(mut callback) => (callback)(action, self, window, cx),
+            Err(_) => OverlayKeyResult::PassThrough,
         }
     }
 
@@ -433,6 +503,8 @@ impl RichDocumentView {
         self.selected_image = None;
         self.image_resize_drag = None;
         self.active_chip_popover = None;
+        self.overlays.clear();
+        self.completion.active_session = None;
         self.table_column_drag = None;
         self.update_selection(None, cx);
         self.resync_layout_with_anchor(None);
@@ -675,6 +747,19 @@ impl RichDocumentView {
         self.policy = policy;
         if !policy.editing.enabled {
             self.ime_preedit = None;
+            if self
+                .completion
+                .active_session
+                .as_ref()
+                .is_some_and(|session| {
+                    session
+                        .merged_items
+                        .iter()
+                        .all(|entry| entry.item.accept.requires_editing())
+                })
+            {
+                self.dismiss_completion(cx);
+            }
         }
         if !policy.can_apply_input_rules() {
             self.pending_input_rule_undo = None;
@@ -760,6 +845,7 @@ impl RichDocumentView {
             self.ime_preedit = None;
             self.last_ime_anchor = None;
             self.stop_caret_blink();
+            self.dismiss_overlays_where(|spec| spec.dismiss.on_blur, cx);
         }
     }
 
@@ -1000,7 +1086,12 @@ impl Render for RichDocumentView {
             .on_action(cx.listener(|this, _: &SelectAll, _window, cx| {
                 this.dispatch_command(RichCommand::SelectAll, cx);
             }))
-            .on_action(cx.listener(|this, _: &ClearSelection, _window, cx| {
+            .on_action(cx.listener(|this, _: &ClearSelection, window, cx| {
+                if this.route_overlay_key(OverlayKeyAction::Escape, window, cx)
+                    == OverlayKeyResult::Handled
+                {
+                    return;
+                }
                 this.dispatch_command(RichCommand::ClearSelection, cx);
             }))
             .on_action(cx.listener(|this, _: &ZoomIn, _window, cx| {
@@ -1021,7 +1112,12 @@ impl Render for RichDocumentView {
             .on_action(cx.listener(|this, _: &Redo, _window, cx| {
                 this.dispatch_command(RichCommand::Redo, cx);
             }))
-            .on_action(cx.listener(|this, _: &MoveLeft, _window, cx| {
+            .on_action(cx.listener(|this, _: &MoveLeft, window, cx| {
+                if this.route_overlay_key(OverlayKeyAction::Left, window, cx)
+                    == OverlayKeyResult::Handled
+                {
+                    return;
+                }
                 this.dispatch_command(
                     RichCommand::MoveCaret {
                         direction: MoveDirection::Backward,
@@ -1031,7 +1127,12 @@ impl Render for RichDocumentView {
                     cx,
                 );
             }))
-            .on_action(cx.listener(|this, _: &MoveRight, _window, cx| {
+            .on_action(cx.listener(|this, _: &MoveRight, window, cx| {
+                if this.route_overlay_key(OverlayKeyAction::Right, window, cx)
+                    == OverlayKeyResult::Handled
+                {
+                    return;
+                }
                 this.dispatch_command(
                     RichCommand::MoveCaret {
                         direction: MoveDirection::Forward,
@@ -1041,7 +1142,12 @@ impl Render for RichDocumentView {
                     cx,
                 );
             }))
-            .on_action(cx.listener(|this, _: &MoveUp, _window, cx| {
+            .on_action(cx.listener(|this, _: &MoveUp, window, cx| {
+                if this.route_overlay_key(OverlayKeyAction::Up, window, cx)
+                    == OverlayKeyResult::Handled
+                {
+                    return;
+                }
                 this.dispatch_command(
                     RichCommand::MoveCaret {
                         direction: MoveDirection::Up,
@@ -1051,7 +1157,12 @@ impl Render for RichDocumentView {
                     cx,
                 );
             }))
-            .on_action(cx.listener(|this, _: &MoveDown, _window, cx| {
+            .on_action(cx.listener(|this, _: &MoveDown, window, cx| {
+                if this.route_overlay_key(OverlayKeyAction::Down, window, cx)
+                    == OverlayKeyResult::Handled
+                {
+                    return;
+                }
                 this.dispatch_command(
                     RichCommand::MoveCaret {
                         direction: MoveDirection::Down,
@@ -1257,7 +1368,12 @@ impl Render for RichDocumentView {
                     cx,
                 );
             }))
-            .on_action(cx.listener(|this, _: &Enter, _window, cx| {
+            .on_action(cx.listener(|this, _: &Enter, window, cx| {
+                if this.route_overlay_key(OverlayKeyAction::Enter, window, cx)
+                    == OverlayKeyResult::Handled
+                {
+                    return;
+                }
                 this.dispatch_command(RichCommand::SplitBlock, cx);
             }))
             .on_action(cx.listener(|this, _: &ExitBlock, _window, cx| {
@@ -1266,10 +1382,20 @@ impl Render for RichDocumentView {
             .on_action(cx.listener(|this, _: &SoftBreak, _window, cx| {
                 this.dispatch_command(RichCommand::InsertSoftBreak, cx);
             }))
-            .on_action(cx.listener(|this, _: &Indent, _window, cx| {
+            .on_action(cx.listener(|this, _: &Indent, window, cx| {
+                if this.route_overlay_key(OverlayKeyAction::Tab, window, cx)
+                    == OverlayKeyResult::Handled
+                {
+                    return;
+                }
                 this.dispatch_command(RichCommand::Indent, cx);
             }))
-            .on_action(cx.listener(|this, _: &Outdent, _window, cx| {
+            .on_action(cx.listener(|this, _: &Outdent, window, cx| {
+                if this.route_overlay_key(OverlayKeyAction::ShiftTab, window, cx)
+                    == OverlayKeyResult::Handled
+                {
+                    return;
+                }
                 this.dispatch_command(RichCommand::Outdent, cx);
             }))
             .on_action(cx.listener(|this, _: &ToggleBold, _window, cx| {
@@ -1375,6 +1501,23 @@ impl Render for RichDocumentView {
             .on_action(cx.listener(|this, _: &SplitTableCell, _window, cx| {
                 this.dispatch_command(RichCommand::SplitTableCell, cx);
             }))
+            .on_action(cx.listener(|this, _: &TriggerCompletion, _window, cx| {
+                this.trigger_completion(cx);
+            }))
+            .on_key_down(
+                cx.listener(|this, event: &gpui_kit::KeyDownEvent, window, cx| {
+                    let action = match event.keystroke.key.as_str() {
+                        "pageup" => Some(OverlayKeyAction::PageUp),
+                        "pagedown" => Some(OverlayKeyAction::PageDown),
+                        _ => None,
+                    };
+                    if let Some(action) = action
+                        && this.route_overlay_key(action, window, cx) == OverlayKeyResult::Handled
+                    {
+                        cx.stop_propagation();
+                    }
+                }),
+            )
             .on_scroll(cx.listener(Self::handle_scroll_wheel))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::handle_mouse_down))
             .on_mouse_move(cx.listener(Self::handle_mouse_move))

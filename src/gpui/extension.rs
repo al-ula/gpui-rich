@@ -246,6 +246,7 @@ pub enum ExtensionNamespace {
     Inline,
     Command,
     Query,
+    Completion,
 }
 
 impl fmt::Display for ExtensionNamespace {
@@ -255,6 +256,7 @@ impl fmt::Display for ExtensionNamespace {
             Self::Inline => formatter.write_str("inline"),
             Self::Command => formatter.write_str("command"),
             Self::Query => formatter.write_str("query"),
+            Self::Completion => formatter.write_str("completion"),
         }
     }
 }

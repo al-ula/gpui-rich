@@ -6,6 +6,10 @@ use crate::gpui::extension::{
     ErasedBlockRenderer, ErasedInlineRenderContext, ErasedInlineRenderer, ExtensionDiagnostic,
     ExtensionNodeTarget, ExtensionRegistry, InlineCallbackResult,
 };
+use crate::gpui::overlay::{
+    OverlayAnchor, OverlayId, OverlayOffscreenBehavior, OverlayPlacement, OverlayRenderContext,
+    OverlayRenderFn, OverlayZLayer, is_anchor_visible_in_viewport, resolve_overlay_origin,
+};
 use crate::gpui::shaper::{GpuiGlyphBackend, GpuiShaper, rgba_to_hsla};
 use crate::gpui::theme::RichTheme;
 use crate::gpui::view::{
@@ -126,6 +130,14 @@ struct ColumnDividerGuide {
     dragging: bool,
 }
 
+struct PendingAnchoredOverlay {
+    id: OverlayId,
+    z_layer: OverlayZLayer,
+    anchor_rect: Rect,
+    placement: OverlayPlacement,
+    render: OverlayRenderFn,
+}
+
 struct BlockChromeControls {
     heading_chevrons: bool,
     code_copy: bool,
@@ -142,7 +154,6 @@ pub struct RichPrepaintState {
     image_assets: HashMap<ImageAssetId, LoadedAsset>,
     selected_image_overlay: Option<SelectedImageOverlay>,
     column_divider_guide: Option<ColumnDividerGuide>,
-    popover_element: Option<AnyElement>,
     handled_custom_blocks: HashSet<BlockId>,
     handled_custom_inlines: HashSet<(BlockId, InlineObjectId)>,
     chrome_custom_nodes: HashMap<BlockId, PrepaintedCustomChrome>,
@@ -212,6 +223,7 @@ impl Element for RichDocumentElement {
             selected_image_overlay,
             column_divider_guide,
             pending_chip_popover,
+            pending_overlays,
             pending_custom_blocks,
             pending_custom_inlines,
             caret_rect,
@@ -397,6 +409,36 @@ impl Element for RichDocumentElement {
                 }
             }
 
+            if let Some((preview_block_id, preview_offset, preview_affinity, preview_text)) =
+                view.active_completion_inline_preview()
+                && let Some(preview_pos) = view
+                    .document
+                    .doc_pos_for_block(preview_block_id, preview_offset)
+                && let Some(anchor_rect) =
+                    view.flow
+                        .caret_rect_in_visible(&preview_pos, preview_affinity, &visible)
+            {
+                let block_font_pt = view
+                    .document
+                    .find_block(preview_block_id)
+                    .map(|block| {
+                        block
+                            .style
+                            .resolved_base_text(
+                                &view.document.stylesheet,
+                                &view.document.config.default_style,
+                            )
+                            .font_size_pt
+                    })
+                    .unwrap_or(view.document.config.default_style.font_size_pt);
+                decoration_overlays.push(PrepaintDecorationOverlay::GhostText {
+                    anchor_rect,
+                    font_size_px: pt_to_px(block_font_pt, view.zoom).max(10.0),
+                    text: preview_text,
+                    color: None,
+                });
+            }
+
             let mut pending_custom_blocks = Vec::new();
             let mut pending_custom_inlines = Vec::new();
             let mut visible_image_ids: HashSet<ImageAssetId> = HashSet::new();
@@ -529,19 +571,89 @@ impl Element for RichDocumentElement {
                 })
             });
 
+            let caret_anchor_rect = match &view.selection {
+                Some(DocumentSelection::Text {
+                    focus, affinity, ..
+                }) => view.flow.caret_rect_in_visible(focus, *affinity, &visible),
+                _ => None,
+            };
+
+            let selection_anchor_rect = if let Some(first) = selection_rects.first() {
+                let mut min_x = first.x;
+                let mut min_y = first.y;
+                let mut max_x = first.right();
+                let mut max_y = first.bottom();
+                for rect in selection_rects.iter().skip(1) {
+                    min_x = min_x.min(rect.x);
+                    min_y = min_y.min(rect.y);
+                    max_x = max_x.max(rect.right());
+                    max_y = max_y.max(rect.bottom());
+                }
+                Some(Rect::new(
+                    min_x,
+                    min_y,
+                    (max_x - min_x).max(0.0),
+                    (max_y - min_y).max(0.0),
+                ))
+            } else {
+                None
+            };
+
+            let mut pending_overlays = Vec::new();
+            let mut offscreen_dismiss_ids = Vec::new();
+            if !view.overlays.is_empty() {
+                let viewport_canvas = Rect::new(
+                    view.scroll_x,
+                    view.scroll_y,
+                    viewport_width,
+                    viewport_height,
+                );
+                for spec in view.overlays.sorted_specs() {
+                    let resolved_anchor = match &spec.anchor {
+                        OverlayAnchor::Caret => caret_anchor_rect,
+                        OverlayAnchor::DocPos { pos, affinity } => {
+                            view.flow.caret_rect_in_visible(pos, *affinity, &visible)
+                        }
+                        OverlayAnchor::Selection => selection_anchor_rect,
+                        OverlayAnchor::InlineObject {
+                            block_id,
+                            object_id,
+                        } => view
+                            .flow
+                            .inline_object_rect_in_visible(*block_id, *object_id, &visible),
+                    };
+                    match resolved_anchor {
+                        Some(anchor_rect)
+                            if is_anchor_visible_in_viewport(anchor_rect, viewport_canvas) =>
+                        {
+                            pending_overlays.push(PendingAnchoredOverlay {
+                                id: spec.id,
+                                z_layer: spec.z_layer,
+                                anchor_rect,
+                                placement: spec.placement,
+                                render: spec.render,
+                            });
+                        }
+                        _ => {
+                            if spec.placement.offscreen == OverlayOffscreenBehavior::Dismiss {
+                                offscreen_dismiss_ids.push(spec.id);
+                            }
+                        }
+                    }
+                }
+                for dismissed_id in offscreen_dismiss_ids {
+                    view.overlays.remove(&dismissed_id);
+                }
+            }
+
             let caret_rect = if focused
                 && policy.should_show_caret()
                 && view.caret_visible
                 && preedit_overlay.is_none()
             {
                 match &view.selection {
-                    Some(DocumentSelection::Text {
-                        anchor,
-                        focus,
-                        affinity,
-                        ..
-                    }) if anchor == focus => {
-                        view.flow.caret_rect_in_visible(focus, *affinity, &visible)
+                    Some(DocumentSelection::Text { anchor, focus, .. }) if anchor == focus => {
+                        caret_anchor_rect
                     }
                     _ => None,
                 }
@@ -586,6 +698,7 @@ impl Element for RichDocumentElement {
                 selected_image_overlay,
                 column_divider_guide,
                 pending_chip_popover,
+                pending_overlays,
                 pending_custom_blocks,
                 pending_custom_inlines,
                 caret_rect,
@@ -780,7 +893,16 @@ impl Element for RichDocumentElement {
             view.extension_diagnostics = frame_diagnostics;
         });
 
-        let popover_element = pending_chip_popover.map(|(popover, anchor_rect)| {
+        let window_viewport = window.viewport_size();
+        let window_clamp_rect = Rect::new(
+            0.0,
+            0.0,
+            f32::from(window_viewport.width).max(origin_x + viewport_width),
+            f32::from(window_viewport.height).max(origin_y + viewport_height),
+        );
+        let viewport_clamp_rect = Rect::new(origin_x, origin_y, viewport_width, viewport_height);
+
+        if let Some((popover, anchor_rect)) = pending_chip_popover {
             let popover_w = 224.0f32;
             let dropdown = crate::gpui::view::components::build_dropdown_options(
                 &popover,
@@ -792,20 +914,20 @@ impl Element for RichDocumentElement {
                 .as_ref()
                 .map_or(84.0, |(_, count)| (14.0 + *count as f32 * 29.0).min(240.0));
             let anchor_bounds = rect_to_bounds(anchor_rect);
-            let anchor_left: f32 = anchor_bounds.origin.x.into();
-            let anchor_bottom: f32 = (anchor_bounds.origin.y + anchor_bounds.size.height).into();
-            let anchor_top: f32 = anchor_bounds.origin.y.into();
-
-            let clamped_x = anchor_left.clamp(
-                origin_x + 8.0,
-                (origin_x + viewport_width - popover_w - 8.0).max(origin_x + 8.0),
+            let anchor_window_rect = Rect::new(
+                anchor_bounds.origin.x.into(),
+                anchor_bounds.origin.y.into(),
+                anchor_bounds.size.width.into(),
+                anchor_bounds.size.height.into(),
             );
-            let pop_y = if anchor_bottom + 6.0 + popover_h <= origin_y + viewport_height - 8.0 {
-                anchor_bottom + 6.0
-            } else {
-                (anchor_top - popover_h - 6.0).max(origin_y + 8.0)
-            };
-            let mut element = dropdown.map_or_else(
+            let placement = OverlayPlacement::below_start();
+            let origin = resolve_overlay_origin(
+                anchor_window_rect,
+                crate::layout::Size::new(popover_w, popover_h),
+                window_clamp_rect,
+                placement,
+            );
+            let inner = dropdown.map_or_else(
                 || {
                     build_smart_chip_popover_element(
                         &popover,
@@ -817,13 +939,78 @@ impl Element for RichDocumentElement {
                 },
                 |(menu, _)| menu,
             );
+            let mut wrapped = div()
+                .on_mouse_down(MouseButton::Left, |_, _window, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Right, |_, _window, cx| cx.stop_propagation())
+                .on_scroll(|_, _window, cx| cx.stop_propagation())
+                .child(inner)
+                .into_any_element();
             let available = size(
                 AvailableSpace::Definite(px(popover_w)),
                 AvailableSpace::Definite(px(popover_h)),
             );
-            element.prepaint_as_root(point(px(clamped_x), px(pop_y)), available, window, cx);
-            element
-        });
+            wrapped.layout_as_root(available, window, cx);
+            window.defer_draw(
+                wrapped,
+                point(px(origin.x), px(origin.y)),
+                OverlayZLayer::Passive.deferred_priority(),
+                None,
+            );
+        }
+
+        for overlay in pending_overlays {
+            let anchor_bounds = rect_to_bounds(overlay.anchor_rect);
+            let anchor_window_rect = Rect::new(
+                anchor_bounds.origin.x.into(),
+                anchor_bounds.origin.y.into(),
+                anchor_bounds.size.width.into(),
+                anchor_bounds.size.height.into(),
+            );
+            let inner = (overlay.render)(
+                &OverlayRenderContext {
+                    id: &overlay.id,
+                    view: self.view.clone(),
+                    anchor_bounds,
+                    viewport_bounds: bounds,
+                    theme: &theme,
+                    zoom,
+                },
+                window,
+                cx,
+            );
+            let mut wrapped = div()
+                .on_mouse_down(MouseButton::Left, |_, _window, cx| cx.stop_propagation())
+                .on_mouse_down(MouseButton::Right, |_, _window, cx| cx.stop_propagation())
+                .on_scroll(|_, _window, cx| cx.stop_propagation())
+                .child(inner)
+                .into_any_element();
+            let measured = wrapped.layout_as_root(
+                size(AvailableSpace::MaxContent, AvailableSpace::MaxContent),
+                window,
+                cx,
+            );
+            let overlay_size = crate::layout::Size::new(
+                f32::from(measured.width).max(1.0),
+                f32::from(measured.height).max(1.0),
+            );
+            let (clamp_rect, content_mask) = if overlay.placement.clamp_to_window {
+                (window_clamp_rect, None)
+            } else {
+                (viewport_clamp_rect, Some(ContentMask { bounds }))
+            };
+            let origin = resolve_overlay_origin(
+                anchor_window_rect,
+                overlay_size,
+                clamp_rect,
+                overlay.placement,
+            );
+            window.defer_draw(
+                wrapped,
+                point(px(origin.x), px(origin.y)),
+                overlay.z_layer.deferred_priority(),
+                content_mask,
+            );
+        }
 
         RichPrepaintState {
             visible_blocks,
@@ -834,7 +1021,6 @@ impl Element for RichDocumentElement {
             image_assets,
             selected_image_overlay,
             column_divider_guide,
-            popover_element,
             handled_custom_blocks,
             handled_custom_inlines,
             chrome_custom_nodes,
@@ -1055,9 +1241,6 @@ impl Element for RichDocumentElement {
                     Bounds::new(top_left, size(px(2.0), px(caret.height.max(12.0)))),
                     theme.caret,
                 ));
-            }
-            if let Some(mut popover) = prepaint.popover_element.take() {
-                popover.paint(window, cx);
             }
 
             if prepaint.total_height > viewport_height + 1.0 {

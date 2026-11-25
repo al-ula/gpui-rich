@@ -829,7 +829,29 @@ fn paint_text_fragment(
             };
             let glyph_origin = to_window(origin_x + fragment.x + glyph.x, baseline_y + glyph.y);
             let paint_result = if glyph.is_emoji {
-                window.paint_emoji(glyph_origin, run.font, glyph.glyph_id, font_size)
+                let target_px = (fragment.font_size_px * window.scale_factor() * 1.15)
+                    .round()
+                    .max(12.0) as u32;
+                if let Some(image) =
+                    crate::gpui::emoji::rasterize_colrv1_glyph_id(glyph.glyph_id.0, target_px)
+                {
+                    let emoji_px = (fragment.font_size_px * 1.15).max(10.0);
+                    let top_offset = fragment.ascent.max(fragment.font_size_px * 0.85);
+                    let emoji_bounds = Bounds::new(
+                        point(glyph_origin.x, glyph_origin.y - px(top_offset)),
+                        size(px(emoji_px), px(emoji_px)),
+                    );
+                    window.paint_image(
+                        emoji_bounds,
+                        emoji_bounds,
+                        Corners::all(px(0.0)),
+                        image,
+                        0,
+                        false,
+                    )
+                } else {
+                    window.paint_emoji(glyph_origin, run.font, glyph.glyph_id, font_size)
+                }
             } else {
                 window.paint_glyph(glyph_origin, run.font, glyph.glyph_id, font_size, color)
             };

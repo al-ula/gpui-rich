@@ -1433,6 +1433,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "emojis"
+version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "589871e639330783bc20ad89d32ac1b049e02c273d96c907ca27478c8bc674a2"
+dependencies = [
+ "phf 0.13.1",
+]
+
+[[package]]
 name = "encoding_rs"
 version = "0.8.44"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3011,12 +3020,16 @@ name = "gpui-rich"
 version = "0.1.0-pre.1"
 dependencies = [
  "base64 0.22.1",
+ "emojis",
  "gpui-kit",
+ "image",
  "merman",
  "regex",
  "serde",
  "serde_json",
+ "skrifa 0.44.0",
  "smallvec",
+ "tiny-skia",
  "unicode-bidi",
  "unicode-linebreak",
  "unicode-segmentation",

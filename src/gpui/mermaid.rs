@@ -6,6 +6,10 @@
 mod editor;
 
 use self::editor::{MermaidLabelEditor, MermaidSourceEditor};
+use crate::gpui::completion::{
+    CompletionAccept, CompletionBlockScope, CompletionDetail, CompletionItem, CompletionProvider,
+    CompletionQueryContext, CompletionQueryResult, CompletionTrigger, fuzzy_match_label,
+};
 use crate::gpui::extension::{
     BlockRenderContext, BlockRenderer, CustomRenderOutput, ExtensionPlugin,
     ExtensionRegistrationError, ReadCommandOutcome,
@@ -67,6 +71,8 @@ pub struct MermaidConfig {
     pub default_max_height_pt: f32,
     /// Maximum number of entries retained in each tier of the LRU compile and raster caches.
     pub cache_capacity: usize,
+    /// Registers a built-in `/mermaid` slash-completion item when installing [`MermaidExtension`].
+    pub register_slash_completion: bool,
 }
 
 impl Default for MermaidConfig {
@@ -75,6 +81,7 @@ impl Default for MermaidConfig {
             asset_source: None,
             default_max_height_pt: DEFAULT_MAX_HEIGHT_PT,
             cache_capacity: DEFAULT_CACHE_CAPACITY,
+            register_slash_completion: true,
         }
     }
 }
@@ -100,6 +107,12 @@ impl MermaidConfig {
     /// Sets the per-tier LRU cache capacity.
     pub fn with_cache_capacity(mut self, cache_capacity: usize) -> Self {
         self.cache_capacity = cache_capacity.max(4);
+        self
+    }
+
+    /// Enables or disables automatic `/mermaid` slash completion registration.
+    pub const fn with_slash_completion(mut self, enabled: bool) -> Self {
+        self.register_slash_completion = enabled;
         self
     }
 }
@@ -151,6 +164,7 @@ impl ExtensionPlugin for MermaidExtension {
             Some(asset_source) => SvgRenderer::new(Arc::clone(asset_source)),
             None => cx.svg_renderer(),
         };
+        let register_slash = self.config.register_slash_completion;
         let state = Rc::new(RefCell::new(MermaidRuntimeState::new(
             self.backend,
             svg_renderer,
@@ -270,7 +284,76 @@ impl ExtensionPlugin for MermaidExtension {
             Some(runtime.block_status(query.block_id, &data.source))
         })?;
 
+        if register_slash {
+            view.register_completion_provider(MermaidSlashCompletionProvider::new())?;
+        }
+
         Ok(())
+    }
+}
+
+struct MermaidSlashCompletionProvider {
+    triggers: [CompletionTrigger; 1],
+}
+
+impl MermaidSlashCompletionProvider {
+    fn new() -> Self {
+        Self {
+            triggers: [CompletionTrigger::prefix("/")],
+        }
+    }
+}
+
+impl CompletionProvider for MermaidSlashCompletionProvider {
+    fn id(&self) -> &'static str {
+        "gpui_rich.mermaid.slash"
+    }
+
+    fn triggers(&self) -> &[CompletionTrigger] {
+        &self.triggers
+    }
+
+    fn block_scope(&self) -> CompletionBlockScope {
+        CompletionBlockScope::ProseOnly
+    }
+
+    fn header_title(&self) -> Option<&str> {
+        Some("Slash Commands")
+    }
+
+    fn query(
+        &self,
+        context: &CompletionQueryContext<'_>,
+        _view: WeakEntity<RichDocumentView>,
+        _cx: &mut App,
+    ) -> CompletionQueryResult {
+        const DEFAULT_DIAGRAM: &str = "flowchart LR\n    Start[Start] --> Done[Done]";
+        let label = "Mermaid Diagram";
+        let matched = fuzzy_match_label(context.query, label).or_else(|| {
+            fuzzy_match_label(context.query, "flowchart").map(|(score, _)| (score - 10, Vec::new()))
+        });
+        let Some((score, indices)) = matched else {
+            return CompletionQueryResult::Ready(Vec::new());
+        };
+        let item = CompletionItem::new(
+            "mermaid-diagram",
+            label,
+            CompletionAccept::command(crate::model::RichCommand::extension(
+                InsertMermaidDiagram::new(DEFAULT_DIAGRAM),
+            )),
+        )
+        .with_subtitle("Insert an interactive Mermaid diagram")
+        .with_badge("diagram")
+        .with_category("Media")
+        .with_match(score, indices)
+        .with_detail(
+            CompletionDetail::new(
+                "Mermaid Diagram",
+                "Inserts a live-editable diagram block supporting flowchart, sequence, and state syntax.",
+            )
+            .with_preview(DEFAULT_DIAGRAM),
+        );
+        CompletionQueryResult::Ready(vec![item])
     }
 }
 

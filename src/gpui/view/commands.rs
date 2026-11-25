@@ -120,6 +120,29 @@ impl RichDocumentView {
             self.pending_input_rule_undo = None;
         }
         let outcome = self.execute_command(&current_command, source, cx);
+        if source == CommandSource::User {
+            match &current_command {
+                RichCommand::InsertText(_)
+                | RichCommand::Delete {
+                    direction: MoveDirection::Backward,
+                    unit: MoveUnit::Grapheme,
+                } => {
+                    self.refresh_completion_after_edit(cx);
+                }
+                RichCommand::SetSelection(_)
+                | RichCommand::MoveCaret { .. }
+                | RichCommand::Undo
+                | RichCommand::Redo
+                | RichCommand::PasteText(_)
+                | RichCommand::PasteHtml { .. }
+                | RichCommand::PasteFragment { .. }
+                | RichCommand::SplitBlock
+                | RichCommand::Delete { .. } => {
+                    self.reconcile_completion_with_selection(cx);
+                }
+                _ => {}
+            }
+        }
         cx.emit(RichDocumentEvent::CommandExecuted {
             command_id: current_command.command_id(),
             effect: current_command.effect(),
@@ -3097,6 +3120,7 @@ impl RichDocumentView {
         }
         self.pending_reveal = None;
         self.selection = next_selection;
+        self.dismiss_overlays_where(|spec| spec.dismiss.on_selection_change, cx);
         cx.emit(RichDocumentEvent::SelectionChanged {
             selection: self.selection.clone().map(Box::new),
         });
@@ -3107,6 +3131,7 @@ impl RichDocumentView {
     fn notify_transaction_applied(&mut self, change_set: ChangeSet, cx: &mut Context<Self>) {
         self.document_revision = self.document_revision.wrapping_add(1);
         self.refresh_search_matches();
+        self.dismiss_overlays_where(|spec| spec.dismiss.on_document_edit, cx);
         for (_, middleware) in &mut self.middleware {
             middleware.after_transaction(&change_set, &self.document, self.selection.as_ref());
         }
