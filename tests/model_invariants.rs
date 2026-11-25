@@ -747,7 +747,7 @@ fn checklist_toggle_and_inline_image_resize_undo_roundtrip() {
     let mut para = InlineContent::empty();
     let img_id = para.push_object(
         InlineObject::Image {
-            asset_id: "hero.png".into(),
+            asset_id: ImageAssetId::new("hero.png").unwrap(),
             alt: "Hero".into(),
             width_pt: 200.0,
             height_pt: 120.0,
@@ -775,7 +775,7 @@ fn checklist_toggle_and_inline_image_resize_undo_roundtrip() {
         block_id: para_id,
         object_id: img_id,
         object: InlineObject::Image {
-            asset_id: "hero.png".into(),
+            asset_id: ImageAssetId::new("hero.png").unwrap(),
             alt: "Hero".into(),
             width_pt: 320.0,
             height_pt: 192.0,
@@ -882,6 +882,53 @@ fn main() {}
     let html = registry.encode_as(&html_id, &decoded).unwrap();
     let reparsed_html = registry.decode_as(&html_id, &html).unwrap();
     assert_eq!(reparsed_html.blocks.len(), decoded.blocks.len());
+}
+
+#[test]
+fn image_sources_round_trip_and_missing_sources_do_not_create_images() {
+    let registry = CodecRegistry::with_builtin_codecs();
+    let markdown = FormatId::new("markdown");
+    let html = FormatId::new("html");
+    let linked = "../assets/hero.png";
+    let bundled = "DATA:image/gif;BASE64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
+    let source = format!("![Host]({linked}) ![Bundle]({bundled}) ![No source]()");
+    let document = registry.decode_as(&markdown, &source).unwrap();
+
+    let assert_image_sources = |document: &Document| {
+        let inline = document.blocks[0].kind.inline_content().unwrap();
+        let sources: Vec<_> = inline
+            .objects
+            .iter()
+            .map(|entry| match &entry.object {
+                InlineObject::Image { asset_id, .. } => asset_id.source(),
+                other => panic!("expected image, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            sources,
+            [
+                ImageAssetSource::Linked(linked),
+                ImageAssetSource::Bundled(bundled),
+            ]
+        );
+    };
+    assert_image_sources(&document);
+    for format in [&markdown, &html] {
+        let encoded = registry.encode_as(format, &document).unwrap();
+        assert_image_sources(&registry.decode_as(format, &encoded).unwrap());
+    }
+    let encoded_html = registry.encode_as(&html, &document).unwrap();
+    assert!(encoded_html.contains(&format!("<img src=\"{bundled}\"")));
+    let json = document.to_json_pretty().unwrap();
+    assert_image_sources(&Document::from_json(&json).unwrap());
+    assert!(Document::from_json(&json.replace(linked, " ")).is_err());
+
+    let without_source = registry
+        .decode_as(&html, "<p><img src=\" \" alt=\"No source\"></p>")
+        .unwrap();
+    let inline = without_source.blocks[0].kind.inline_content().unwrap();
+    assert_eq!(inline.text, "No source");
+    assert!(inline.objects.is_empty());
 }
 
 #[test]
@@ -1064,7 +1111,7 @@ fn custom_node_json_fidelity_error_classification_and_fallible_serialization() {
     let mut inline = InlineContent::empty();
     inline.push_object(
         InlineObject::Image {
-            asset_id: ImageAssetId::new("asset://hero/1"),
+            asset_id: ImageAssetId::new("asset://hero/1").unwrap(),
             alt: "Hero".into(),
             width_pt: 80.0,
             height_pt: 40.0,

@@ -363,7 +363,11 @@ fn write_inline_object_html(
             height_pt,
             ..
         } => {
-            output.push_str("<img data-asset-id=\"");
+            let attribute = match asset_id.source() {
+                ImageAssetSource::Linked(_) => "<img data-asset-id=\"",
+                ImageAssetSource::Bundled(_) => "<img src=\"",
+            };
+            output.push_str(attribute);
             push_escaped_html(asset_id.as_str(), output);
             output.push_str("\" alt=\"");
             push_escaped_html(alt, output);
@@ -1155,11 +1159,11 @@ impl HtmlFragmentParser {
                 }
             }
             "img" => {
-                let asset_id = attr_value(attrs, "data-asset-id")
-                    .or_else(|| attr_value(attrs, "src"))
-                    .unwrap_or("image")
-                    .to_owned();
-                let alt = attr_value(attrs, "alt").unwrap_or("").to_owned();
+                let asset_id = ["data-asset-id", "src"]
+                    .into_iter()
+                    .filter_map(|name| attr_value(attrs, name))
+                    .find_map(|source| ImageAssetId::new(source).ok());
+                let alt = attr_value(attrs, "alt").unwrap_or("");
                 let width_pt = attr_value(attrs, "width")
                     .and_then(|v| v.parse::<f32>().ok())
                     .unwrap_or(120.0)
@@ -1171,10 +1175,14 @@ impl HtmlFragmentParser {
                 self.ensure_paragraph();
                 let style = self.current_inline_style();
                 if let Some(block) = self.current_block.as_mut() {
+                    let Some(asset_id) = asset_id else {
+                        block.content.push_text(alt, style);
+                        return;
+                    };
                     block.content.push_object(
                         InlineObject::Image {
-                            asset_id: ImageAssetId::new(asset_id),
-                            alt,
+                            asset_id,
+                            alt: alt.to_owned(),
                             width_pt,
                             height_pt,
                             valign: InlineVAlign::Middle,

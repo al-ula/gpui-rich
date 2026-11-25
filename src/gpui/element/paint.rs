@@ -1277,7 +1277,7 @@ fn collect_custom_inlines_in_paragraph(
                             });
                         }
                     }
-                    InlineObject::Image { asset_id, .. } if !asset_id.is_empty() => {
+                    InlineObject::Image { asset_id, .. } => {
                         out_images.insert(asset_id.clone());
                     }
                     _ => {}

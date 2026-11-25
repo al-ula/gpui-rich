@@ -6,11 +6,12 @@ license = "Apache-2.0 OR MIT"
 
 [features]
 default = ["gpui"]
-gpui = ["dep:gpui-kit"]
+gpui = ["dep:base64", "dep:gpui-kit"]
 gpui-fast = ["gpui", "gpui-kit/gpui-fast"]
 mermaid = ["dep:merman"]
 
 [dependencies]
+base64 = { version = "0.22", optional = true }
 gpui-kit = { version = "0.10.0", default-features = false, optional = true }
 merman = { version = "0.11.0", default-features = false, features = ["all-diagrams", "svg", "layout-cytoscape"], optional = true }
 regex = "1"

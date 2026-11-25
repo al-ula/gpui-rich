@@ -1280,9 +1280,14 @@ fn gpui_extension_type_safety_end_to_end() {
             return;
         }
 
-        // Start async missing vs undecodable image loading scenario.
-        let missing_id = ImageAssetId::new("missing.png");
-        let broken_id = ImageAssetId::new("broken.png");
+        let missing_id = ImageAssetId::new("missing.png").unwrap();
+        let broken_id = ImageAssetId::new("asset://test/broken.png").unwrap();
+        let bundled_id = ImageAssetId::new(concat!(
+            "DATA:image/png;BASE64,",
+            "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAAD0lEQVR4nGO4ppLC0fAEAAlLAsu5bKHnAAAAAElFTkSuQmCC"
+        ))
+        .unwrap();
+        let invalid_bundle = ImageAssetId::new("data:image/png;base64,not!base64").unwrap();
         let provider = MemoryAssetProvider::new();
         provider.insert_encoded(
             broken_id.clone(),
@@ -1292,26 +1297,18 @@ fn gpui_extension_type_safety_end_to_end() {
 
         let mut image_doc = Document::new();
         let mut inline = InlineContent::empty();
-        inline.push_object(
-            InlineObject::Image {
-                asset_id: missing_id.clone(),
-                width_pt: 40.0,
-                height_pt: 40.0,
-                alt: "missing".to_owned(),
-                valign: InlineVAlign::Baseline,
-            },
-            InlineStyle::default(),
-        );
-        inline.push_object(
-            InlineObject::Image {
-                asset_id: broken_id.clone(),
-                width_pt: 40.0,
-                height_pt: 40.0,
-                alt: "broken".to_owned(),
-                valign: InlineVAlign::Baseline,
-            },
-            InlineStyle::default(),
-        );
+        for asset_id in [&missing_id, &broken_id, &bundled_id, &invalid_bundle] {
+            inline.push_object(
+                InlineObject::Image {
+                    asset_id: asset_id.clone(),
+                    width_pt: 40.0,
+                    height_pt: 40.0,
+                    alt: "image".to_owned(),
+                    valign: InlineVAlign::Baseline,
+                },
+                InlineStyle::default(),
+            );
+        }
         image_doc.add_paragraph(inline, BlockStyle::default());
         let initial_snapshot = JsonCodec
             .encode(&image_doc)
@@ -1323,8 +1320,7 @@ fn gpui_extension_type_safety_end_to_end() {
         let image_view_capture = Rc::clone(&image_view_slot);
         let image_window = cx
             .open_window(fixed_window_options(640.0, 240.0), move |_window, cx| {
-                let view =
-                    cx.new(|cx| RichDocumentView::new(image_doc, cx).with_asset_provider(provider));
+                let view = cx.new(|cx| RichDocumentView::new(image_doc, cx));
                 *image_view_capture.borrow_mut() = Some(view.clone());
                 view
             })
@@ -1334,12 +1330,37 @@ fn gpui_extension_type_safety_end_to_end() {
 
         let failure_for_async = Arc::clone(&failure_for_run);
         cx.spawn(async move |cx| {
+            for _ in 0..40 {
+                let ready = cx.update(|cx| {
+                    let view = image_view.read(cx);
+                    matches!(view.asset_state(&bundled_id), Some(LoadedAsset::Ready(_)))
+                });
+                if ready {
+                    break;
+                }
+                cx.background_executor()
+                    .timer(Duration::from_millis(50))
+                    .await;
+            }
+            let ready_without_provider = cx.update(|cx| {
+                let view = image_view.read(cx);
+                let ready = matches!(view.asset_state(&bundled_id), Some(LoadedAsset::Ready(_)))
+                    && view.asset_state(&missing_id).is_none();
+                image_view.update(cx, |view, cx| {
+                    view.set_asset_provider(Some(Arc::new(provider)), cx);
+                });
+                draw_window(image_window.into(), cx);
+                ready
+            });
+
             // Wait up to 2 seconds for background decode tasks to settle.
             for _ in 0..40 {
                 let settled = cx.update(|cx| {
                     let view = image_view.read(cx);
                     matches!(view.asset_state(&missing_id), Some(LoadedAsset::Failed(_)))
                         && matches!(view.asset_state(&broken_id), Some(LoadedAsset::Failed(_)))
+                        && matches!(view.asset_state(&bundled_id), Some(LoadedAsset::Ready(_)))
+                        && matches!(view.asset_state(&invalid_bundle), Some(LoadedAsset::Failed(_)))
                 });
                 if settled {
                     break;
@@ -1350,6 +1371,7 @@ fn gpui_extension_type_safety_end_to_end() {
             }
 
             let async_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                assert!(ready_without_provider, "bundled image must load without a provider");
                 cx.update(|cx| {
                     let view = image_view.read(cx);
                     match view.asset_state(&missing_id) {
@@ -1373,6 +1395,15 @@ fn gpui_extension_type_safety_end_to_end() {
                             panic!("expected Decode failure for broken asset, got {other:?}")
                         }
                     }
+                    assert!(
+                        matches!(view.asset_state(&bundled_id), Some(LoadedAsset::Ready(_))),
+                        "bundled image must not be requested from the host provider"
+                    );
+                    assert!(matches!(
+                        view.asset_state(&invalid_bundle),
+                        Some(LoadedAsset::Failed(error @ ImageAssetError::Decode { .. }))
+                            if error.source().is_some()
+                    ));
                     assert!(
                         !view.history.can_undo(),
                         "asset loading must not add history"
