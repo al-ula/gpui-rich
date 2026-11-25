@@ -7,8 +7,8 @@ use crate::model::block::{
 };
 use crate::model::components::PlaceholderKind;
 use crate::model::inline::{
-    ChipKind, ImageAssetId, InlineContent, InlineObject, InlineVAlign, OBJECT_REPLACEMENT_CHAR,
-    OBJECT_REPLACEMENT_UTF8_LEN,
+    ChipKind, ImageAssetId, ImageAssetSource, InlineContent, InlineObject, InlineVAlign,
+    OBJECT_REPLACEMENT_CHAR, OBJECT_REPLACEMENT_UTF8_LEN,
 };
 use crate::model::payload::CustomPayload;
 use crate::model::selection::DocumentSelection;

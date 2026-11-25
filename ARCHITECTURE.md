@@ -108,6 +108,12 @@ view.set_policy(policy, cx);
 
 The policy controls interactions, not what renders or what a codec accepts. A host that needs Markdown-only import/export chooses `MarkdownCodec` separately.
 
+### Inline Image Assets
+
+* **Linked**: An image carries a non-blank path or URI, such as `figures/hero.png` or `asset://gallery/hero`. The host supplies an `AssetProvider` through `RichDocumentView::with_asset_provider`. The viewer does not fetch these links itself. Relative paths, URI schemes, and access policy are up to the provider; use `FileAssetProvider` only with trusted documents because it also accepts absolute paths.
+* **Bundled**: Markdown `![Alt](data:image/png;base64,...)` and HTML `<img src="data:image/png;base64,...">` carry their own bytes. GPUI decodes supported base64 image data URIs in the background without a provider. Invalid data uses the normal image-error placeholder and is never passed to the host.
+* `ImageAssetId::new` rejects a blank source, and `source()` distinguishes linked and bundled references. Native JSON still uses the existing `asset_id` string; there is no new native asset table or package format.
+
 ### `gpui-kit` Integration
 
 * `src/model` and `src/layout` remain pure Rust with zero GPUI or `gpui-kit` dependencies (`cargo test --no-default-features -j 4`).

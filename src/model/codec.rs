@@ -987,7 +987,11 @@ fn encode_markdown_inline(content: &InlineContent) -> String {
             {
                 match &entry.object {
                     InlineObject::Image { asset_id, alt, .. } => {
-                        inner.push_str(&format!("![{alt}]({asset_id})"));
+                        inner.push_str("![");
+                        inner.push_str(alt);
+                        inner.push_str("](");
+                        inner.push_str(asset_id.as_str());
+                        inner.push(')');
                     }
                     InlineObject::SmartChip { label, .. } => {
                         inner.push_str(label);
@@ -1561,14 +1565,15 @@ fn parse_markdown_inline_into(input: &str, active_style: &InlineStyle, output: &
             continue;
         }
 
-        // Image: ![alt](asset_id).
+        // Image: ![alt](path-or-uri).
         if rest.starts_with("![")
             && let Some((alt, src, consumed)) = parse_md_link_or_image(rest, 2)
+            && let Ok(asset_id) = ImageAssetId::new(src)
         {
             flush_plain(&mut plain_buffer, output);
             output.push_object(
                 InlineObject::Image {
-                    asset_id: ImageAssetId::new(src),
+                    asset_id,
                     alt: alt.to_string(),
                     width_pt: 240.0,
                     height_pt: 150.0,
@@ -1681,7 +1686,11 @@ fn parse_md_link_or_image(input: &str, open_len: usize) -> Option<(&str, &str, u
     let after_paren = after_bracket.strip_prefix('(')?;
     let close_paren = after_paren.find(')')?;
     let target = after_paren[..close_paren].trim();
-    if target.is_empty() || target.to_ascii_lowercase().starts_with("javascript:") {
+    if target.is_empty()
+        || target
+            .get(..11)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("javascript:"))
+    {
         return None;
     }
     let consumed = open_len + close_bracket + 1 + 1 + close_paren + 1;

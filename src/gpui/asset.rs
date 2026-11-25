@@ -1,14 +1,11 @@
 //! Asynchronous [`AssetProvider`] contract and built-in loaders for decoding inline images
 //! into GPUI [`RenderImage`] handles painted via `window.paint_image`.
 //!
-//! # Breaking changes
-//!
-//! * Asset requests, cache keys, and invalidation now use [`crate::model::ImageAssetId`] instead of
-//!   raw `&str` / `String`. The JSON wire format remains a plain string.
-//! * Failures now return structured [`ImageAssetError`] values classifying missing assets,
-//!   provider failures, and decode failures while retaining their underlying causes.
+//! Linked images are fetched through the host's provider. Bundled data URIs are decoded locally.
 
-use crate::model::ImageAssetId;
+use crate::model::{ImageAssetId, ImageAssetSource};
+use base64::Engine as _;
+use base64::engine::{DecodePaddingMode, GeneralPurpose, GeneralPurposeConfig};
 use gpui_kit::{Image, ImageFormat, RenderImage, SvgRenderer};
 use std::collections::HashMap;
 use std::error::Error;
@@ -180,16 +177,70 @@ pub enum LoadedAsset {
     Failed(ImageAssetError),
 }
 
-/// Asynchronous asset resolver supplied by the host application for `InlineObject::Image`.
+/// Asynchronous resolver supplied by the host for linked inline image paths and URIs.
 ///
 /// Resolving an asset never mutates [`crate::model::Document`] or changes undo history.
 pub trait AssetProvider: Send + Sync + 'static {
-    /// Fetches raw or pre-decoded image data for `asset_id`.
-    /// Executed on GPUI's background executor so network or disk I/O never blocks painting.
+    /// Fetches raw or pre-decoded image data for a linked `asset_id`. Bundled data URIs never
+    /// reach the provider. Both this method and its future run on GPUI's background executor.
     fn load_image(
         &self,
         asset_id: &ImageAssetId,
     ) -> Pin<Box<dyn Future<Output = Result<ImageAssetData, ImageAssetError>> + Send + 'static>>;
+}
+
+pub(crate) fn decode_bundled_image(
+    asset_id: &ImageAssetId,
+) -> Result<ImageAssetData, ImageAssetError> {
+    const BASE64: GeneralPurpose = GeneralPurpose::new(
+        &base64::alphabet::STANDARD,
+        GeneralPurposeConfig::new().with_decode_padding_mode(DecodePaddingMode::Indifferent),
+    );
+
+    let invalid_uri = || {
+        ImageAssetError::decode(
+            asset_id.clone(),
+            "expected a base64 image data URI (data:image/<format>;base64,...)",
+        )
+    };
+    let ImageAssetSource::Bundled(uri) = asset_id.source() else {
+        return Err(invalid_uri());
+    };
+    let (metadata, encoded) = uri
+        .get(5..)
+        .and_then(|body| body.split_once(','))
+        .ok_or_else(invalid_uri)?;
+    let (media_type_with_params, encoding) = metadata.rsplit_once(';').ok_or_else(invalid_uri)?;
+    if !encoding.eq_ignore_ascii_case("base64") || encoded.is_empty() {
+        return Err(invalid_uri());
+    }
+    let media_type = media_type_with_params
+        .split_once(';')
+        .map_or(media_type_with_params, |(media_type, _)| media_type);
+    let format = [
+        ("image/png", ImageFormat::Png),
+        ("image/jpeg", ImageFormat::Jpeg),
+        ("image/webp", ImageFormat::Webp),
+        ("image/gif", ImageFormat::Gif),
+        ("image/svg+xml", ImageFormat::Svg),
+        ("image/bmp", ImageFormat::Bmp),
+        ("image/tiff", ImageFormat::Tiff),
+        ("image/x-icon", ImageFormat::Ico),
+        ("image/vnd.microsoft.icon", ImageFormat::Ico),
+        ("image/x-portable-anymap", ImageFormat::Pnm),
+        ("image/x-portable-bitmap", ImageFormat::Pnm),
+        ("image/x-portable-graymap", ImageFormat::Pnm),
+        ("image/x-portable-pixmap", ImageFormat::Pnm),
+    ]
+    .into_iter()
+    .find_map(|(name, format)| name.eq_ignore_ascii_case(media_type).then_some(format))
+    .ok_or_else(|| {
+        ImageAssetError::decode(asset_id.clone(), "unsupported bundled image media type")
+    })?;
+    let bytes = BASE64.decode(encoded).map_err(|error| {
+        ImageAssetError::decode_with_cause(asset_id.clone(), "invalid base64 image payload", error)
+    })?;
+    Ok(ImageAssetData::Encoded { format, bytes })
 }
 
 /// Decodes [`ImageAssetData`] into a GPUI [`RenderImage`] (safe to run on a background thread).
@@ -234,7 +285,7 @@ pub fn infer_image_format(path_or_id: &str) -> Option<ImageFormat> {
     }
 }
 
-/// Thread-safe in-memory [`AssetProvider`] useful for embedded assets, data bundles, and demos.
+/// Thread-safe in-memory provider for host-supplied linked assets.
 #[derive(Default)]
 pub struct MemoryAssetProvider {
     entries: RwLock<HashMap<ImageAssetId, ImageAssetData>>,
@@ -249,19 +300,19 @@ impl MemoryAssetProvider {
     /// Inserts encoded image bytes for `asset_id`.
     pub fn insert_encoded(
         &self,
-        asset_id: impl Into<ImageAssetId>,
+        asset_id: ImageAssetId,
         format: ImageFormat,
         bytes: impl Into<Vec<u8>>,
     ) {
         if let Ok(mut guard) = self.entries.write() {
-            guard.insert(asset_id.into(), ImageAssetData::encoded(format, bytes));
+            guard.insert(asset_id, ImageAssetData::encoded(format, bytes));
         }
     }
 
     /// Inserts a pre-decoded [`RenderImage`] for `asset_id`.
-    pub fn insert_decoded(&self, asset_id: impl Into<ImageAssetId>, image: Arc<RenderImage>) {
+    pub fn insert_decoded(&self, asset_id: ImageAssetId, image: Arc<RenderImage>) {
         if let Ok(mut guard) = self.entries.write() {
-            guard.insert(asset_id.into(), ImageAssetData::decoded(image));
+            guard.insert(asset_id, ImageAssetData::decoded(image));
         }
     }
 

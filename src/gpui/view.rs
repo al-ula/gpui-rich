@@ -1,7 +1,7 @@
 //! Interactive GPUI view hosting [`RichDocumentElement`] with command-driven actions,
 //! policy gating, theming, host events, keyboard navigation, IME input, and core editing.
 
-use crate::gpui::asset::{AssetProvider, LoadedAsset, decode_image_asset};
+use crate::gpui::asset::{AssetProvider, LoadedAsset, decode_bundled_image, decode_image_asset};
 use crate::gpui::element::RichDocumentElement;
 use crate::gpui::extension::{
     BlockRenderer, CommandExecutionResult, EditCommandContext, ExtensionDiagnostic,
@@ -20,11 +20,12 @@ use crate::model::{
     CommandDecision, CommandEffectKind, CommandMiddleware, CommandOutcome, CommandResolution,
     CommandSource, CrdtSyncBridge, DecorationProvider, DocPos, Document, DocumentCodec,
     DocumentSelection, DynamicDocumentCodec, Edges, Edit, EncodedDocument, ExtensionCommand,
-    ExtensionInvocation, History, HistoryMergeGroup, HorizontalLayout, ImageAssetId, InlineContent,
-    InlineObject, InlineObjectId, InlineSpec, InlineStyle, InteractionPolicy, LinkTarget, ListKind,
-    MarkKind, MoveDirection, MoveUnit, NamedStyle, NumberStyle, OBJECT_REPLACEMENT_UTF8_LEN,
-    PathSegment, ReadOnly, ResolvedCommand, ResolvedTextStyle, RgbaColor, RichCommand,
-    SelectionValue, SharedStr, Step, StyleId, SyncDelta, TextAlign, Transaction, block_kinds,
+    ExtensionInvocation, History, HistoryMergeGroup, HorizontalLayout, ImageAssetId,
+    ImageAssetSource, InlineContent, InlineObject, InlineObjectId, InlineSpec, InlineStyle,
+    InteractionPolicy, LinkTarget, ListKind, MarkKind, MoveDirection, MoveUnit, NamedStyle,
+    NumberStyle, OBJECT_REPLACEMENT_UTF8_LEN, PathSegment, ReadOnly, ResolvedCommand,
+    ResolvedTextStyle, RgbaColor, RichCommand, SelectionValue, SharedStr, Step, StyleId, SyncDelta,
+    TextAlign, Transaction, block_kinds,
 };
 use gpui_kit::{
     App, Bounds, ClipboardItem, Context, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
@@ -199,7 +200,7 @@ impl RichDocumentView {
         self
     }
 
-    /// Builder method configuring an asynchronous [`AssetProvider`] for inline images.
+    /// Configures the host resolver for linked inline images. Bundled images need no provider.
     pub fn with_asset_provider(mut self, provider: impl AssetProvider) -> Self {
         self.asset_provider = Some(Arc::new(provider));
         self
@@ -236,8 +237,8 @@ impl RichDocumentView {
         cx.notify();
     }
 
-    /// Returns the cached [`LoadedAsset`] state for `asset_id`, kicking off an async background
-    /// fetch + decode task when an [`AssetProvider`] is configured and `asset_id` is uncached.
+    /// Returns the cached state, starting a background task for an uncached bundled image or
+    /// a linked image with a configured provider.
     pub(crate) fn resolve_or_request_image(
         &mut self,
         asset_id: &ImageAssetId,
@@ -246,18 +247,23 @@ impl RichDocumentView {
         if let Some(existing) = self.asset_cache.get(asset_id) {
             return Some(existing.clone());
         }
-        let provider = self.asset_provider.as_ref()?.clone();
+        let provider = match asset_id.source() {
+            ImageAssetSource::Linked(_) => Some(self.asset_provider.as_ref()?.clone()),
+            ImageAssetSource::Bundled(_) => None,
+        };
         let key = asset_id.clone();
         self.asset_cache.insert(key.clone(), LoadedAsset::Loading);
         let svg_renderer = cx.svg_renderer();
-        let load_future = provider.load_image(asset_id);
         let key_for_decode = key.clone();
         let key_for_task = key.clone();
         let task = cx.spawn(async move |weak_view, cx| {
             let decoded_result = cx
                 .background_executor()
                 .spawn(async move {
-                    let raw = load_future.await?;
+                    let raw = match provider {
+                        Some(provider) => provider.load_image(&key_for_decode).await?,
+                        None => decode_bundled_image(&key_for_decode)?,
+                    };
                     decode_image_asset(&key_for_decode, raw, svg_renderer)
                 })
                 .await;

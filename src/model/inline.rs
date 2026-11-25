@@ -5,6 +5,7 @@ use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::fmt;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -13,53 +14,109 @@ use std::sync::Arc;
 pub const OBJECT_REPLACEMENT_CHAR: char = '\u{FFFC}';
 pub const OBJECT_REPLACEMENT_UTF8_LEN: usize = 3;
 
-/// Typed identifier for an inline image asset.
-///
-/// Serializes transparently as its inner string to preserve existing native JSON and HTML/Markdown
-/// representations. An `ImageAssetId` identifies an image to an asset provider and is not required
-/// to be a filesystem path or URL.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
+/// Where the bytes for an inline image come from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ImageAssetSource<'a> {
+    /// A non-blank path or URI interpreted by the host.
+    Linked(&'a str),
+    /// A `data:` URI carried with the image instead of resolved by the host.
+    Bundled(&'a str),
+}
+
+/// An inline image source and cache key. Serializes as the existing `asset_id` string.
+#[derive(Clone, Debug, Eq, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
-pub struct ImageAssetId(pub String);
+pub struct ImageAssetId {
+    source: Arc<str>,
+    // Visible images are hashed each frame. A data URI can be megabytes long.
+    #[serde(skip)]
+    fingerprint: u64,
+}
+
+/// An image was constructed without a path, URI, or embedded data.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct MissingImageAssetSource;
+
+impl fmt::Display for MissingImageAssetSource {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("image source must be a non-blank path or URI")
+    }
+}
+
+impl std::error::Error for MissingImageAssetSource {}
 
 impl ImageAssetId {
-    /// Creates an [`ImageAssetId`] from an arbitrary string identifier.
-    pub fn new(id: impl Into<String>) -> Self {
-        Self(id.into())
+    /// Creates an image reference, reserving the `data:` scheme for bundled images.
+    ///
+    /// Paths and other URIs are stored verbatim; the host decides how to interpret them.
+    /// Bundled data is decoded by the renderer when needed, not during construction.
+    pub fn new(source: &str) -> Result<Self, MissingImageAssetSource> {
+        if source.trim().is_empty() {
+            return Err(MissingImageAssetSource);
+        }
+        Ok(Self::from_non_blank(Arc::from(source)))
     }
 
-    /// Borrows the underlying identifier string.
+    fn from_non_blank(source: Arc<str>) -> Self {
+        let mut hasher = DefaultHasher::new();
+        source.hash(&mut hasher);
+        Self {
+            source,
+            fingerprint: hasher.finish(),
+        }
+    }
+
+    /// Returns the original path or URI.
     pub fn as_str(&self) -> &str {
-        &self.0
+        &self.source
     }
 
-    /// Returns `true` when the identifier string is empty.
-    pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+    /// Distinguishes host-resolved links from self-contained data URIs.
+    pub fn source(&self) -> ImageAssetSource<'_> {
+        let source = self.as_str();
+        if source
+            .get(..5)
+            .is_some_and(|scheme| scheme.eq_ignore_ascii_case("data:"))
+        {
+            ImageAssetSource::Bundled(source)
+        } else {
+            ImageAssetSource::Linked(source)
+        }
     }
 }
 
-impl From<String> for ImageAssetId {
-    fn from(value: String) -> Self {
-        Self(value)
+impl<'de> Deserialize<'de> for ImageAssetId {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let source = Arc::<str>::deserialize(deserializer)?;
+        if source.trim().is_empty() {
+            return Err(serde::de::Error::custom(MissingImageAssetSource));
+        }
+        Ok(Self::from_non_blank(source))
     }
 }
 
-impl From<&str> for ImageAssetId {
-    fn from(value: &str) -> Self {
-        Self(value.to_owned())
+impl PartialEq for ImageAssetId {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.source, &other.source)
+            || (self.fingerprint == other.fingerprint && self.source == other.source)
+    }
+}
+
+impl Hash for ImageAssetId {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        state.write_u64(self.fingerprint);
     }
 }
 
 impl AsRef<str> for ImageAssetId {
     fn as_ref(&self) -> &str {
-        &self.0
+        self.as_str()
     }
 }
 
 impl fmt::Display for ImageAssetId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(&self.0)
+        formatter.write_str(self.as_str())
     }
 }
 

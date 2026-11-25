@@ -345,9 +345,8 @@ pub struct DocsViewerApp {
 
 impl DocsViewerApp {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        let document = build_sample_document();
         let assets = MemoryAssetProvider::new();
-        assets.insert_encoded("diagram-1", ImageFormat::Svg, SAMPLE_DIAGRAM_SVG.as_bytes());
+        let document = build_sample_document(&assets);
         let document_view = cx.new(|cx| {
             let mut view = RichDocumentView::new(document, cx)
                 .with_asset_provider(assets)
@@ -1769,7 +1768,7 @@ const SAMPLE_DIAGRAM_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" wid
   <path d="M94 36 L118 36 M200 36 L224 36" stroke="#1f2328" stroke-width="2.5" stroke-linecap="round"/>
 </svg>"##;
 
-fn build_sample_document() -> Document {
+fn build_sample_document(assets: &MemoryAssetProvider) -> Document {
     let mut document = Document::new();
 
     document.add_paragraph(
@@ -1887,24 +1886,46 @@ fn build_sample_document() -> Document {
     document.add_paragraph(chips, BlockStyle::default());
 
     let mut inline_img = InlineContent::empty();
-    inline_img.push_text(
-        "Inline image placeholder anchored to baseline: ",
-        InlineStyle::default(),
-    );
-    inline_img.push_object(
-        InlineObject::Image {
-            asset_id: ImageAssetId::new("diagram-1"),
-            alt: "Diagram 160x36".into(),
-            width_pt: 120.0,
-            height_pt: 28.0,
-            valign: InlineVAlign::Middle,
-        },
-        InlineStyle::default(),
-    );
-    inline_img.push_text(
-        " flowing cleanly with surrounding text.",
-        InlineStyle::default(),
-    );
+    inline_img.push_text("Host-provided image: ", InlineStyle::default());
+    match ImageAssetId::new("asset://docs-viewer/diagram.svg") {
+        Ok(asset_id) => {
+            assets.insert_encoded(
+                asset_id.clone(),
+                ImageFormat::Svg,
+                SAMPLE_DIAGRAM_SVG.as_bytes(),
+            );
+            inline_img.push_object(
+                InlineObject::Image {
+                    asset_id,
+                    alt: "Diagram 160x36".into(),
+                    width_pt: 120.0,
+                    height_pt: 28.0,
+                    valign: InlineVAlign::Middle,
+                },
+                InlineStyle::default(),
+            );
+        }
+        Err(error) => eprintln!("docs_viewer: invalid diagram source: {error}"),
+    }
+    inline_img.push_text(" and bundled PNG: ", InlineStyle::default());
+    match ImageAssetId::new(concat!(
+        "data:image/png;base64,",
+        "iVBORw0KGgoAAAANSUhEUgAAAAIAAAABCAIAAAB7QOjdAAAAD0lEQVR4nGO4ppLC0fAEAAlLAsu5bKHnAAAAAElFTkSuQmCC"
+    )) {
+        Ok(asset_id) => {
+            inline_img.push_object(
+                InlineObject::Image {
+                    asset_id,
+                    alt: "Two-color swatch".into(),
+                    width_pt: 56.0,
+                    height_pt: 28.0,
+                    valign: InlineVAlign::Middle,
+                },
+                InlineStyle::default(),
+            );
+        }
+        Err(error) => eprintln!("docs_viewer: invalid swatch source: {error}"),
+    }
     document.add_paragraph(inline_img, BlockStyle::default());
 
     // Section 2: Alignment, lists, blockquotes, and code blocks.
