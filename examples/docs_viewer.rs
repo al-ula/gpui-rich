@@ -17,11 +17,12 @@ use gpui_rich::layout::{InlineBoxMetrics, Insets, pt_to_px};
 use gpui_rich::model::{
     BaselineShift, BlockByteRange, BlockKind, BlockNode, BlockSpec, BlockStyle, BlockWidth,
     ChipKind, ColumnSpec, DecorationContext, DecorationProvider, DecorationWriter, Document, Edges,
-    ExportDocument, FontWeight, HorizontalLayout, ImageAssetId, InlineContent,
-    InlineDecorationStyle, InlineObject, InlineSpec, InlineStyle, InlineVAlign, InteractionPolicy,
-    ListId, ListKind, MarkKind, MarkdownCodec, MermaidData, MermaidSpec, NumberStyle, PaperSpec,
-    RgbaColor, RichCommand, SelectionValue, StyleId, TableBlock, TableBorderStyle, TableCell,
-    TableRow, TextAlign, UnderlineKind, block_shape,
+    EquationBlockData, EquationBlockSpec, ExportDocument, FontWeight, HorizontalLayout,
+    ImageAssetId, InlineContent, InlineDecorationStyle, InlineEquationData, InlineEquationSpec,
+    InlineObject, InlineSpec, InlineStyle, InlineVAlign, InteractionPolicy, ListId, ListKind,
+    MarkKind, MarkdownCodec, MermaidData, MermaidSpec, NumberStyle, PaperSpec, RgbaColor,
+    RichCommand, SelectionValue, StyleId, TableBlock, TableBorderStyle, TableCell, TableRow,
+    TextAlign, UnderlineKind, block_shape,
 };
 use serde::{Deserialize, Serialize};
 
@@ -192,12 +193,11 @@ impl InlineRenderer for StatusBadgeRenderer {
 
     fn measure(&self, data: &StatusBadgeData, zoom: f32, _window: &Window) -> InlineBoxMetrics {
         let font_px = pt_to_px(9.0, zoom);
-        InlineBoxMetrics {
-            width: (data.label.chars().count().max(3) as f32) * font_px * 0.62
-                + pt_to_px(14.0, zoom),
-            height: pt_to_px(16.0, zoom),
-            valign: InlineVAlign::Middle,
-        }
+        InlineBoxMetrics::new(
+            (data.label.chars().count().max(3) as f32) * font_px * 0.62 + pt_to_px(14.0, zoom),
+            pt_to_px(16.0, zoom),
+            InlineVAlign::Middle,
+        )
     }
 
     fn render(
@@ -826,6 +826,10 @@ impl DocsViewerApp {
             #[cfg(feature = "mermaid")]
             if let Err(error) = view.install_mermaid(cx) {
                 eprintln!("docs_viewer: failed to install mermaid extension: {error}");
+            }
+            #[cfg(feature = "equation")]
+            if let Err(error) = view.install_equation(cx) {
+                eprintln!("docs_viewer: failed to install equation extension: {error}");
             }
             if let Err(error) = view.install_emoji(cx) {
                 eprintln!("docs_viewer: failed to install emoji extension: {error}");
@@ -2538,6 +2542,33 @@ fn build_sample_document(assets: &MemoryAssetProvider) -> Document {
             "flowchart LR\n    Doc[Document Tree] --> Flow[FlowLayout]\n    Flow --> Cache[Two-Tier SVG Cache]\n    Cache --> Canvas[GPUI Layer 4 Paint]",
         )
         .with_caption("Built-in Mermaid diagram extension (click a label to edit directly, or switch to Split / Source)"),
+    );
+
+    let mut math_prose = InlineContent::empty();
+    math_prose.push_text(
+        "Built-in LaTeX equations powered by RaTeX align inline formulas such as ",
+        InlineStyle::default(),
+    );
+    math_prose.push_object(
+        InlineObject::custom::<InlineEquationSpec>(InlineEquationData::new(r"e^{i\pi} + 1 = 0")),
+        InlineStyle::default(),
+    );
+    math_prose.push_text(" and ", InlineStyle::default());
+    math_prose.push_object(
+        InlineObject::custom::<InlineEquationSpec>(InlineEquationData::new(r"\frac{a}{b + c_i}")),
+        InlineStyle::default(),
+    );
+    math_prose.push_text(
+        " directly on the prose baseline (click any equation to edit, or type $...$ / $$ ):",
+        InlineStyle::default(),
+    );
+    document.add_paragraph(math_prose, BlockStyle::default());
+
+    document.add_leaf_block::<EquationBlockSpec>(
+        EquationBlockData::new(
+            r"\int_{-\infty}^{\infty} e^{-x^2}\,dx = \sqrt{\pi}, \qquad \sum_{n=1}^{\infty} \frac{1}{n^2} = \frac{\pi^2}{6}",
+        )
+        .with_numbering("1"),
     );
 
     let quote_child_id = document.alloc_block_id();

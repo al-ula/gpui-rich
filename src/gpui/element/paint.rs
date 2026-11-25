@@ -1295,6 +1295,8 @@ fn collect_custom_inlines_in_paragraph(
                                 kind: kind.clone(),
                                 data: data.clone(),
                                 canvas_rect,
+                                font_size_pt: inline_box.font_size_pt,
+                                text_color: inline_box.text_color,
                                 renderer,
                             });
                         }

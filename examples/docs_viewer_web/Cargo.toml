@@ -8,8 +8,9 @@ publish = false
 crate-type = ["cdylib"]
 
 [features]
-default = ["mermaid"]
+default = ["mermaid", "equation"]
 mermaid = ["gpui-rich/mermaid"]
+equation = ["gpui-rich/equation"]
 gpui-fast = ["gpui-rich/gpui-fast", "gpui-kit/gpui-fast"]
 
 [dependencies]

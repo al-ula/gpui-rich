@@ -31,6 +31,10 @@ use crate::model::block::{
     TableBorderStyle, TableCell, TableRow, block_kinds,
 };
 use crate::model::clipboard::ClipboardFragment;
+use crate::model::equation::{
+    EQUATION_BLOCK_KIND, EquationBlockData, EquationBlockSpec, INLINE_EQUATION_KIND,
+    InlineEquationData, InlineEquationSpec,
+};
 use crate::model::inline::{
     ChipKind, ImageAssetId, InlineContent, InlineObject, InlineVAlign, OBJECT_REPLACEMENT_CHAR,
 };
@@ -641,12 +645,16 @@ pub struct MarkdownCodecConfig {
     /// When `true` (default), ```` ```mermaid ```` fenced blocks decode into [`MermaidSpec`] leaf
     /// blocks and [`MermaidSpec`] blocks encode back to standard ```` ```mermaid ```` fences.
     pub mermaid_fences: bool,
+    /// When `true` (default), `$$ ... $$` / ```` ```math ```` blocks and `$ ... $` inline spans
+    /// round-trip with [`EquationBlockSpec`] and [`InlineEquationSpec`].
+    pub math_expressions: bool,
 }
 
 impl Default for MarkdownCodecConfig {
     fn default() -> Self {
         Self {
             mermaid_fences: true,
+            math_expressions: true,
         }
     }
 }
@@ -777,7 +785,7 @@ fn encode_markdown_blocks(
                         output.push('#');
                     }
                     output.push(' ');
-                    output.push_str(&encode_markdown_inline(content));
+                    output.push_str(&encode_markdown_inline(content, config));
                 }
                 block_kinds::LIST_ITEM => {
                     if let Some(item) = block.kind.list_item_data() {
@@ -805,7 +813,7 @@ fn encode_markdown_blocks(
                                 output.push_str(&format!("{counter}. "));
                             }
                         }
-                        output.push_str(&encode_markdown_inline(content));
+                        output.push_str(&encode_markdown_inline(content, config));
                     }
                 }
                 block_kinds::CODE_BLOCK => {
@@ -826,7 +834,7 @@ fn encode_markdown_blocks(
                     output.push_str("```");
                 }
                 block_kinds::PARAGRAPH => {
-                    let rendered = encode_markdown_inline(content);
+                    let rendered = encode_markdown_inline(content, config);
                     for (line_idx, line) in rendered.split('\n').enumerate() {
                         if line_idx > 0 {
                             output.push_str("  \n");
@@ -840,7 +848,7 @@ fn encode_markdown_blocks(
                     let payload = serde_json::to_string(data)
                         .map_err(|error| CodecError::serialize("markdown", error.to_string()))?;
                     output.push_str(&format!("<!-- gpui-rich:{kind} {payload} -->\n"));
-                    let rendered = encode_markdown_inline(content);
+                    let rendered = encode_markdown_inline(content, config);
                     for (line_idx, line) in rendered.split('\n').enumerate() {
                         if line_idx > 0 {
                             output.push_str("  \n");
@@ -868,7 +876,7 @@ fn encode_markdown_blocks(
                 }
             }
             BlockKind::Grid { table, .. } => {
-                encode_markdown_table(table, line_prefix, output);
+                encode_markdown_table(table, line_prefix, config, output);
             }
             BlockKind::Leaf { kind, data } => {
                 if kind.as_ref() == block_kinds::HORIZONTAL_RULE {
@@ -887,6 +895,19 @@ fn encode_markdown_blocks(
                     }
                     output.push_str(line_prefix);
                     output.push_str("```");
+                } else if config.math_expressions
+                    && kind.as_ref() == EQUATION_BLOCK_KIND
+                    && let Ok(equation) = data.try_as_typed::<EquationBlockData>()
+                {
+                    output.push_str(line_prefix);
+                    output.push_str("$$\n");
+                    for line in equation.source.split('\n') {
+                        output.push_str(line_prefix);
+                        output.push_str(line);
+                        output.push('\n');
+                    }
+                    output.push_str(line_prefix);
+                    output.push_str("$$");
                 } else {
                     output.push_str(line_prefix);
                     let payload = serde_json::to_string(data)
@@ -899,7 +920,12 @@ fn encode_markdown_blocks(
     Ok(())
 }
 
-fn encode_markdown_table(table: &TableBlock, line_prefix: &str, output: &mut String) {
+fn encode_markdown_table(
+    table: &TableBlock,
+    line_prefix: &str,
+    config: MarkdownCodecConfig,
+    output: &mut String,
+) {
     if table.rows.is_empty() {
         return;
     }
@@ -932,7 +958,7 @@ fn encode_markdown_table(table: &TableBlock, line_prefix: &str, output: &mut Str
                         .blocks
                         .iter()
                         .filter_map(|block| block.kind.inline_content())
-                        .map(encode_markdown_inline)
+                        .map(|inline| encode_markdown_inline(inline, config))
                         .collect();
                     Some((joined.join("<br>").replace('|', "\\|"), align))
                 })
@@ -970,7 +996,7 @@ fn encode_markdown_table(table: &TableBlock, line_prefix: &str, output: &mut Str
     }
 }
 
-fn encode_markdown_inline(content: &InlineContent) -> String {
+fn encode_markdown_inline(content: &InlineContent, config: MarkdownCodecConfig) -> String {
     if content.is_empty() {
         return String::new();
     }
@@ -999,8 +1025,21 @@ fn encode_markdown_inline(content: &InlineContent) -> String {
                     InlineObject::FootnoteRef { index } => {
                         inner.push_str(&format!("[^{index}]"));
                     }
-                    InlineObject::Custom { kind, .. } => {
-                        inner.push_str(&format!("[{kind}]"));
+                    InlineObject::Custom { kind, data } => {
+                        if config.math_expressions
+                            && kind.as_ref() == INLINE_EQUATION_KIND
+                            && let Ok(equation) = data.try_as_typed::<InlineEquationData>()
+                        {
+                            let single_line = equation
+                                .source
+                                .replace("\r\n", " ")
+                                .replace(['\n', '\r'], " ");
+                            inner.push('$');
+                            inner.push_str(single_line.trim());
+                            inner.push('$');
+                        } else {
+                            inner.push_str(&format!("[{kind}]"));
+                        }
                     }
                 }
             } else {
@@ -1096,6 +1135,55 @@ fn parse_markdown_blocks(
             continue;
         }
 
+        // Display math block (`$$ ... $$`).
+        if config.math_expressions && trimmed.starts_with("$$") {
+            active_list_id = None;
+            let after_open = trimmed.get(2..).unwrap_or("");
+            if let Some(single_line_inner) = after_open.strip_suffix("$$")
+                && !single_line_inner.trim().is_empty()
+            {
+                let id = document.alloc_block_id();
+                blocks.push(BlockNode::new(
+                    id,
+                    BlockKind::leaf::<EquationBlockSpec>(EquationBlockData::new(
+                        single_line_inner.trim(),
+                    )),
+                    BlockStyle {
+                        space_before_pt: Some(8.0),
+                        space_after_pt: Some(10.0),
+                        ..BlockStyle::default()
+                    },
+                ));
+                index += 1;
+                continue;
+            }
+            if after_open.trim().is_empty() {
+                index += 1;
+                let mut math_lines = Vec::new();
+                while index < lines.len() {
+                    if lines[index].trim() == "$$" {
+                        index += 1;
+                        break;
+                    }
+                    math_lines.push(lines[index]);
+                    index += 1;
+                }
+                let id = document.alloc_block_id();
+                blocks.push(BlockNode::new(
+                    id,
+                    BlockKind::leaf::<EquationBlockSpec>(EquationBlockData::new(
+                        math_lines.join("\n"),
+                    )),
+                    BlockStyle {
+                        space_before_pt: Some(8.0),
+                        space_after_pt: Some(10.0),
+                        ..BlockStyle::default()
+                    },
+                ));
+                continue;
+            }
+        }
+
         // Fenced code blocks (``` or ~~~).
         if let Some((fence_char, fence_len, language)) = parse_code_fence_open(trimmed) {
             active_list_id = None;
@@ -1121,6 +1209,20 @@ fn parse_markdown_blocks(
                     BlockKind::leaf::<MermaidSpec>(MermaidData::new(code_body)),
                     BlockStyle {
                         space_before_pt: Some(6.0),
+                        space_after_pt: Some(10.0),
+                        ..BlockStyle::default()
+                    },
+                ));
+            } else if config.math_expressions
+                && language
+                    .as_deref()
+                    .is_some_and(|lang| lang.eq_ignore_ascii_case("math"))
+            {
+                blocks.push(BlockNode::new(
+                    id,
+                    BlockKind::leaf::<EquationBlockSpec>(EquationBlockData::new(code_body)),
+                    BlockStyle {
+                        space_before_pt: Some(8.0),
                         space_after_pt: Some(10.0),
                         ..BlockStyle::default()
                     },
@@ -1156,7 +1258,7 @@ fn parse_markdown_blocks(
         if let Some((level, text)) = parse_atx_heading(trimmed) {
             active_list_id = None;
             let id = document.alloc_block_id();
-            let content = parse_markdown_inline(text);
+            let content = parse_markdown_inline(text, config);
             blocks.push(BlockNode::new(
                 id,
                 BlockKind::heading(level, false, content),
@@ -1216,6 +1318,7 @@ fn parse_markdown_blocks(
                 &alignments,
                 col_count,
                 true,
+                config,
                 document,
             ));
             index += 2;
@@ -1230,6 +1333,7 @@ fn parse_markdown_blocks(
                     &alignments,
                     col_count,
                     false,
+                    config,
                     document,
                 ));
                 index += 1;
@@ -1271,7 +1375,7 @@ fn parse_markdown_blocks(
                     kind,
                     indent_level,
                     checked,
-                    parse_markdown_inline(body),
+                    parse_markdown_inline(body, config),
                 ),
                 style,
             ));
@@ -1287,7 +1391,8 @@ fn parse_markdown_blocks(
             let current_trimmed = current.trim();
             if current_trimmed.is_empty()
                 || (!paragraph_lines.is_empty()
-                    && (parse_code_fence_open(current_trimmed).is_some()
+                    && ((config.math_expressions && current_trimmed.starts_with("$$"))
+                        || parse_code_fence_open(current_trimmed).is_some()
                         || is_horizontal_rule(current_trimmed)
                         || parse_atx_heading(current_trimmed).is_some()
                         || current_trimmed.starts_with('>')
@@ -1313,7 +1418,7 @@ fn parse_markdown_blocks(
         let id = document.alloc_block_id();
         blocks.push(BlockNode::new(
             id,
-            BlockKind::paragraph(parse_markdown_inline(&joined)),
+            BlockKind::paragraph(parse_markdown_inline(&joined, config)),
             BlockStyle::default(),
         ));
     }
@@ -1499,6 +1604,7 @@ fn build_markdown_table_row(
     alignments: &[TextAlign],
     col_count: usize,
     is_header: bool,
+    config: MarkdownCodecConfig,
     document: &mut Document,
 ) -> TableRow {
     let mut cells = Vec::with_capacity(col_count);
@@ -1508,7 +1614,7 @@ fn build_markdown_table_row(
         let cell_id = document.alloc_block_id();
         let para_id = document.alloc_block_id();
         let normalized = raw.replace("<br>", "\n").replace("<br/>", "\n");
-        let content = parse_markdown_inline(&normalized);
+        let content = parse_markdown_inline(&normalized, config);
         cells.push(TableCell::simple(
             cell_id,
             vec![BlockNode::new(
@@ -1521,13 +1627,63 @@ fn build_markdown_table_row(
     TableRow { is_header, cells }
 }
 
-fn parse_markdown_inline(input: &str) -> InlineContent {
+fn parse_markdown_inline(input: &str, config: MarkdownCodecConfig) -> InlineContent {
     let mut output = InlineContent::empty();
-    parse_markdown_inline_into(input, &InlineStyle::default(), &mut output);
+    parse_markdown_inline_into(input, &InlineStyle::default(), config, &mut output);
     output
 }
 
-fn parse_markdown_inline_into(input: &str, active_style: &InlineStyle, output: &mut InlineContent) {
+fn parse_markdown_inline_math(rest: &str) -> Option<(&str, usize)> {
+    if !rest.starts_with('$') || rest.starts_with("$$") {
+        return None;
+    }
+    let after_open = rest.get(1..)?;
+    let first_char = after_open.chars().next()?;
+    if first_char.is_whitespace() || first_char == '$' {
+        return None;
+    }
+
+    let bytes = after_open.as_bytes();
+    let mut offset = 0usize;
+    let mut escaped = false;
+    while offset < bytes.len() {
+        let byte = bytes[offset];
+        if escaped {
+            escaped = false;
+            offset += 1;
+            continue;
+        }
+        if byte == b'\\' {
+            escaped = true;
+            offset += 1;
+            continue;
+        }
+        if byte == b'$' {
+            // Reject double-dollar inside inline math and trailing whitespace before closing `$`.
+            if bytes.get(offset + 1) == Some(&b'$') {
+                return None;
+            }
+            let inner = after_open.get(..offset)?;
+            if inner.is_empty() || inner.chars().last().is_some_and(char::is_whitespace) {
+                return None;
+            }
+            // Reject currency-like `$5 and $10` where the closing `$` is immediately followed by a digit.
+            if bytes.get(offset + 1).is_some_and(u8::is_ascii_digit) {
+                return None;
+            }
+            return Some((inner, offset + 2));
+        }
+        offset += 1;
+    }
+    None
+}
+
+fn parse_markdown_inline_into(
+    input: &str,
+    active_style: &InlineStyle,
+    config: MarkdownCodecConfig,
+    output: &mut InlineContent,
+) {
     let bytes = input.as_bytes();
     let mut cursor = 0usize;
     let mut plain_buffer = String::new();
@@ -1562,6 +1718,20 @@ fn parse_markdown_inline_into(input: &str, active_style: &InlineStyle, output: &
             let code_style = active_style.merge(&InlineStyle::code());
             output.push_text(code_text, code_style);
             cursor += close_rel + 2;
+            continue;
+        }
+
+        // Inline LaTeX math span: `$...$`.
+        if config.math_expressions
+            && bytes[cursor] == b'$'
+            && let Some((math_source, consumed)) = parse_markdown_inline_math(rest)
+        {
+            flush_plain(&mut plain_buffer, output);
+            output.push_object(
+                InlineObject::custom::<InlineEquationSpec>(InlineEquationData::new(math_source)),
+                active_style.clone(),
+            );
+            cursor += consumed;
             continue;
         }
 
@@ -1602,7 +1772,7 @@ fn parse_markdown_inline_into(input: &str, active_style: &InlineStyle, output: &
         {
             flush_plain(&mut plain_buffer, output);
             let link_style = active_style.merge(&InlineStyle::default().with_link(href));
-            parse_markdown_inline_into(label, &link_style, output);
+            parse_markdown_inline_into(label, &link_style, config, output);
             cursor += consumed;
             continue;
         }
@@ -1611,7 +1781,7 @@ fn parse_markdown_inline_into(input: &str, active_style: &InlineStyle, output: &
         if let Some((tag_inner, consumed, overlay)) = parse_inline_html_tag(rest) {
             flush_plain(&mut plain_buffer, output);
             let next_style = active_style.merge(&overlay);
-            parse_markdown_inline_into(tag_inner, &next_style, output);
+            parse_markdown_inline_into(tag_inner, &next_style, config, output);
             cursor += consumed;
             continue;
         }
@@ -1622,7 +1792,7 @@ fn parse_markdown_inline_into(input: &str, active_style: &InlineStyle, output: &
         {
             flush_plain(&mut plain_buffer, output);
             let next_style = active_style.merge(&InlineStyle::bold());
-            parse_markdown_inline_into(inner, &next_style, output);
+            parse_markdown_inline_into(inner, &next_style, config, output);
             cursor += consumed;
             continue;
         }
@@ -1633,7 +1803,7 @@ fn parse_markdown_inline_into(input: &str, active_style: &InlineStyle, output: &
         {
             flush_plain(&mut plain_buffer, output);
             let next_style = active_style.merge(&InlineStyle::default().with_strikethrough(true));
-            parse_markdown_inline_into(inner, &next_style, output);
+            parse_markdown_inline_into(inner, &next_style, config, output);
             cursor += consumed;
             continue;
         }
@@ -1646,7 +1816,7 @@ fn parse_markdown_inline_into(input: &str, active_style: &InlineStyle, output: &
         {
             flush_plain(&mut plain_buffer, output);
             let next_style = active_style.merge(&InlineStyle::italic());
-            parse_markdown_inline_into(inner, &next_style, output);
+            parse_markdown_inline_into(inner, &next_style, config, output);
             cursor += consumed;
             continue;
         }

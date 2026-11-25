@@ -46,11 +46,11 @@ impl InlineRenderer for StatusBadgeRenderer {
     type Spec = StatusBadgeSpec;
 
     fn measure(&self, data: &StatusBadgeData, zoom: f32, _window: &Window) -> InlineBoxMetrics {
-        InlineBoxMetrics {
-            width: ((data.label.len() as f32) * 7.0 + 16.0) * zoom,
-            height: 18.0 * zoom,
-            valign: InlineVAlign::Middle,
-        }
+        InlineBoxMetrics::new(
+            ((data.label.len() as f32) * 7.0 + 16.0) * zoom,
+            18.0 * zoom,
+            InlineVAlign::Middle,
+        )
     }
 
     fn render(
@@ -93,11 +93,7 @@ impl InlineRenderer for TagPillRenderer {
     type Spec = TagPillSpec;
 
     fn measure(&self, _data: &TagPillData, zoom: f32, _window: &Window) -> InlineBoxMetrics {
-        InlineBoxMetrics {
-            width: 48.0 * zoom,
-            height: 18.0 * zoom,
-            valign: InlineVAlign::Middle,
-        }
+        InlineBoxMetrics::new(48.0 * zoom, 18.0 * zoom, InlineVAlign::Middle)
     }
 }
 

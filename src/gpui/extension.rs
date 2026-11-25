@@ -86,8 +86,8 @@ use crate::model::{
     CommandEffectKind, CommandResolution, CustomPayload, DROPDOWN_KIND, Document,
     DocumentSelection, Edit, ExtensionCommand, ExtensionInvocation, ExtensionQuery,
     FOOTNOTE_BODY_KIND, FOOTNOTE_REFERENCE_KIND, HistoryMergeGroup, InlineObjectId, InlineSpec,
-    InlineVAlign, InteractionPolicy, ListId, PLACEHOLDER_KIND, QueryError, ReadOnly, RichCommand,
-    SearchState, SharedStr, Transaction, VARIABLE_KIND, block_kinds,
+    InlineVAlign, InteractionPolicy, ListId, PLACEHOLDER_KIND, QueryError, ReadOnly, RgbaColor,
+    RichCommand, SearchState, SharedStr, Transaction, VARIABLE_KIND, block_kinds,
 };
 use gpui_kit::{AnyElement, App, Bounds, Context, Pixels, Window};
 use std::any::{Any, TypeId};
@@ -120,6 +120,16 @@ pub struct BlockRenderContext<'render, T> {
     pub theme: &'render RichTheme,
 }
 
+/// Typed context passed to [`InlineRenderer::measure_with_context`].
+pub struct InlineMeasureContext<'measure, T> {
+    pub block_id: Option<BlockId>,
+    pub object_id: InlineObjectId,
+    pub data: &'measure T,
+    pub font_size_pt: f32,
+    pub text_color: RgbaColor,
+    pub zoom: f32,
+}
+
 /// Typed context passed to [`InlineRenderer::render`].
 pub struct InlineRenderContext<'render, T> {
     pub block_id: BlockId,
@@ -127,6 +137,8 @@ pub struct InlineRenderContext<'render, T> {
     pub kind: &'render str,
     pub data: &'render T,
     pub bounds: Bounds<Pixels>,
+    pub font_size_pt: f32,
+    pub text_color: RgbaColor,
     pub zoom: f32,
     pub theme: &'render RichTheme,
 }
@@ -198,11 +210,22 @@ pub trait InlineRenderer: 'static {
         zoom: f32,
         _window: &Window,
     ) -> InlineBoxMetrics {
-        InlineBoxMetrics {
-            width: pt_to_px(72.0, zoom),
-            height: pt_to_px(18.0, zoom),
-            valign: InlineVAlign::Middle,
-        }
+        InlineBoxMetrics::new(
+            pt_to_px(72.0, zoom),
+            pt_to_px(18.0, zoom),
+            InlineVAlign::Middle,
+        )
+    }
+
+    /// Measures a custom inline object with owning block, object ID, and surrounding text style.
+    ///
+    /// Defaults to calling [`Self::measure`].
+    fn measure_with_context(
+        &self,
+        context: InlineMeasureContext<'_, <Self::Spec as InlineSpec>::Data>,
+        window: &Window,
+    ) -> InlineBoxMetrics {
+        self.measure(context.data, context.zoom, window)
     }
 
     /// Produces a hosted GPUI [`AnyElement`] or direct paint callback for a visible inline object.
@@ -590,12 +613,23 @@ pub(crate) struct ErasedBlockRenderContext<'a> {
     pub(crate) theme: &'a RichTheme,
 }
 
+pub(crate) struct ErasedInlineMeasureContext<'a> {
+    pub(crate) block_id: Option<BlockId>,
+    pub(crate) object_id: InlineObjectId,
+    pub(crate) data: &'a CustomPayload,
+    pub(crate) font_size_pt: f32,
+    pub(crate) text_color: RgbaColor,
+    pub(crate) zoom: f32,
+}
+
 pub(crate) struct ErasedInlineRenderContext<'a> {
     pub(crate) block_id: BlockId,
     pub(crate) object_id: InlineObjectId,
     pub(crate) kind: &'a str,
     pub(crate) data: &'a CustomPayload,
     pub(crate) bounds: Bounds<Pixels>,
+    pub(crate) font_size_pt: f32,
+    pub(crate) text_color: RgbaColor,
     pub(crate) zoom: f32,
     pub(crate) theme: &'a RichTheme,
 }
@@ -749,8 +783,7 @@ pub(crate) trait ErasedInlineRenderer {
     fn clear_cache(&self);
     fn measure(
         &self,
-        data: &CustomPayload,
-        zoom: f32,
+        context: ErasedInlineMeasureContext<'_>,
         window: &Window,
     ) -> InlineCallbackResult<InlineBoxMetrics>;
     fn render(
@@ -784,14 +817,22 @@ impl<R: InlineRenderer> ErasedInlineRenderer for InlineRendererAdapter<R> {
 
     fn measure(
         &self,
-        data: &CustomPayload,
-        zoom: f32,
+        context: ErasedInlineMeasureContext<'_>,
         window: &Window,
     ) -> InlineCallbackResult<InlineBoxMetrics> {
-        match self
-            .cache
-            .with_resolved(data, |typed| self.renderer.measure(typed, zoom, window))
-        {
+        match self.cache.with_resolved(context.data, |typed| {
+            self.renderer.measure_with_context(
+                InlineMeasureContext {
+                    block_id: context.block_id,
+                    object_id: context.object_id,
+                    data: typed,
+                    font_size_pt: context.font_size_pt,
+                    text_color: context.text_color,
+                    zoom: context.zoom,
+                },
+                window,
+            )
+        }) {
             Ok(metrics) => InlineCallbackResult::Ok(metrics),
             Err(message) => {
                 InlineCallbackResult::Invalid(ExtensionDiagnosticKind::InvalidPayload { message })
@@ -813,6 +854,8 @@ impl<R: InlineRenderer> ErasedInlineRenderer for InlineRendererAdapter<R> {
                     kind: context.kind,
                     data: typed,
                     bounds: context.bounds,
+                    font_size_pt: context.font_size_pt,
+                    text_color: context.text_color,
                     zoom: context.zoom,
                     theme: context.theme,
                 },

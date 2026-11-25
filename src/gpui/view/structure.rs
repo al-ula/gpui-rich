@@ -1,7 +1,11 @@
 //! Structural editing glue and reversible typed-list input rules.
 
 use super::*;
-use crate::model::{ListId, StructureCommand};
+use crate::model::{
+    EQUATION_BLOCK_KIND, EquationBlockData, EquationBlockSpec, EquationViewMode,
+    INLINE_EQUATION_KIND, InlineEquationData, InlineEquationSpec, ListId, OBJECT_REPLACEMENT_CHAR,
+    OBJECT_REPLACEMENT_UTF8_LEN, SetEquationViewMode, StructureCommand, block_kinds,
+};
 
 /// Pending marker conversion, retained only until immediate Backspace or invalidated by other input.
 #[derive(Clone, Debug)]
@@ -42,6 +46,25 @@ pub(super) fn recognize_typed_list_prefix(text: &str) -> Option<TypedListPrefix>
     })
 }
 
+fn find_inline_equation_open_dollar(prefix: &str) -> Option<usize> {
+    let bytes = prefix.as_bytes();
+    let mut index = bytes.len();
+    while index > 0 {
+        index -= 1;
+        if bytes[index] == b'\n' {
+            return None;
+        }
+        if bytes[index] == b'$' {
+            let escaped = index > 0 && bytes[index - 1] == b'\\';
+            let preceded_by_dollar = index > 0 && bytes[index - 1] == b'$';
+            if !escaped && !preceded_by_dollar {
+                return Some(index);
+            }
+        }
+    }
+    None
+}
+
 impl RichDocumentView {
     /// Executes a structural command through the normal transaction/history/layout path.
     pub(super) fn execute_structure_command(
@@ -68,6 +91,9 @@ impl RichDocumentView {
     /// Called before ordinary text insertion; a successful conversion consumes `raw_text`.
     pub(super) fn try_apply_input_rule(&mut self, raw_text: &str, cx: &mut Context<Self>) -> bool {
         self.pending_input_rule_undo = None;
+        if raw_text == "$" {
+            return self.try_apply_inline_equation_input_rule(cx);
+        }
         if raw_text != " " {
             return false;
         }
@@ -91,6 +117,36 @@ impl RichDocumentView {
         };
         if focus.offset != inline.len() {
             return false;
+        }
+        if inline.text == "$$"
+            && inline.objects.is_empty()
+            && self.extensions.has_block(EQUATION_BLOCK_KIND)
+        {
+            let before = self.selection.clone();
+            let steps = vec![
+                Step::SetBlockKind {
+                    block_id,
+                    kind: BlockKind::leaf::<EquationBlockSpec>(EquationBlockData::new("")),
+                },
+                Step::SetBlockStyle {
+                    block_id,
+                    style: BlockStyle {
+                        space_before_pt: Some(8.0),
+                        space_after_pt: Some(10.0),
+                        ..BlockStyle::default()
+                    },
+                },
+            ];
+            let transaction = Transaction::new(steps).with_selections(before, None);
+            self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
+            self.dispatch_extension_command(
+                SetEquationViewMode {
+                    block_id,
+                    mode: EquationViewMode::Edit,
+                },
+                cx,
+            );
+            return true;
         }
         let mut original_content = inline.clone();
         let mut trigger = inline.text.clone();
@@ -133,6 +189,75 @@ impl RichDocumentView {
             list_id,
             list_kind: prefix.kind,
         });
+        true
+    }
+
+    fn try_apply_inline_equation_input_rule(&mut self, cx: &mut Context<Self>) -> bool {
+        if !self.policy.editing.inline_objects || !self.extensions.has_inline(INLINE_EQUATION_KIND)
+        {
+            return false;
+        }
+        let Some((anchor, focus, _)) = self.active_text_selection() else {
+            return false;
+        };
+        if anchor != focus {
+            return false;
+        }
+        let Some(block_id) = focus.leaf_block_id() else {
+            return false;
+        };
+        let Some(block) = self.document.find_block(block_id) else {
+            return false;
+        };
+        if block.kind.semantic_kind() == block_kinds::CODE_BLOCK {
+            return false;
+        }
+        let Some(inline) = block.kind.inline_content() else {
+            return false;
+        };
+        let Some(prefix) = inline.text.get(..focus.offset) else {
+            return false;
+        };
+        let Some(open_pos) = find_inline_equation_open_dollar(prefix) else {
+            return false;
+        };
+        let Some(inner) = prefix.get((open_pos + 1)..) else {
+            return false;
+        };
+        if inner.is_empty()
+            || inner.starts_with(char::is_whitespace)
+            || inner.ends_with(char::is_whitespace)
+            || inner.contains('\n')
+            || inner.contains(OBJECT_REPLACEMENT_CHAR)
+        {
+            return false;
+        }
+
+        let inherited_style = inline.style_at_caret(open_pos);
+        let mut replacement = InlineContent::empty();
+        replacement.push_object(
+            InlineObject::custom::<InlineEquationSpec>(InlineEquationData::new(inner)),
+            inherited_style,
+        );
+        let before = self.selection.clone();
+        let after_offset = open_pos + OBJECT_REPLACEMENT_UTF8_LEN;
+        let after = self
+            .document
+            .doc_pos_for_block(block_id, after_offset)
+            .map(|pos| DocumentSelection::caret(pos, Affinity::Downstream));
+        let transaction = Transaction::new(vec![
+            Step::DeleteRange {
+                block_id,
+                range: open_pos..focus.offset,
+            },
+            Step::InsertContent {
+                block_id,
+                offset: open_pos,
+                content: replacement,
+            },
+        ])
+        .with_selections(before, after);
+        self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
         true
     }
 

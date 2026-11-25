@@ -269,11 +269,7 @@ fn custom_block_and_inline_object_measure_via_shaper() {
 
         fn measure_inline_object(&mut self, object: &InlineObject, zoom: f32) -> InlineBoxMetrics {
             if object.read_data::<BadgeSpec>().is_ok() {
-                return InlineBoxMetrics {
-                    width: 64.0 * zoom,
-                    height: 20.0 * zoom,
-                    valign: InlineVAlign::Middle,
-                };
+                return InlineBoxMetrics::new(64.0 * zoom, 20.0 * zoom, InlineVAlign::Middle);
             }
             MockShaper.measure_inline_object(object, zoom)
         }
@@ -371,11 +367,7 @@ fn invalid_custom_metrics_fall_back_and_large_table_culls_offscreen_leaves() {
             MockShaper.shape_segment(text, font_size_px, runs)
         }
         fn measure_inline_object(&mut self, _obj: &InlineObject, _zoom: f32) -> InlineBoxMetrics {
-            InlineBoxMetrics {
-                width: f32::NAN,
-                height: -10.0,
-                valign: InlineVAlign::Middle,
-            }
+            InlineBoxMetrics::new(f32::NAN, -10.0, InlineVAlign::Middle)
         }
         fn measure_custom_block(
             &mut self,
@@ -858,4 +850,72 @@ fn flow_invalidate_block_remeasures_custom_leaf_without_version_bump() {
     assert_eq!(doc.blocks[0].version, initial_version);
     assert!((second[0].layout.height - 280.0).abs() < 0.01);
     assert!((second_trailing_y - first_trailing_y - 160.0).abs() < 0.5);
+}
+
+#[test]
+fn inline_box_baseline_depth_aligns_below_baseline_and_expands_descent() {
+    use gpui_rich::model::{InlineEquationData, InlineEquationSpec};
+
+    struct EquationMetricShaper;
+
+    impl TextShaper for EquationMetricShaper {
+        type Backend = MockBackend;
+
+        fn shape_segment(
+            &mut self,
+            text: &str,
+            font_size_px: f32,
+            runs: &[ShaperRunSpec],
+        ) -> ShapedSegment<Self::Backend> {
+            MockShaper.shape_segment(text, font_size_px, runs)
+        }
+
+        fn measure_inline_object(&mut self, obj: &InlineObject, zoom: f32) -> InlineBoxMetrics {
+            if obj.read_data::<InlineEquationSpec>().is_ok() {
+                return InlineBoxMetrics::baseline_with_depth(40.0 * zoom, 22.0 * zoom, 8.0 * zoom);
+            }
+            MockShaper.measure_inline_object(obj, zoom)
+        }
+    }
+
+    let mut content = InlineContent::empty();
+    content.push_text("Value ", InlineStyle::default());
+    content.push_object(
+        InlineObject::custom::<InlineEquationSpec>(InlineEquationData::new(r"\frac{a}{b}")),
+        InlineStyle::default(),
+    );
+    content.push_text(" end", InlineStyle::default());
+
+    let sheet = StyleSheet::default();
+    let config = DocumentLayoutConfig::default();
+    let mut shaper = EquationMetricShaper;
+    let paragraph = layout_paragraph(
+        &content,
+        &BlockStyle::default(),
+        &sheet,
+        &config,
+        400.0,
+        1.0,
+        &mut shaper,
+    );
+    assert_eq!(paragraph.lines.len(), 1);
+    let line = &paragraph.lines[0];
+    let eq_box = line
+        .fragments
+        .iter()
+        .find_map(|fragment| match fragment {
+            LineFragment::InlineBox(inline_box) => Some(inline_box),
+            _ => None,
+        })
+        .expect("inline equation box fragment");
+
+    let rect = line.inline_box_rect(eq_box);
+    assert!((line.ascent - 14.0).abs() < 0.5, "ascent={}", line.ascent);
+    assert!((line.descent - 8.0).abs() < 0.5, "descent={}", line.descent);
+    assert!(
+        (rect.bottom() - (line.baseline_y + 8.0)).abs() < 0.01,
+        "rect bottom {} should sit depth=8px below baseline {}",
+        rect.bottom(),
+        line.baseline_y
+    );
 }

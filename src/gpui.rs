@@ -10,6 +10,7 @@ pub mod asset;
 pub mod completion;
 pub mod element;
 pub mod emoji;
+pub mod equation;
 pub mod extension;
 pub mod mermaid;
 pub mod overlay;
@@ -33,11 +34,12 @@ pub use emoji::{
     EMOJI_PICKER_OVERLAY_ID, EmojiCategory, EmojiConfig, EmojiEntry, EmojiExtension,
     OpenEmojiPicker, default_emoji_catalog,
 };
+pub use equation::{EquationConfig, EquationExtension, INLINE_EQUATION_EDITOR_OVERLAY_ID};
 pub use extension::{
     BlockRenderContext, BlockRenderer, CustomRenderOutput, DirectPaintCallback, EditCommandContext,
     ExtensionDiagnostic, ExtensionDiagnosticKind, ExtensionNamespace, ExtensionNodeTarget,
-    ExtensionPlugin, ExtensionRegistrationError, ExtensionRegistry, InlineRenderContext,
-    InlineRenderer, QueryContext, ReadCommandContext, ReadCommandOutcome,
+    ExtensionPlugin, ExtensionRegistrationError, ExtensionRegistry, InlineMeasureContext,
+    InlineRenderContext, InlineRenderer, QueryContext, ReadCommandContext, ReadCommandOutcome,
 };
 pub use mermaid::{MermaidConfig, MermaidExtension};
 pub use overlay::{

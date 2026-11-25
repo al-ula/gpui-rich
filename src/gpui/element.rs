@@ -109,6 +109,8 @@ struct PendingCustomInline {
     kind: SharedStr,
     data: CustomPayload,
     canvas_rect: Rect,
+    font_size_pt: f32,
+    text_color: RgbaColor,
     renderer: Rc<dyn ErasedInlineRenderer>,
 }
 
@@ -852,6 +854,8 @@ impl Element for RichDocumentElement {
                     kind: &custom_inline.kind,
                     data: &custom_inline.data,
                     bounds: node_bounds,
+                    font_size_pt: custom_inline.font_size_pt,
+                    text_color: custom_inline.text_color,
                     zoom,
                     theme: &theme,
                 },

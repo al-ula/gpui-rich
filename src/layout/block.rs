@@ -1,5 +1,5 @@
 use crate::layout::geometry::{Insets, Point, Rect, pt_to_px};
-use crate::layout::line::{HitResult, ParagraphLayout, layout_paragraph};
+use crate::layout::line::{HitResult, ParagraphLayout, layout_paragraph_for_block};
 use crate::layout::shaper::{
     GlyphBackend, TextShaper, is_valid_custom_insets, is_valid_custom_size,
 };
@@ -363,7 +363,8 @@ pub fn layout_block<S: TextShaper>(
             content,
         } => match kind.as_ref() {
             block_kinds::PARAGRAPH => {
-                let para = layout_paragraph(
+                let para = layout_paragraph_for_block(
+                    Some(block.id),
                     content,
                     &block.style,
                     sheet,
@@ -391,7 +392,8 @@ pub fn layout_block<S: TextShaper>(
                         level: 1,
                         collapsed: false,
                     });
-                let para = layout_paragraph(
+                let para = layout_paragraph_for_block(
+                    Some(block.id),
                     content,
                     &block.style,
                     sheet,
@@ -438,7 +440,8 @@ pub fn layout_block<S: TextShaper>(
                         indent_level: 0,
                         checked: None,
                     });
-                let para = layout_paragraph(
+                let para = layout_paragraph_for_block(
+                    Some(block.id),
                     content,
                     &block.style,
                     sheet,
@@ -492,8 +495,16 @@ pub fn layout_block<S: TextShaper>(
                 let pad_y = pt_to_px(10.0, zoom);
                 let header_h = pt_to_px(20.0, zoom);
                 let inner_w = (max_width - 2.0 * pad_x).max(40.0);
-                let para =
-                    layout_paragraph(content, &block.style, sheet, config, inner_w, zoom, shaper);
+                let para = layout_paragraph_for_block(
+                    Some(block.id),
+                    content,
+                    &block.style,
+                    sheet,
+                    config,
+                    inner_w,
+                    zoom,
+                    shaper,
+                );
                 let total_h = header_h + para.height + 2.0 * pad_y;
                 let button_w = pt_to_px(44.0, zoom);
                 let button_h = pt_to_px(15.0, zoom);
@@ -528,8 +539,16 @@ pub fn layout_block<S: TextShaper>(
                     Insets::xy(pt_to_px(12.0, zoom), pt_to_px(8.0, zoom))
                 };
                 let inner_w = (max_width - chrome.horizontal()).max(40.0);
-                let para =
-                    layout_paragraph(content, &block.style, sheet, config, inner_w, zoom, shaper);
+                let para = layout_paragraph_for_block(
+                    Some(block.id),
+                    content,
+                    &block.style,
+                    sheet,
+                    config,
+                    inner_w,
+                    zoom,
+                    shaper,
+                );
                 let total_h = (chrome.top + para.height + chrome.bottom).max(1.0);
                 BlockLayout {
                     id: block.id,

@@ -1932,6 +1932,7 @@ fn mermaid_spec_markdown_roundtrip_and_svg_dimensions() {
     // Opt-out config keeps fenced mermaid blocks as plain CodeBlock nodes.
     let plain_codec = MarkdownCodec::with_config(MarkdownCodecConfig {
         mermaid_fences: false,
+        ..MarkdownCodecConfig::default()
     });
     let plain_doc = plain_codec
         .decode_raw(markdown)
@@ -2064,4 +2065,144 @@ fn mermaid_spec_markdown_roundtrip_and_svg_dimensions() {
             Some("sequenceDiagram\nparticipant A as Client\nAlice->>Bob: Hello")
         );
     }
+}
+
+#[test]
+fn markdown_codec_roundtrips_equations_and_preserves_currency() {
+    use gpui_rich::model::{
+        DocumentCodec, EncodedDocument, EquationBlockData, EquationBlockSpec, InlineEquationData,
+        InlineEquationSpec, MarkdownCodec, MarkdownCodecConfig, MarkdownFormat,
+    };
+
+    let markdown = "Euler's identity $e^{i\\pi} + 1 = 0$ costs $5 and $10.\n\n$$\n\\int_0^1 x^2\\,dx = \\frac{1}{3}\n$$\n\n```math\n\\sum_{k=1}^n k\n```";
+    let decoded = MarkdownCodec
+        .decode(&EncodedDocument::<MarkdownFormat>::from_raw(markdown))
+        .expect("decode markdown with math");
+    assert_eq!(decoded.blocks.len(), 3);
+
+    let first_inline = decoded.blocks[0].kind.inline_content().expect("paragraph");
+    assert_eq!(first_inline.objects.len(), 1);
+    let inline_data = first_inline.objects[0]
+        .object
+        .read_data::<InlineEquationSpec>()
+        .expect("inline equation");
+    assert_eq!(inline_data.source, r"e^{i\pi} + 1 = 0");
+    assert!(first_inline.text.contains("costs $5 and $10."));
+
+    let display_data = decoded.blocks[1]
+        .kind
+        .read_data::<EquationBlockSpec>()
+        .expect("display equation block");
+    assert_eq!(display_data.source, r"\int_0^1 x^2\,dx = \frac{1}{3}");
+
+    let fenced_math = decoded.blocks[2]
+        .kind
+        .read_data::<EquationBlockSpec>()
+        .expect("fenced math block");
+    assert_eq!(fenced_math.source, r"\sum_{k=1}^n k");
+
+    let encoded = MarkdownCodec.encode(&decoded).expect("encode markdown");
+    let redecoded = MarkdownCodec.decode(&encoded).expect("redecode markdown");
+    assert_eq!(redecoded.blocks.len(), 3);
+    assert_eq!(
+        redecoded.blocks[1]
+            .kind
+            .read_data::<EquationBlockSpec>()
+            .expect("roundtripped display block")
+            .source,
+        r"\int_0^1 x^2\,dx = \frac{1}{3}"
+    );
+    assert_eq!(
+        redecoded.blocks[0]
+            .kind
+            .inline_content()
+            .expect("roundtripped para")
+            .objects[0]
+            .object
+            .read_data::<InlineEquationSpec>()
+            .expect("roundtripped inline equation")
+            .source,
+        r"e^{i\pi} + 1 = 0"
+    );
+
+    // Opting out keeps `$...$` and `$$` as plain text / code blocks.
+    let disabled = MarkdownCodec::with_config(MarkdownCodecConfig {
+        mermaid_fences: true,
+        math_expressions: false,
+    });
+    let plain = disabled
+        .decode(&EncodedDocument::<MarkdownFormat>::from_raw(
+            "Inline $x^2$ stays text.",
+        ))
+        .expect("decode without math");
+    assert!(
+        plain.blocks[0]
+            .kind
+            .inline_content()
+            .unwrap()
+            .objects
+            .is_empty()
+    );
+
+    let mut constructed = Document::new();
+    let mut inline = InlineContent::empty();
+    inline.push_object(
+        InlineObject::custom::<InlineEquationSpec>(InlineEquationData::new("a^2 + b^2 = c^2")),
+        InlineStyle::default(),
+    );
+    constructed.add_paragraph(inline, BlockStyle::default());
+    constructed.add_leaf_block::<EquationBlockSpec>(EquationBlockData::new("x = y"));
+    let exported = MarkdownCodec.encode(&constructed).expect("encode");
+    assert!(exported.as_str().contains("$a^2 + b^2 = c^2$"));
+    assert!(exported.as_str().contains("$$\nx = y\n$$"));
+}
+
+#[cfg(feature = "equation")]
+#[test]
+fn builtin_ratex_backend_renders_resvg_safe_svg_and_metrics() {
+    use gpui_rich::model::{
+        BuiltInEquationBackend, EquationBackend, EquationRenderOptions, RgbaColor,
+    };
+
+    let backend = BuiltInEquationBackend::new();
+    let inline = backend
+        .render_svg(
+            r"\frac{a}{b + c_i}",
+            &EquationRenderOptions::inline(12.0, RgbaColor::rgb(0x1f, 0x23, 0x28)),
+        )
+        .expect("inline equation renders");
+    assert!(inline.svg.contains("<svg"));
+    assert!(inline.svg.contains("<path"));
+    assert!(!inline.svg.contains("<text"));
+    assert!(!inline.svg.contains("rgba("));
+    assert!(inline.width_pt > 1.0);
+    assert!(inline.height_pt > inline.depth_pt);
+    assert!(inline.depth_pt > 0.5);
+
+    let display = backend
+        .render_svg(
+            r"\int_{-\infty}^{\infty} e^{-x^2}\,dx = \sqrt{\pi}",
+            &EquationRenderOptions::display(14.0, RgbaColor::rgb(0xe6, 0xed, 0xf3)),
+        )
+        .expect("display equation renders");
+    assert!(display.svg.contains("<path"));
+    assert!(display.width_pt > inline.width_pt);
+    assert!(display.height_pt > inline.height_pt);
+
+    let syntax_err = backend
+        .render_svg(
+            r"\frac{1}{",
+            &EquationRenderOptions::inline(12.0, RgbaColor::BLACK),
+        )
+        .expect_err("malformed latex must fail");
+    assert!(syntax_err.offset.is_some());
+
+    assert!(
+        backend
+            .render_svg(
+                "   ",
+                &EquationRenderOptions::display(12.0, RgbaColor::BLACK)
+            )
+            .is_err()
+    );
 }

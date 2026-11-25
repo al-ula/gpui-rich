@@ -1,13 +1,16 @@
 //! GPUI implementation of [`crate::layout::TextShaper`] backed by `WindowTextSystem`.
 
-use crate::gpui::extension::{BlockCallbackResult, ExtensionRegistry, InlineCallbackResult};
+use crate::gpui::extension::{
+    BlockCallbackResult, ErasedInlineMeasureContext, ExtensionRegistry, InlineCallbackResult,
+};
 use crate::layout::{
     GlyphBackend, InlineBoxMetrics, Insets, ShapedGlyph, ShapedGlyphRun, ShapedSegment,
     ShaperRunSpec, Size, TextShaper, is_valid_custom_insets, is_valid_custom_size, pt_to_px,
 };
 use crate::model::{
     AnchorId, BlockId, BlockShapeKind, ChipKind, ComponentStore, CustomPayload, DROPDOWN_KIND,
-    InlineObject, InlineVAlign, PLACEHOLDER_KIND, RgbaColor, VARIABLE_KIND, footnote_reference_id,
+    InlineObject, InlineObjectId, InlineVAlign, PLACEHOLDER_KIND, ResolvedTextStyle, RgbaColor,
+    VARIABLE_KIND, footnote_reference_id,
 };
 use gpui_kit::{
     Font, FontFallbacks, FontFeatures, FontId, FontStyle, FontWeight as GpuiFontWeight, GlyphId,
@@ -346,6 +349,124 @@ impl<'window, 'registry> GpuiShaper<'window, 'registry> {
         }
     }
 
+    fn measure_inline_object_inner(
+        &mut self,
+        block_id: Option<BlockId>,
+        object_id: InlineObjectId,
+        object: &InlineObject,
+        style: &ResolvedTextStyle,
+        zoom: f32,
+    ) -> InlineBoxMetrics {
+        match object {
+            InlineObject::Image {
+                width_pt,
+                height_pt,
+                valign,
+                ..
+            } => InlineBoxMetrics::new(
+                pt_to_px(*width_pt, zoom),
+                pt_to_px(*height_pt, zoom),
+                *valign,
+            ),
+            InlineObject::SmartChip { label, .. } => {
+                let font_size = px(pt_to_px(10.0, zoom));
+                let run = TextRun {
+                    len: label.len(),
+                    font: gpui_kit::font(".SystemUIFont"),
+                    color: rgba_to_hsla(RgbaColor::BLACK),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let shaped = self.window.text_system().shape_line(
+                    SharedString::from(label.clone()),
+                    font_size,
+                    &[run],
+                    None,
+                );
+                let label_width: f32 = shaped.width.into();
+                InlineBoxMetrics::new(
+                    label_width + pt_to_px(18.0, zoom),
+                    pt_to_px(18.0, zoom),
+                    InlineVAlign::Middle,
+                )
+            }
+            InlineObject::FootnoteRef { index } => {
+                let text = format!("[{index}]");
+                let font_size = px(pt_to_px(8.5, zoom));
+                let run = TextRun {
+                    len: text.len(),
+                    font: gpui_kit::font(".SystemUIFont"),
+                    color: rgba_to_hsla(RgbaColor::LINK),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let shaped = self.window.text_system().shape_line(
+                    SharedString::from(text),
+                    font_size,
+                    &[run],
+                    None,
+                );
+                let text_width: f32 = shaped.width.into();
+                InlineBoxMetrics::new(
+                    text_width + pt_to_px(4.0, zoom),
+                    pt_to_px(12.0, zoom),
+                    InlineVAlign::Baseline,
+                )
+            }
+            InlineObject::Custom { .. } if footnote_reference_id(object).is_some() => {
+                InlineBoxMetrics::new(
+                    pt_to_px(15.0, zoom),
+                    pt_to_px(12.0, zoom),
+                    InlineVAlign::Baseline,
+                )
+            }
+            InlineObject::Custom { kind, data } => {
+                if let Some(renderer) = self
+                    .extensions
+                    .and_then(|registry| registry.get_inline(kind))
+                    && let InlineCallbackResult::Ok(metrics) = renderer.measure(
+                        ErasedInlineMeasureContext {
+                            block_id,
+                            object_id,
+                            data,
+                            font_size_pt: style.font_size_pt,
+                            text_color: style.color,
+                            zoom,
+                        },
+                        self.window,
+                    )
+                    && metrics.is_valid()
+                {
+                    return metrics;
+                }
+                let label = kind.to_string();
+                let font_size = px(pt_to_px(10.0, zoom));
+                let run = TextRun {
+                    len: label.len(),
+                    font: gpui_kit::font(".SystemUIFont"),
+                    color: rgba_to_hsla(RgbaColor::BLACK),
+                    background_color: None,
+                    underline: None,
+                    strikethrough: None,
+                };
+                let shaped = self.window.text_system().shape_line(
+                    SharedString::from(label),
+                    font_size,
+                    &[run],
+                    None,
+                );
+                let label_width: f32 = shaped.width.into();
+                InlineBoxMetrics::new(
+                    label_width + pt_to_px(16.0, zoom),
+                    pt_to_px(18.0, zoom),
+                    InlineVAlign::Middle,
+                )
+            }
+        }
+    }
+
     /// Attaches an optional render-time [`FontResolver`] for per-variant or custom font mapping.
     pub fn with_optional_font_resolver(
         mut self,
@@ -503,105 +624,24 @@ impl TextShaper for GpuiShaper<'_, '_> {
     }
 
     fn measure_inline_object(&mut self, object: &InlineObject, zoom: f32) -> InlineBoxMetrics {
-        match object {
-            InlineObject::Image {
-                width_pt,
-                height_pt,
-                valign,
-                ..
-            } => InlineBoxMetrics {
-                width: pt_to_px(*width_pt, zoom),
-                height: pt_to_px(*height_pt, zoom),
-                valign: *valign,
-            },
-            InlineObject::SmartChip { label, .. } => {
-                let font_size = px(pt_to_px(10.0, zoom));
-                let run = TextRun {
-                    len: label.len(),
-                    font: gpui_kit::font(".SystemUIFont"),
-                    color: rgba_to_hsla(RgbaColor::BLACK),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                };
-                let shaped = self.window.text_system().shape_line(
-                    SharedString::from(label.clone()),
-                    font_size,
-                    &[run],
-                    None,
-                );
-                let label_width: f32 = shaped.width.into();
-                InlineBoxMetrics {
-                    width: label_width + pt_to_px(18.0, zoom),
-                    height: pt_to_px(18.0, zoom),
-                    valign: InlineVAlign::Middle,
-                }
-            }
-            InlineObject::FootnoteRef { index } => {
-                let text = format!("[{index}]");
-                let font_size = px(pt_to_px(8.5, zoom));
-                let run = TextRun {
-                    len: text.len(),
-                    font: gpui_kit::font(".SystemUIFont"),
-                    color: rgba_to_hsla(RgbaColor::LINK),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                };
-                let shaped = self.window.text_system().shape_line(
-                    SharedString::from(text),
-                    font_size,
-                    &[run],
-                    None,
-                );
-                let text_width: f32 = shaped.width.into();
-                InlineBoxMetrics {
-                    width: text_width + pt_to_px(4.0, zoom),
-                    height: pt_to_px(12.0, zoom),
-                    valign: InlineVAlign::Baseline,
-                }
-            }
-            InlineObject::Custom { .. } if footnote_reference_id(object).is_some() => {
-                InlineBoxMetrics {
-                    width: pt_to_px(15.0, zoom),
-                    height: pt_to_px(12.0, zoom),
-                    valign: InlineVAlign::Baseline,
-                }
-            }
-            InlineObject::Custom { kind, data } => {
-                if let Some(renderer) = self
-                    .extensions
-                    .and_then(|registry| registry.get_inline(kind))
-                    && let InlineCallbackResult::Ok(metrics) =
-                        renderer.measure(data, zoom, self.window)
-                    && metrics.is_valid()
-                {
-                    return metrics;
-                }
-                let label = kind.to_string();
-                let font_size = px(pt_to_px(10.0, zoom));
-                let run = TextRun {
-                    len: label.len(),
-                    font: gpui_kit::font(".SystemUIFont"),
-                    color: rgba_to_hsla(RgbaColor::BLACK),
-                    background_color: None,
-                    underline: None,
-                    strikethrough: None,
-                };
-                let shaped = self.window.text_system().shape_line(
-                    SharedString::from(label),
-                    font_size,
-                    &[run],
-                    None,
-                );
-                let label_width: f32 = shaped.width.into();
-                InlineBoxMetrics {
-                    width: label_width + pt_to_px(16.0, zoom),
-                    height: pt_to_px(18.0, zoom),
-                    valign: InlineVAlign::Middle,
-                }
-            }
-        }
+        self.measure_inline_object_inner(
+            None,
+            InlineObjectId(0),
+            object,
+            &ResolvedTextStyle::default(),
+            zoom,
+        )
+    }
+
+    fn measure_inline_object_with_style(
+        &mut self,
+        block_id: Option<BlockId>,
+        object_id: InlineObjectId,
+        object: &InlineObject,
+        style: &ResolvedTextStyle,
+        zoom: f32,
+    ) -> InlineBoxMetrics {
+        self.measure_inline_object_inner(block_id, object_id, object, style, zoom)
     }
 
     fn resolve_inline_object(&self, object: &InlineObject) -> Option<InlineObject> {

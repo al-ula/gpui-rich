@@ -4,9 +4,9 @@ use crate::layout::shaper::{
     TextShaper,
 };
 use crate::model::{
-    Affinity, BlockStyle, DocumentLayoutConfig, InlineContent, InlineObject, InlineObjectId,
-    InlineVAlign, LineHeight, LinkTarget, OBJECT_REPLACEMENT_CHAR, ResolvedTextStyle, RgbaColor,
-    StyleSheet, TextAlign, TextDirection, UnderlineKind,
+    Affinity, BlockId, BlockStyle, DocumentLayoutConfig, InlineContent, InlineObject,
+    InlineObjectId, InlineVAlign, LineHeight, LinkTarget, OBJECT_REPLACEMENT_CHAR,
+    ResolvedTextStyle, RgbaColor, StyleSheet, TextAlign, TextDirection, UnderlineKind,
 };
 use std::ops::Range;
 use unicode_bidi::{BidiInfo, Level};
@@ -150,7 +150,12 @@ pub struct InlineBoxFragment {
     pub x: f32,
     pub width: f32,
     pub height: f32,
+    /// Distance in pixels from the mathematical baseline to the bottom of the box (used with
+    /// [`InlineVAlign::Baseline`]).
+    pub depth: f32,
     pub valign: InlineVAlign,
+    pub font_size_pt: f32,
+    pub text_color: RgbaColor,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -217,7 +222,10 @@ impl<B: GlyphBackend> VisualLine<B> {
     /// Computes the vertical rect of an inline box relative to the block origin.
     pub fn inline_box_rect(&self, bx: &InlineBoxFragment) -> Rect {
         let top = match bx.valign {
-            InlineVAlign::Baseline => self.baseline_y - bx.height,
+            InlineVAlign::Baseline => {
+                let clamped_depth = bx.depth.clamp(0.0, bx.height);
+                self.baseline_y - (bx.height - clamped_depth)
+            }
             InlineVAlign::Middle => {
                 let mid = self.baseline_y - self.ascent * 0.35;
                 mid - bx.height * 0.5
@@ -630,6 +638,8 @@ enum ShapedItem<B: GlyphBackend> {
         object_id: InlineObjectId,
         object: InlineObject,
         metrics: InlineBoxMetrics,
+        font_size_pt: f32,
+        text_color: RgbaColor,
     },
     Tab {
         doc_range: Range<usize>,
@@ -728,6 +738,29 @@ pub fn layout_paragraph<S: TextShaper>(
     zoom: f32,
     shaper: &mut S,
 ) -> ParagraphLayout<S::Backend> {
+    layout_paragraph_for_block(
+        None,
+        content,
+        block_style,
+        sheet,
+        config,
+        max_width,
+        zoom,
+        shaper,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn layout_paragraph_for_block<S: TextShaper>(
+    block_id: Option<BlockId>,
+    content: &InlineContent,
+    block_style: &BlockStyle,
+    sheet: &StyleSheet,
+    config: &DocumentLayoutConfig,
+    max_width: f32,
+    zoom: f32,
+    shaper: &mut S,
+) -> ParagraphLayout<S::Backend> {
     let base_text = block_style.resolved_base_text(sheet, &config.default_style);
     let base_font_px = pt_to_px(base_text.font_size_pt, zoom).max(1.0);
     let line_height_spec = block_style.resolved_line_height(sheet);
@@ -771,7 +804,7 @@ pub fn layout_paragraph<S: TextShaper>(
     let bidi = ParagraphBidi::analyze(&content.text, block_style.direction, content.is_ascii);
 
     // 1. Itemize into ShapedItems (batched by uniform font_size + baseline_shift + bidi_level).
-    let items = itemize_and_shape(content, &base_text, &bidi, zoom, shaper);
+    let items = itemize_and_shape(block_id, content, &base_text, &bidi, zoom, shaper);
 
     // 2. Collect UAX #14 break points plus forced breaks around tabs, hard breaks, and U+FFFC.
     let mut break_points: Vec<usize> = linebreaks(&content.text)
@@ -951,7 +984,10 @@ pub fn layout_paragraph<S: TextShaper>(
                 }
                 LineFragment::InlineBox(b) => match b.valign {
                     InlineVAlign::Baseline => {
-                        max_ascent = max_ascent.max(b.height);
+                        let clamped_depth = b.depth.clamp(0.0, b.height);
+                        let box_ascent = (b.height - clamped_depth).max(0.0);
+                        max_ascent = max_ascent.max(box_ascent);
+                        max_descent = max_descent.max(clamped_depth);
                     }
                     InlineVAlign::Middle => {
                         let half = b.height * 0.5;
@@ -1060,6 +1096,7 @@ fn next_tab_stop(
 }
 
 fn itemize_and_shape<S: TextShaper>(
+    block_id: Option<BlockId>,
     content: &InlineContent,
     base_text: &ResolvedTextStyle,
     bidi: &ParagraphBidi,
@@ -1154,21 +1191,25 @@ fn itemize_and_shape<S: TextShaper>(
                     let object = shaper
                         .resolve_inline_object(&entry.object)
                         .unwrap_or_else(|| entry.object.clone());
-                    let raw_metrics = shaper.measure_inline_object(&object, zoom);
+                    let raw_metrics = shaper.measure_inline_object_with_style(
+                        block_id, entry.id, &object, &resolved, zoom,
+                    );
                     let metrics = if raw_metrics.is_valid() {
                         raw_metrics
                     } else {
-                        InlineBoxMetrics {
-                            width: pt_to_px(72.0, zoom),
-                            height: pt_to_px(18.0, zoom),
-                            valign: InlineVAlign::Middle,
-                        }
+                        InlineBoxMetrics::new(
+                            pt_to_px(72.0, zoom),
+                            pt_to_px(18.0, zoom),
+                            InlineVAlign::Middle,
+                        )
                     };
                     items.push(ShapedItem::InlineBox {
                         doc_range: abs_idx..(abs_idx + ch_len),
                         object_id: entry.id,
                         object,
                         metrics,
+                        font_size_pt: resolved.font_size_pt,
+                        text_color: resolved.color,
                     });
                 }
                 cursor = abs_idx + ch_len;
@@ -1346,6 +1387,8 @@ fn slice_items_range<B: GlyphBackend>(
                 object_id,
                 object,
                 metrics,
+                font_size_pt,
+                text_color,
             } => {
                 out.push(LineFragment::InlineBox(InlineBoxFragment {
                     doc_range: doc_range.clone(),
@@ -1354,7 +1397,10 @@ fn slice_items_range<B: GlyphBackend>(
                     x: 0.0,
                     width: metrics.width,
                     height: metrics.height,
+                    depth: metrics.depth,
                     valign: metrics.valign,
+                    font_size_pt: *font_size_pt,
+                    text_color: *text_color,
                 }));
             }
             ShapedItem::Tab { doc_range } => {

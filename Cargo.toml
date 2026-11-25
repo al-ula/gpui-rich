@@ -9,12 +9,17 @@ default = ["gpui"]
 gpui = ["dep:base64", "dep:emojis", "dep:gpui-kit", "dep:image", "dep:skrifa", "dep:tiny-skia"]
 gpui-fast = ["gpui", "gpui-kit/gpui-fast"]
 mermaid = ["dep:merman"]
+equation = ["dep:ratex-layout", "dep:ratex-parser", "dep:ratex-svg", "dep:ratex-types"]
 
 [dependencies]
 base64 = { version = "0.22", optional = true }
 emojis = { version = "0.9.1", optional = true }
 gpui-kit = { version = "0.10.0", default-features = false, optional = true }
 merman = { version = "0.11.0", default-features = false, features = ["all-diagrams", "svg", "layout-cytoscape"], optional = true }
+ratex-layout = { version = "0.1.16", optional = true }
+ratex-parser = { version = "0.1.16", optional = true }
+ratex-svg = { version = "0.1.16", features = ["embed-fonts"], optional = true }
+ratex-types = { version = "0.1.16", optional = true }
 regex = "1"
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"

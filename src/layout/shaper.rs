@@ -1,6 +1,6 @@
 use crate::layout::geometry::{Insets, Size, pt_to_px};
 use crate::model::{
-    BlockId, BlockShapeKind, CustomPayload, FontWeight, InlineObject, InlineVAlign,
+    BlockId, BlockShapeKind, CustomPayload, FontWeight, InlineObject, InlineObjectId, InlineVAlign,
     ResolvedTextStyle, RgbaColor, SharedStr, UnderlineKind,
 };
 use std::fmt::Debug;
@@ -117,13 +117,41 @@ impl<B: GlyphBackend> ShapedSegment<B> {
 pub struct InlineBoxMetrics {
     pub width: f32,
     pub height: f32,
+    /// Distance in pixels from the mathematical baseline to the bottom of the box (used with
+    /// [`InlineVAlign::Baseline`]).
+    pub depth: f32,
     pub valign: InlineVAlign,
 }
 
 impl InlineBoxMetrics {
-    /// Returns `true` when width and height are finite and nonnegative.
+    /// Creates inline box metrics with zero baseline depth.
+    pub const fn new(width: f32, height: f32, valign: InlineVAlign) -> Self {
+        Self {
+            width,
+            height,
+            depth: 0.0,
+            valign,
+        }
+    }
+
+    /// Creates baseline-aligned inline box metrics with explicit distance below the baseline.
+    pub const fn baseline_with_depth(width: f32, height: f32, depth: f32) -> Self {
+        Self {
+            width,
+            height,
+            depth,
+            valign: InlineVAlign::Baseline,
+        }
+    }
+
+    /// Returns `true` when width, height, and depth are finite and nonnegative.
     pub fn is_valid(&self) -> bool {
-        self.width.is_finite() && self.width >= 0.0 && self.height.is_finite() && self.height >= 0.0
+        self.width.is_finite()
+            && self.width >= 0.0
+            && self.height.is_finite()
+            && self.height >= 0.0
+            && self.depth.is_finite()
+            && self.depth >= 0.0
     }
 }
 
@@ -156,6 +184,19 @@ pub trait TextShaper {
     ) -> ShapedSegment<Self::Backend>;
 
     fn measure_inline_object(&mut self, obj: &InlineObject, zoom: f32) -> InlineBoxMetrics;
+
+    /// Measures an inline atomic object with its owning block, object ID, and surrounding text
+    /// style. Defaults to [`Self::measure_inline_object`].
+    fn measure_inline_object_with_style(
+        &mut self,
+        _block_id: Option<BlockId>,
+        _object_id: InlineObjectId,
+        obj: &InlineObject,
+        _style: &ResolvedTextStyle,
+        zoom: f32,
+    ) -> InlineBoxMetrics {
+        self.measure_inline_object(obj, zoom)
+    }
 
     /// Resolves a display-only atom without changing its backing document identity.
     fn resolve_inline_object(&self, _object: &InlineObject) -> Option<InlineObject> {
@@ -323,35 +364,34 @@ impl TextShaper for MockShaper {
                 height_pt,
                 valign,
                 ..
-            } => InlineBoxMetrics {
-                width: pt_to_px(*width_pt, zoom),
-                height: pt_to_px(*height_pt, zoom),
-                valign: *valign,
-            },
+            } => InlineBoxMetrics::new(
+                pt_to_px(*width_pt, zoom),
+                pt_to_px(*height_pt, zoom),
+                *valign,
+            ),
             InlineObject::SmartChip { label, .. } => {
                 let font_px = pt_to_px(10.0, zoom);
-                InlineBoxMetrics {
-                    width: (label.chars().count() as f32) * font_px * 0.58 + pt_to_px(18.0, zoom),
-                    height: pt_to_px(18.0, zoom),
-                    valign: InlineVAlign::Middle,
-                }
+                InlineBoxMetrics::new(
+                    (label.chars().count() as f32) * font_px * 0.58 + pt_to_px(18.0, zoom),
+                    pt_to_px(18.0, zoom),
+                    InlineVAlign::Middle,
+                )
             }
             InlineObject::FootnoteRef { index } => {
                 let digits = index.to_string().len().max(1) as f32;
-                InlineBoxMetrics {
-                    width: pt_to_px(8.0 + digits * 5.0, zoom),
-                    height: pt_to_px(12.0, zoom),
-                    valign: InlineVAlign::Baseline,
-                }
+                InlineBoxMetrics::new(
+                    pt_to_px(8.0 + digits * 5.0, zoom),
+                    pt_to_px(12.0, zoom),
+                    InlineVAlign::Baseline,
+                )
             }
             InlineObject::Custom { kind, .. } => {
                 let font_px = pt_to_px(10.0, zoom);
-                InlineBoxMetrics {
-                    width: (kind.chars().count().max(4) as f32) * font_px * 0.58
-                        + pt_to_px(16.0, zoom),
-                    height: pt_to_px(18.0, zoom),
-                    valign: InlineVAlign::Middle,
-                }
+                InlineBoxMetrics::new(
+                    (kind.chars().count().max(4) as f32) * font_px * 0.58 + pt_to_px(16.0, zoom),
+                    pt_to_px(18.0, zoom),
+                    InlineVAlign::Middle,
+                )
             }
         }
     }
