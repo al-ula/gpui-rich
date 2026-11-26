@@ -1,4 +1,6 @@
-use crate::layout::block::{BlockLayout, LayoutCache, default_list_marker};
+use crate::layout::block::{
+    BlockLayout, BlockLayoutKind, LayoutCache, PlacedChildBlock, default_list_marker,
+};
 use crate::layout::geometry::{Point, Rect, pt_to_px};
 use crate::layout::line::{HitResult, LineFragment, ParagraphLayout};
 use crate::layout::shaper::{GlyphBackend, TextShaper};
@@ -357,6 +359,19 @@ impl<B: GlyphBackend> FlowLayout<B> {
                 }
                 break;
             }
+        }
+    }
+
+    /// Projects ranges out of a plain source paragraph while preserving source coordinates.
+    #[cfg(feature = "gpui")]
+    pub(crate) fn set_source_hidden_ranges(
+        &mut self,
+        doc: &Document,
+        block_id: BlockId,
+        ranges: &[std::ops::Range<usize>],
+    ) {
+        if self.cache.set_source_hidden_ranges(block_id, ranges) {
+            self.invalidate_block(doc, block_id);
         }
     }
 
@@ -1125,23 +1140,32 @@ impl<B: GlyphBackend> FlowLayout<B> {
             }
         }
 
-        // 2. Cross into the previous or next visible leaf block.
+        let parallel = (pos.path.len() > 1 && doc.is_editable_slot(leaf_id))
+            .then(|| self.cache.get_latest(top_id))
+            .flatten()
+            .and_then(|layout| {
+                parallel_slot_children(&layout, leaf_id, block_x)
+                    .map(|(children, _)| children.len())
+            });
         let visible_leaves = doc.collect_visible_leaf_blocks();
         let current_leaf_index = visible_leaves
             .iter()
             .position(|block| block.id == leaf_id)?;
-        let target_leaf_index = if delta_lines < 0 {
+        let target_leaf_index = if let Some(count) = parallel {
+            let (_, index) = doc.locate_block(leaf_id)?;
+            let first = current_leaf_index.checked_sub(index)?;
+            if delta_lines < 0 {
+                first.checked_sub(1)?
+            } else {
+                first + count
+            }
+        } else if delta_lines < 0 {
             current_leaf_index.checked_sub(1)?
         } else {
-            let next = current_leaf_index + 1;
-            if next < visible_leaves.len() {
-                next
-            } else {
-                return None;
-            }
+            current_leaf_index + 1
         };
         let target_leaf = visible_leaves.get(target_leaf_index)?;
-        let target_path = doc.path_for_block(target_leaf.id)?;
+        let mut target_path = doc.path_for_block(target_leaf.id)?;
         let target_top_id = target_path.first().map(|segment| match *segment {
             PathSegment::Block(id) => id,
             PathSegment::TableCell { table_id, .. } => table_id,
@@ -1157,6 +1181,16 @@ impl<B: GlyphBackend> FlowLayout<B> {
         let target_block_y = self.block_y(target_top_index);
 
         if let Some(target_layout) = self.cache.get_latest(target_top_id) {
+            let mut target_id = target_leaf.id;
+            if target_path.len() > 1
+                && doc.is_editable_slot(target_id)
+                && let Some((children, origin_x)) =
+                    parallel_slot_children(&target_layout, target_id, target_block_x)
+                && let Some(child) = nearest_slot(children, effective_goal_x - origin_x)
+            {
+                target_id = child.layout.id;
+                target_path = doc.path_for_block(target_id)?;
+            }
             let mut leaf_paragraphs = Vec::new();
             collect_leaf_paragraphs(
                 &target_layout,
@@ -1166,7 +1200,7 @@ impl<B: GlyphBackend> FlowLayout<B> {
             );
             if let Some(leaf_ref) = leaf_paragraphs
                 .into_iter()
-                .find(|leaf| leaf.block_id == target_leaf.id)
+                .find(|leaf| leaf.block_id == target_id)
                 && let Some(line) = if delta_lines < 0 {
                     leaf_ref.paragraph.lines.last()
                 } else {
@@ -1557,7 +1591,18 @@ fn hit_test_layout_recursive<B: GlyphBackend>(
         });
     }
     if let Some(children) = layout.children() {
-        if let Some(child) = nearest_child_for_y(children, local.y) {
+        let child = if matches!(
+            layout.kind,
+            BlockLayoutKind::CustomContainer {
+                side_by_side: true,
+                ..
+            }
+        ) {
+            nearest_slot(children, local.x)
+        } else {
+            nearest_child_for_y(children, local.y)
+        };
+        if let Some(child) = child {
             let child_local = Point::new(local.x - child.x, local.y - child.y);
             path_prefix.push(PathSegment::Block(layout.id));
             let result = hit_test_layout_recursive(&child.layout, child_local, path_prefix);
@@ -1596,6 +1641,45 @@ fn hit_test_layout_recursive<B: GlyphBackend>(
         }
     }
     None
+}
+
+fn parallel_slot_children<B: GlyphBackend>(
+    layout: &BlockLayout<B>,
+    slot_id: BlockId,
+    origin_x: f32,
+) -> Option<(&[PlacedChildBlock<B>], f32)> {
+    if let Some(children) = layout.children() {
+        if matches!(
+            layout.kind,
+            BlockLayoutKind::CustomContainer {
+                side_by_side: true,
+                ..
+            }
+        ) && children.iter().any(|child| child.layout.id == slot_id)
+        {
+            return Some((children, origin_x));
+        }
+        return children
+            .iter()
+            .find_map(|child| parallel_slot_children(&child.layout, slot_id, origin_x + child.x));
+    }
+    let origin_x = origin_x + layout.content_origin().x;
+    layout.table_layout()?.cells.iter().find_map(|cell| {
+        cell.children.iter().find_map(|child| {
+            parallel_slot_children(&child.layout, slot_id, origin_x + cell.rect.x + child.x)
+        })
+    })
+}
+
+fn nearest_slot<B: GlyphBackend>(
+    children: &[PlacedChildBlock<B>],
+    x: f32,
+) -> Option<&PlacedChildBlock<B>> {
+    let distance =
+        |child: &PlacedChildBlock<B>| (x - x.clamp(child.x, child.x + child.layout.width)).abs();
+    children
+        .iter()
+        .min_by(|left, right| distance(left).total_cmp(&distance(right)))
 }
 
 fn nearest_child_for_y<B: GlyphBackend>(

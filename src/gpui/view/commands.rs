@@ -180,6 +180,9 @@ impl RichDocumentView {
         history_group: Option<HistoryMergeGroup>,
         cx: &mut Context<Self>,
     ) -> ChangeSet {
+        if self.source.is_some() {
+            return ChangeSet::default();
+        }
         let anchor = self.flow.capture_anchor(self.scroll_y);
         let next_selection = transaction.selection_after.clone();
         let applied = self.document.apply(transaction);
@@ -212,6 +215,9 @@ impl RichDocumentView {
         source: CommandSource,
         cx: &mut Context<Self>,
     ) -> CommandOutcome {
+        if let Some(outcome) = self.execute_source_command(command, cx) {
+            return outcome;
+        }
         match command {
             RichCommand::SetHorizontalLayout(layout) => {
                 if self.document.config.horizontal_layout == *layout {
@@ -748,8 +754,9 @@ impl RichDocumentView {
             .find_block(block_id)
             .is_some_and(|block| block.kind.code_block_data().is_some());
 
-        // Multi-line paste outside a code block splits into sibling paragraphs atomically.
-        if normalized.contains('\n') && !is_code_block {
+        // Fixed text slots keep pasted line breaks within the child.
+        if normalized.contains('\n') && !is_code_block && !self.document.is_editable_slot(block_id)
+        {
             return self.execute_insert_multiline_text(
                 &normalized,
                 steps,
@@ -1957,7 +1964,12 @@ impl RichDocumentView {
                 .selection
                 .as_ref()
                 .is_some_and(|selection| match selection {
-                    DocumentSelection::Text { focus, .. } => table_cell_of(focus).is_some(),
+                    DocumentSelection::Text { focus, .. } => {
+                        table_cell_of(focus).is_some()
+                            && !focus
+                                .leaf_block_id()
+                                .is_some_and(|id| self.document.is_editable_slot(id))
+                    }
                     _ => false,
                 });
         let single_table = match fragment.blocks.as_slice() {
@@ -2029,6 +2041,14 @@ impl RichDocumentView {
             );
             self.apply_transaction_grouped(transaction, Some(HistoryMergeGroup::Atomic), cx);
             return CommandOutcome::Executed;
+        }
+
+        if self.document.is_editable_slot(first_block_id) {
+            let plain = plain_fallback.map_or_else(
+                || fragment.to_plain_text_with(&self.extensions),
+                ToOwned::to_owned,
+            );
+            return self.execute_paste_text(&plain, source, cx);
         }
 
         let Some((target, start_index)) = self.document.locate_block(first_block_id) else {
@@ -3120,6 +3140,7 @@ impl RichDocumentView {
         }
         self.pending_reveal = None;
         self.selection = next_selection;
+        self.refresh_source_reveal();
         self.dismiss_overlays_where(|spec| spec.dismiss.on_selection_change, cx);
         cx.emit(RichDocumentEvent::SelectionChanged {
             selection: self.selection.clone().map(Box::new),
@@ -3128,7 +3149,11 @@ impl RichDocumentView {
         true
     }
 
-    fn notify_transaction_applied(&mut self, change_set: ChangeSet, cx: &mut Context<Self>) {
+    pub(super) fn notify_transaction_applied(
+        &mut self,
+        change_set: ChangeSet,
+        cx: &mut Context<Self>,
+    ) {
         self.document_revision = self.document_revision.wrapping_add(1);
         self.refresh_search_matches();
         self.dismiss_overlays_where(|spec| spec.dismiss.on_document_edit, cx);
@@ -3165,6 +3190,10 @@ impl RichDocumentView {
 
     /// Extracts the plain UTF-8 text covered by the current selection (TSV for multi-cell table selections).
     pub fn selected_plain_text(&self) -> Option<String> {
+        if let Some(source) = self.source_buffer() {
+            let range = self.source_selection()?;
+            return (!range.is_empty()).then(|| source.text()[range].to_owned());
+        }
         let fragment = self.selected_fragment()?;
         Some(fragment.to_plain_text_with(&clipboard::ComponentClipboardFormatter::new(self)))
     }

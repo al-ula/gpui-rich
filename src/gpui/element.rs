@@ -247,6 +247,7 @@ impl Element for RichDocumentElement {
             view.last_viewport_bounds = bounds;
             let focused = view.focus_handle.is_focused(window);
             view.sync_focus_state(focused, cx);
+            view.refresh_source_reveal();
 
             let horizontal =
                 resolve_horizontal_metrics(viewport_width, &view.document.config, view.zoom);

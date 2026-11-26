@@ -1271,6 +1271,45 @@ fn verify_mermaid_extension_commands_and_policy(cx: &mut App) {
     });
 }
 
+fn verify_source_preserving_editing(cx: &mut App) {
+    use gpui_rich::model::{MoveDirection, MoveUnit, SourceBuffer};
+
+    let original = "# Heading  \r\nname = \"é\"\n";
+    let view = cx.new(|cx| RichDocumentView::new_source(SourceBuffer::new(original.into()), cx));
+    view.update(cx, |view, cx| {
+        assert_eq!(view.source_buffer().unwrap().text(), original);
+        view.select_source(2, 2, cx);
+        let delete = RichCommand::Delete {
+            direction: MoveDirection::Backward,
+            unit: MoveUnit::Grapheme,
+        };
+        assert_eq!(view.dispatch_command(delete, cx), CommandOutcome::Executed);
+        assert_eq!(
+            view.source_buffer().unwrap().text(),
+            "#Heading  \r\nname = \"é\"\n"
+        );
+        view.reveal_source(true, cx);
+        assert_eq!(
+            view.dispatch_command(RichCommand::Undo, cx),
+            CommandOutcome::Executed
+        );
+        assert_eq!(view.source_buffer().unwrap().text(), original);
+        assert_eq!(view.source_syntax_revealed(), Some(true));
+
+        let first_break = original.find('\r').unwrap();
+        view.select_source(first_break, first_break + 2, cx);
+        assert_eq!(view.selected_plain_text().as_deref(), Some("\r\n"));
+        assert_eq!(
+            view.dispatch_command(RichCommand::PasteText("\r\nnew\r".into()), cx),
+            CommandOutcome::Executed
+        );
+        assert_eq!(
+            view.source_buffer().unwrap().text(),
+            "# Heading  \r\nnew\rname = \"é\"\n"
+        );
+    });
+}
+
 #[test]
 fn gpui_extension_type_safety_end_to_end() {
     let app = gpui_kit::platform::headless();
@@ -1287,6 +1326,7 @@ fn gpui_extension_type_safety_end_to_end() {
             verify_payload_cache_unknown_fields_and_diagnostics(cx);
             verify_large_table_decoration_culling(cx);
             verify_mermaid_extension_commands_and_policy(cx);
+            verify_source_preserving_editing(cx);
         }));
         if let Err(payload) = sync_result {
             let message = payload

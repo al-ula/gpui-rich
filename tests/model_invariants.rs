@@ -1151,6 +1151,7 @@ fn custom_node_json_fidelity_error_classification_and_fallible_serialization() {
             kind: std::sync::Arc::from("callout"),
             data: CustomPayload::from_json(serde_json::json!({ "title": 123 })),
             children: Vec::new(),
+            editable_slots: None,
         },
         BlockStyle::default(),
     );

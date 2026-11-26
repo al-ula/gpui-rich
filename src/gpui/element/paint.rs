@@ -1152,6 +1152,7 @@ pub(super) fn collect_pending_custom_nodes(
             bounds,
             chrome,
             children,
+            ..
         } => {
             if let Some(renderer) = extensions.get_block(kind) {
                 out_blocks.push(PendingCustomBlock {

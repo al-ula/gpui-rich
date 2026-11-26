@@ -525,6 +525,48 @@ impl TableBlock {
     }
 }
 
+/// Visual arrangement of the fixed text children in a custom container.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EditableSlotLayout {
+    Stack,
+    /// Equal-width columns in document order. Narrow containers fall back to a stack.
+    SideBySide,
+}
+
+/// Names indexed by direct child order, independent of block IDs and visual placement.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EditableSlots {
+    layout: EditableSlotLayout,
+    names: Vec<SharedStr>,
+}
+
+impl EditableSlots {
+    pub const fn layout(&self) -> EditableSlotLayout {
+        self.layout
+    }
+
+    pub fn names(&self) -> &[SharedStr] {
+        &self.names
+    }
+
+    pub(crate) fn matches_children(&self, children: &[BlockNode]) -> bool {
+        self.valid_names(children.len())
+            && children
+                .iter()
+                .all(|child| child.kind.inline_content().is_some())
+    }
+
+    pub(crate) fn valid_names(&self, count: usize) -> bool {
+        count > 0
+            && self.names.len() == count
+            && self
+                .names
+                .iter()
+                .enumerate()
+                .all(|(index, name)| !name.trim().is_empty() && !self.names[..index].contains(name))
+    }
+}
+
 /// Structural block shape with an open semantic `kind` identifier and typed [`CustomPayload`].
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum BlockKind {
@@ -541,6 +583,8 @@ pub enum BlockKind {
         #[serde(default)]
         data: CustomPayload,
         children: Vec<BlockNode>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        editable_slots: Option<EditableSlots>,
     },
     /// Two-dimensional table/grid container.
     Grid {
@@ -609,6 +653,7 @@ impl BlockKind {
             kind: Arc::from(block_kinds::BLOCKQUOTE),
             data: CustomPayload::empty(),
             children,
+            editable_slots: None,
         }
     }
 
@@ -648,7 +693,51 @@ impl BlockKind {
             kind: Arc::from(S::KIND),
             data: CustomPayload::typed(data),
             children,
+            editable_slots: None,
         }
+    }
+
+    /// Constructs a custom container with required, named native text slots.
+    ///
+    /// Each slot is one editable text block. Enter inserts a line break; structural edits cannot
+    /// split, remove, reorder, or replace individual slots with non-text blocks. The container
+    /// can still be copied, moved, or deleted as a whole.
+    ///
+    /// Returns `None` for no slots, blank or duplicate names, or non-text children.
+    pub fn slotted_container<S: BlockSpec<Shape = block_shape::Container>>(
+        data: S::Data,
+        layout: EditableSlotLayout,
+        slots: Vec<(SharedStr, BlockNode)>,
+    ) -> Option<Self> {
+        let (names, children): (Vec<_>, Vec<_>) = slots.into_iter().unzip();
+        let editable_slots = EditableSlots { layout, names };
+        if !editable_slots.matches_children(&children) {
+            return None;
+        }
+        Some(Self::Container {
+            kind: Arc::from(S::KIND),
+            data: CustomPayload::typed(data),
+            children,
+            editable_slots: Some(editable_slots),
+        })
+    }
+
+    /// Returns the fixed slot schema, if this is a slotted container.
+    pub fn editable_slots(&self) -> Option<&EditableSlots> {
+        match self {
+            Self::Container { editable_slots, .. } => editable_slots.as_ref(),
+            _ => None,
+        }
+    }
+
+    /// Finds a native text child by its slot name.
+    pub fn editable_slot(&self, name: &str) -> Option<&BlockNode> {
+        let index = self
+            .editable_slots()?
+            .names()
+            .iter()
+            .position(|slot| slot.as_ref() == name)?;
+        self.children()?.get(index)
     }
 
     /// Constructs a custom grid block bound to [`BlockSpec`] `S`.
@@ -689,6 +778,7 @@ impl BlockKind {
             kind: kind.into(),
             data,
             children,
+            editable_slots: None,
         }
     }
 
@@ -1182,6 +1272,20 @@ impl Document {
                     .map(|cell| cell.blocks.as_slice())
             }
         }
+    }
+
+    pub(crate) fn is_slotted_target(&self, target: ContainerTarget) -> bool {
+        match target {
+            ContainerTarget::Container(id) => self
+                .find_block(id)
+                .is_some_and(|block| block.kind.editable_slots().is_some()),
+            _ => false,
+        }
+    }
+
+    pub(crate) fn is_editable_slot(&self, id: BlockId) -> bool {
+        self.locate_block(id)
+            .is_some_and(|(parent, _)| self.is_slotted_target(parent))
     }
 
     /// Returns a mutable reference to the block list inside `target`.

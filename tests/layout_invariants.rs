@@ -353,6 +353,161 @@ fn custom_block_and_inline_object_measure_via_shaper() {
     assert_eq!(hit.pos.top_level_block_id(), Some(container_id));
 }
 
+fn editable_slots_document() -> (Document, BlockId, BlockId, BlockId, BlockId) {
+    struct CardSpec;
+    impl BlockSpec for CardSpec {
+        const KIND: &'static str = "test.card";
+        type Shape = block_shape::Container;
+        type Data = String;
+    }
+
+    let mut document = Document::new();
+    document.config.horizontal_layout = HorizontalLayout::Fill;
+    let left = document.alloc_block_id();
+    let right = document.alloc_block_id();
+    let card = document.alloc_block_id();
+    let slot = |id, text| {
+        BlockNode::new(
+            id,
+            BlockKind::paragraph(InlineContent::plain(text)),
+            BlockStyle::default(),
+        )
+    };
+    let kind = BlockKind::slotted_container::<CardSpec>(
+        "Card chrome".into(),
+        EditableSlotLayout::SideBySide,
+        vec![
+            ("title".into(), slot(left, "Alpha")),
+            ("body".into(), slot(right, "Beta")),
+        ],
+    )
+    .unwrap();
+    document.push_block(BlockNode::new(card, kind, BlockStyle::default()));
+    let below = document.add_paragraph(InlineContent::plain("Below the card"), Default::default());
+    (document, card, left, right, below)
+}
+
+#[test]
+fn editable_slots_share_document_geometry_and_vertical_navigation() {
+    let (document, _, left, right, below) = editable_slots_document();
+    let mut flow = FlowLayout::<MockBackend>::default();
+    let mut shaper = MockShaper;
+    let wide = 640.0;
+    let visible = flow.layout_visible_blocks(&document, 0.0, wide, wide, 0.0, 1.0, &mut shaper);
+    let left_pos = document.doc_pos_for_block(left, 0).unwrap();
+    let right_pos = document.doc_pos_for_block(right, 0).unwrap();
+    let left_caret = flow
+        .caret_rect_in_visible(&left_pos, Affinity::Downstream, &visible)
+        .unwrap();
+    let right_caret = flow
+        .caret_rect_in_visible(&right_pos, Affinity::Downstream, &visible)
+        .unwrap();
+    assert_eq!(left_caret.y, right_caret.y);
+    assert!(left_caret.right() < right_caret.x);
+    for (caret, id) in [(left_caret, left), (right_caret, right)] {
+        let hit = flow
+            .hit_test_canvas(caret.center(), &document, wide, 1.0, &mut shaper)
+            .unwrap();
+        assert_eq!(hit.pos.leaf_block_id(), Some(id));
+    }
+
+    let selection = DocumentSelection::Text {
+        anchor: left_pos.clone(),
+        focus: document.doc_pos_for_block(right, 4).unwrap(),
+        affinity: Affinity::Downstream,
+        goal_x: None,
+        stored_marks: None,
+    };
+    let selected = flow.selection_rects_for_visible(&selection, &visible);
+    assert!(selected.iter().any(|rect| rect.x < right_caret.x));
+    assert!(selected.iter().any(|rect| rect.x >= right_caret.x));
+
+    let (outside, affinity, goal_x) = flow
+        .cached_vertical_move(
+            &right_pos,
+            Affinity::Downstream,
+            None,
+            1,
+            &document,
+            wide,
+            1.0,
+        )
+        .unwrap();
+    assert_eq!(outside.leaf_block_id(), Some(below));
+    let (back, _, _) = flow
+        .cached_vertical_move(&outside, affinity, Some(goal_x), -1, &document, wide, 1.0)
+        .unwrap();
+    assert_eq!(back.leaf_block_id(), Some(right));
+
+    let narrow = flow.layout_visible_blocks(&document, 0.0, 180.0, wide, 0.0, 1.0, &mut shaper);
+    let left = flow
+        .caret_rect_in_visible(&left_pos, Affinity::Downstream, &narrow)
+        .unwrap();
+    let right = flow
+        .caret_rect_in_visible(&right_pos, Affinity::Downstream, &narrow)
+        .unwrap();
+    assert_eq!(left.x, right.x);
+    assert!(left.y < right.y);
+}
+
+#[test]
+fn editable_slots_preserve_children_on_edit_undo_and_copy() {
+    let (mut document, card, left, right, _) = editable_slots_document();
+    let caret = document.doc_pos_for_block(left, 2).unwrap();
+    let undo_line_break = document
+        .build_split_block_transaction(&caret, None)
+        .map(|tx| document.apply(tx).inverse)
+        .unwrap();
+    let text = |document: &Document, id| {
+        document
+            .find_block(id)
+            .unwrap()
+            .kind
+            .inline_content()
+            .unwrap()
+            .text
+            .clone()
+    };
+    assert_eq!(text(&document, left), "Al\npha");
+    let end = document.doc_pos_for_block(right, 2).unwrap();
+    let (steps, _) = document.delete_selection_steps(&caret, &end).unwrap();
+    let undo_delete = document.apply(Transaction::new(steps)).inverse;
+    assert_eq!(text(&document, left), "Al");
+    assert_eq!(text(&document, right), "ta");
+    document.apply(undo_delete);
+    document.apply(undo_line_break);
+    assert_eq!(text(&document, left), "Alpha");
+    assert_eq!(text(&document, right), "Beta");
+
+    let before = document.clone();
+    document.apply(Transaction::new(vec![
+        Step::DeleteRange {
+            block_id: left,
+            range: 0..2,
+        },
+        Step::RemoveBlockIn {
+            target: ContainerTarget::Container(card),
+            index: 1,
+        },
+    ]));
+    assert_eq!(document, before);
+
+    let mut destination = Document::new();
+    let copied = ClipboardFragment::from_document(&document)
+        .to_versioned_json()
+        .unwrap();
+    let fragment = ClipboardFragment::from_versioned_json(&copied).unwrap();
+    let blocks = fragment.to_block_nodes(&mut destination);
+    let copied_title = blocks[0].kind.editable_slot("title").unwrap();
+    let copied_body = blocks[0].kind.editable_slot("body").unwrap();
+    assert_eq!(copied_title.kind.inline_content().unwrap().text, "Alpha");
+    assert_eq!(copied_body.kind.inline_content().unwrap().text, "Beta");
+    assert_eq!(
+        blocks[0].kind.editable_slots().unwrap().layout(),
+        EditableSlotLayout::SideBySide
+    );
+}
+
 #[test]
 fn invalid_custom_metrics_fall_back_and_large_table_culls_offscreen_leaves() {
     struct BadMetricShaper;

@@ -862,6 +862,7 @@ fn encode_markdown_blocks(
                 kind,
                 data,
                 children,
+                ..
             } => {
                 if kind.as_ref() == block_kinds::BLOCKQUOTE {
                     let nested_prefix = format!("{line_prefix}> ");

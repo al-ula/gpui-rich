@@ -120,6 +120,7 @@ impl RichDocumentView {
         }
         if inline.text == "$$"
             && inline.objects.is_empty()
+            && !self.document.is_editable_slot(block_id)
             && self.extensions.has_block(EQUATION_BLOCK_KIND)
         {
             let before = self.selection.clone();

@@ -1,14 +1,17 @@
 use crate::layout::geometry::{Insets, Point, Rect, pt_to_px};
-use crate::layout::line::{HitResult, ParagraphLayout, layout_paragraph_for_block};
+use crate::layout::line::{
+    HitResult, ParagraphLayout, layout_paragraph_for_block, layout_source_paragraph,
+};
 use crate::layout::shaper::{
     GlyphBackend, TextShaper, is_valid_custom_insets, is_valid_custom_size,
 };
 use crate::model::{
     BlockId, BlockKind, BlockNode, BlockShapeKind, CellVAlign, ColumnSpec, CustomPayload, Document,
-    DocumentLayoutConfig, ListKind, NumberStyle, RgbaColor, SharedStr, StyleSheet, TableBlock,
-    TableBorderStyle, block_kinds,
+    DocumentLayoutConfig, EditableSlotLayout, ListKind, NumberStyle, RgbaColor, SharedStr,
+    StyleSheet, TableBlock, TableBorderStyle, block_kinds,
 };
 use std::collections::HashMap;
+use std::ops::Range;
 use std::sync::Arc;
 
 #[derive(Clone, Debug, PartialEq)]
@@ -89,6 +92,7 @@ pub enum BlockLayoutKind<B: GlyphBackend> {
         bounds: Rect,
         chrome: Insets,
         children: Vec<PlacedChildBlock<B>>,
+        side_by_side: bool,
     },
     CustomGrid {
         kind: SharedStr,
@@ -181,6 +185,7 @@ struct CacheKey {
 pub struct LayoutCache<B: GlyphBackend> {
     entries: HashMap<CacheKey, Arc<BlockLayout<B>>>,
     latest_by_id: HashMap<BlockId, CacheKey>,
+    source_hidden_ranges: HashMap<BlockId, Vec<Range<usize>>>,
     ordered_markers: HashMap<BlockId, Arc<str>>,
     footnote_numbers: Arc<HashMap<crate::model::AnchorId, u32>>,
 }
@@ -190,6 +195,7 @@ impl<B: GlyphBackend> Default for LayoutCache<B> {
         Self {
             entries: HashMap::new(),
             latest_by_id: HashMap::new(),
+            source_hidden_ranges: HashMap::new(),
             ordered_markers: HashMap::new(),
             footnote_numbers: Arc::default(),
         }
@@ -205,9 +211,32 @@ impl<B: GlyphBackend> LayoutCache<B> {
 
     pub fn clear(&mut self) {
         self.entries.clear();
+        self.source_hidden_ranges.clear();
         self.latest_by_id.clear();
         self.ordered_markers.clear();
         self.footnote_numbers = Arc::default();
+    }
+
+    #[cfg(feature = "gpui")]
+    pub(crate) fn set_source_hidden_ranges(
+        &mut self,
+        id: BlockId,
+        ranges: &[Range<usize>],
+    ) -> bool {
+        if self
+            .source_hidden_ranges
+            .get(&id)
+            .map_or(&[][..], Vec::as_slice)
+            == ranges
+        {
+            return false;
+        }
+        if ranges.is_empty() {
+            self.source_hidden_ranges.remove(&id);
+        } else {
+            self.source_hidden_ranges.insert(id, ranges.to_vec());
+        }
+        true
     }
 
     pub(crate) fn sync_ordered_markers(&mut self, document: &Document) {
@@ -363,16 +392,30 @@ pub fn layout_block<S: TextShaper>(
             content,
         } => match kind.as_ref() {
             block_kinds::PARAGRAPH => {
-                let para = layout_paragraph_for_block(
-                    Some(block.id),
-                    content,
-                    &block.style,
-                    sheet,
-                    config,
-                    max_width,
-                    zoom,
-                    shaper,
-                );
+                let para = if let Some(ranges) = cache.source_hidden_ranges.get(&block.id) {
+                    layout_source_paragraph(
+                        block.id,
+                        content,
+                        ranges,
+                        &block.style,
+                        sheet,
+                        config,
+                        max_width,
+                        zoom,
+                        shaper,
+                    )
+                } else {
+                    layout_paragraph_for_block(
+                        Some(block.id),
+                        content,
+                        &block.style,
+                        sheet,
+                        config,
+                        max_width,
+                        zoom,
+                        shaper,
+                    )
+                };
                 let height = para.height;
                 BlockLayout {
                     id: block.id,
@@ -572,6 +615,7 @@ pub fn layout_block<S: TextShaper>(
             kind,
             data,
             children,
+            editable_slots,
         } => {
             if kind.as_ref() == block_kinds::BLOCKQUOTE {
                 let indent_px = pt_to_px(block.style.indent_start_pt.max(14.0), zoom);
@@ -623,27 +667,47 @@ pub fn layout_block<S: TextShaper>(
                     Insets::xy(pt_to_px(12.0, zoom), pt_to_px(8.0, zoom))
                 };
                 let child_max_w = (max_width - chrome.horizontal()).max(40.0);
+                let gap = pt_to_px(12.0, zoom);
+                let column_width = editable_slots
+                    .as_ref()
+                    .filter(|slots| {
+                        children.len() > 1 && slots.layout() == EditableSlotLayout::SideBySide
+                    })
+                    .map(|_| (child_max_w + gap) / children.len() as f32 - gap)
+                    .filter(|&width| width >= pt_to_px(96.0, zoom));
+                let side_by_side = column_width.is_some();
+                let child_width = column_width.unwrap_or(child_max_w);
                 let mut placed = Vec::with_capacity(children.len());
                 let mut y = chrome.top;
+                let mut row_height = 0.0f32;
                 let mut prev_after = 0.0f32;
 
                 for (i, child) in children.iter().enumerate() {
                     let child_layout =
-                        cache.get_or_layout(child, None, sheet, config, child_max_w, zoom, shaper);
-                    if i > 0 {
+                        cache.get_or_layout(child, None, sheet, config, child_width, zoom, shaper);
+                    if !side_by_side && i > 0 {
                         y += prev_after.max(child_layout.space_before_px);
                     }
                     let ch = child_layout.height;
                     prev_after = child_layout.space_after_px;
+                    let x = if side_by_side {
+                        chrome.left + i as f32 * (child_width + gap)
+                    } else {
+                        chrome.left
+                    };
                     placed.push(PlacedChildBlock {
-                        x: chrome.left,
+                        x,
                         y,
                         layout: child_layout,
                     });
-                    y += ch;
+                    if side_by_side {
+                        row_height = row_height.max(ch);
+                    } else {
+                        y += ch;
+                    }
                 }
                 let min_h = chrome.vertical() + pt_to_px(16.0, zoom);
-                let total_h = (y + chrome.bottom).max(min_h);
+                let total_h = (y + row_height + chrome.bottom).max(min_h);
                 BlockLayout {
                     id: block.id,
                     version: block.version,
@@ -657,6 +721,7 @@ pub fn layout_block<S: TextShaper>(
                         bounds: Rect::new(0.0, 0.0, max_width, total_h),
                         chrome,
                         children: placed,
+                        side_by_side,
                     },
                 }
             }

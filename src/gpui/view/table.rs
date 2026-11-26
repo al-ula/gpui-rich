@@ -296,7 +296,11 @@ impl RichDocumentView {
             .is_some_and(|selection| match selection {
                 DocumentSelection::TableCells { .. } => true,
                 DocumentSelection::Text { focus, .. } => {
-                    super::table_cell_of(focus).is_some() && text.contains('\t')
+                    super::table_cell_of(focus).is_some()
+                        && text.contains('\t')
+                        && !focus
+                            .leaf_block_id()
+                            .is_some_and(|id| self.document.is_editable_slot(id))
                 }
             });
         if in_cell {

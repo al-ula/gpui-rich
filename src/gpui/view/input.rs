@@ -828,6 +828,7 @@ impl EntityInputHandler for RichDocumentView {
 
         if new_text.is_empty() {
             self.ime_preedit = None;
+            self.refresh_source_reveal();
             self.reset_caret_blink(cx);
             cx.notify();
             return;
@@ -848,6 +849,7 @@ impl EntityInputHandler for RichDocumentView {
             text: new_text.to_owned(),
             selected_range,
         });
+        self.refresh_source_reveal();
         self.reset_caret_blink(cx);
         cx.notify();
     }

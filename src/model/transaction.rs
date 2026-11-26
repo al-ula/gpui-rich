@@ -8,6 +8,7 @@ use crate::model::payload::CustomPayload;
 use crate::model::selection::{Affinity, DocPos, DocumentSelection, PathSegment};
 use crate::model::style::{BlockStyle, InlineStyle, NamedStyle, SharedStr, StyleId};
 use smallvec::SmallVec;
+use std::collections::HashSet;
 use std::ops::Range;
 use std::sync::Arc;
 use std::time::Duration;
@@ -220,6 +221,12 @@ pub struct AppliedTransaction {
 
 impl Document {
     pub fn apply(&mut self, tx: Transaction) -> AppliedTransaction {
+        if self.breaks_editable_slots(&tx.steps) {
+            return AppliedTransaction {
+                change_set: ChangeSet::default(),
+                inverse: Transaction::new(Vec::new()),
+            };
+        }
         let mut change_set = ChangeSet::default();
         let mut inverse_steps = Vec::with_capacity(tx.steps.len());
 
@@ -707,6 +714,55 @@ impl Document {
         }
     }
 
+    fn breaks_editable_slots(&self, steps: &[Step]) -> bool {
+        let mut introduced_parents = HashSet::new();
+        let mut introduced_slots = HashSet::new();
+        for step in steps {
+            let (id, kind) = match step {
+                Step::InsertBlock { block, .. } | Step::InsertBlockIn { block, .. } => {
+                    (block.id, &block.kind)
+                }
+                Step::SetBlockKind { block_id, kind } => (*block_id, kind),
+                _ => continue,
+            };
+            collect_editable_slots(kind, id, &mut introduced_parents, &mut introduced_slots);
+        }
+        steps.iter().any(|step| match step {
+            Step::InsertBlockIn { target, .. }
+            | Step::RemoveBlockIn { target, .. }
+            | Step::MoveBlockIn { target, .. } => {
+                let ContainerTarget::Container(id) = target else {
+                    return false;
+                };
+                self.is_slotted_target(*target) || introduced_parents.contains(id)
+            }
+            Step::SetBlockKind { block_id, kind } => {
+                let previous = self.find_block(*block_id).map(|block| &block.kind);
+                if let Some(previous) = previous.filter(|kind| kind.editable_slots().is_some()) {
+                    return previous.editable_slots() != kind.editable_slots()
+                        || previous.semantic_kind() != kind.semantic_kind()
+                        || previous
+                            .children()
+                            .into_iter()
+                            .flatten()
+                            .map(|child| child.id)
+                            .ne(kind.children().into_iter().flatten().map(|child| child.id))
+                        || kind
+                            .children()
+                            .into_iter()
+                            .flatten()
+                            .any(|child| child.kind.inline_content().is_none());
+                }
+                kind.editable_slots().is_some()
+                    || introduced_parents.contains(block_id)
+                    || (kind.inline_content().is_none()
+                        && (self.is_editable_slot(*block_id)
+                            || introduced_slots.contains(block_id)))
+            }
+            _ => false,
+        })
+    }
+
     fn repair_bookmarks_after_removal(&mut self, order: &[BlockId]) {
         use crate::model::anchors::AnchorPosition;
 
@@ -822,7 +878,10 @@ impl Document {
 
         let mut steps = Vec::new();
 
-        if start_target == end_target && start_container_index < end_container_index {
+        if start_target == end_target
+            && start_container_index < end_container_index
+            && !self.is_slotted_target(start_target)
+        {
             // Merge trailing content of `end_id` onto `start_id` and remove all covered blocks in reverse order.
             if start_offset < start_inline.len() {
                 steps.push(Step::DeleteRange {
@@ -853,7 +912,7 @@ impl Document {
                 });
             }
         } else {
-            // Cross-container selection (e.g. prose into table cell): clear covered text without breaking containers.
+            // Preserve container boundaries and required slots when clearing their text.
             if start_offset < start_inline.len() {
                 steps.push(Step::DeleteRange {
                     block_id: start_id,
@@ -900,8 +959,7 @@ impl Document {
         let inline = block.kind.inline_content()?;
         let offset = pos.offset.min(inline.len());
 
-        // Inside a code block, Enter inserts a newline rather than splitting into a second frame.
-        if block.kind.code_block_data().is_some() {
+        if self.is_slotted_target(target) || block.kind.code_block_data().is_some() {
             let mut next_pos = pos.clone();
             next_pos.offset = offset + 1;
             return Some(
@@ -1081,6 +1139,9 @@ impl Document {
         let leaf_id = pos.leaf_block_id()?;
         let (target, block_index) = self.locate_block(leaf_id)?;
         let block = self.find_block(leaf_id)?;
+        if self.is_slotted_target(target) {
+            return None;
+        }
 
         // Backspace at offset 0 of a list item or heading converts/outdents before merging upward.
         if let Some(item) = block.kind.list_item_data()
@@ -1296,6 +1357,9 @@ impl Document {
     ) -> Option<BoundaryDeleteOutcome> {
         let leaf_id = pos.leaf_block_id()?;
         let (target, block_index) = self.locate_block(leaf_id)?;
+        if self.is_slotted_target(target) {
+            return None;
+        }
         let siblings = self.container_blocks(target)?;
         let current_block = siblings.get(block_index)?;
         if current_block.kind.code_block_data().is_some() {
@@ -1417,6 +1481,9 @@ impl Document {
         selection_before: Option<DocumentSelection>,
     ) -> Option<BoundaryDeleteOutcome> {
         let leaf_id = pos.leaf_block_id()?;
+        if self.is_editable_slot(leaf_id) {
+            return None;
+        }
         let exit_block_id = if self
             .find_block(leaf_id)
             .is_some_and(|block| block.kind.code_block_data().is_some())
@@ -1569,6 +1636,9 @@ impl Document {
 
         let first_id = *block_ids.first()?;
         let (target, first_index) = self.locate_block(first_id)?;
+        if self.is_slotted_target(target) {
+            return None;
+        }
         let siblings = self.container_blocks(target)?;
         let mut min_index = first_index;
         let mut max_index = first_index;
@@ -1790,6 +1860,9 @@ impl Document {
         pos: &DocPos,
         selection_before: Option<DocumentSelection>,
     ) -> Option<Transaction> {
+        if self.is_editable_slot(pos.leaf_block_id()?) {
+            return None;
+        }
         let rule_id = self.alloc_block_id();
         let rule_block = BlockNode::new(
             rule_id,
@@ -1809,6 +1882,9 @@ impl Document {
         with_header: bool,
         selection_before: Option<DocumentSelection>,
     ) -> Option<Transaction> {
+        if self.is_editable_slot(pos.leaf_block_id()?) {
+            return None;
+        }
         let row_count = rows.max(1);
         let col_count = columns.max(1);
         let table_id = self.alloc_block_id();
@@ -2803,6 +2879,33 @@ impl Document {
                 Some((parent_target, _)) => current = parent_target,
                 None => break,
             }
+        }
+    }
+}
+
+fn collect_editable_slots(
+    kind: &BlockKind,
+    id: BlockId,
+    parents: &mut HashSet<BlockId>,
+    slots: &mut HashSet<BlockId>,
+) {
+    if let Some(children) = kind.children() {
+        if kind.editable_slots().is_some() {
+            parents.insert(id);
+            slots.extend(children.iter().map(|block| block.id));
+            return;
+        }
+        for block in children {
+            collect_editable_slots(&block.kind, block.id, parents, slots);
+        }
+    } else if let Some(table) = kind.table_block() {
+        for block in table
+            .rows
+            .iter()
+            .flat_map(|row| &row.cells)
+            .flat_map(|cell| &cell.blocks)
+        {
+            collect_editable_slots(&block.kind, block.id, parents, slots);
         }
     }
 }

@@ -2,8 +2,8 @@
 //! and normalized HTML parsing for copy/paste.
 
 use crate::model::block::{
-    BlockKind, BlockNode, BlockShapeKind, ColumnSpec, Document, ListId, ListKind, NumberStyle,
-    TableBlock, TableBorderStyle, TableCell, TableRow, block_kinds,
+    BlockKind, BlockNode, BlockShapeKind, ColumnSpec, Document, EditableSlots, ListId, ListKind,
+    NumberStyle, TableBlock, TableBorderStyle, TableCell, TableRow, block_kinds,
 };
 use crate::model::components::PlaceholderKind;
 use crate::model::inline::{
@@ -137,6 +137,8 @@ pub enum ClipboardBlock {
         kind: SharedStr,
         data: CustomPayload,
         children: Vec<ClipboardBlock>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        editable_slots: Option<EditableSlots>,
     },
     CustomGrid {
         kind: SharedStr,
@@ -321,8 +323,29 @@ fn validate_clipboard_blocks(blocks: &mut [ClipboardBlock]) -> Result<(), Clipbo
             | ClipboardBlock::CustomText { content, .. } => {
                 validate_inline_content(content)?;
             }
-            ClipboardBlock::Blockquote(children)
-            | ClipboardBlock::CustomContainer { children, .. } => {
+            ClipboardBlock::Blockquote(children) => validate_clipboard_blocks(children)?,
+            ClipboardBlock::CustomContainer {
+                children,
+                editable_slots,
+                ..
+            } => {
+                if let Some(slots) = editable_slots
+                    && (!slots.valid_names(children.len())
+                        || children.iter().any(|child| {
+                            !matches!(
+                                child,
+                                ClipboardBlock::Paragraph { .. }
+                                    | ClipboardBlock::Heading { .. }
+                                    | ClipboardBlock::ListItem { .. }
+                                    | ClipboardBlock::CodeBlock { .. }
+                                    | ClipboardBlock::CustomText { .. }
+                            )
+                        }))
+                {
+                    return Err(ClipboardFragmentError::Parse(
+                        "invalid editable slots".into(),
+                    ));
+                }
                 validate_clipboard_blocks(children)?;
             }
             ClipboardBlock::Table(table) | ClipboardBlock::CustomGrid { table, .. } => {
@@ -526,7 +549,9 @@ impl Document {
                     && anchor_cell_path != focus_cell_path;
                 let mut full_structures = Vec::new();
                 let mut root_leaf_start = 0usize;
-                for root in &self.blocks {
+                let copying_slot_text =
+                    anchor_leaf_id == focus_leaf_id && self.is_editable_slot(anchor_leaf_id);
+                for root in self.blocks.iter().filter(|_| !copying_slot_text) {
                     let leaf_count = block_text_leaf_count(root);
                     let root_leaf_end = root_leaf_start + leaf_count;
                     let covers_start = root_leaf_start > start_index
@@ -736,6 +761,7 @@ fn block_node_to_clipboard_block(block: &BlockNode) -> ClipboardBlock {
             kind,
             data,
             children,
+            editable_slots,
         } => {
             let mapped: Vec<ClipboardBlock> =
                 children.iter().map(block_node_to_clipboard_block).collect();
@@ -746,6 +772,7 @@ fn block_node_to_clipboard_block(block: &BlockNode) -> ClipboardBlock {
                     kind: kind.clone(),
                     data: data.clone(),
                     children: mapped,
+                    editable_slots: editable_slots.clone(),
                 }
             }
         }
@@ -845,6 +872,7 @@ fn extract_partial_node(
             kind,
             data,
             children,
+            editable_slots,
         } => {
             let mut extracted = Vec::new();
             for child in children {
@@ -875,10 +903,15 @@ fn extract_partial_node(
             } else if kind.as_ref() == block_kinds::BLOCKQUOTE {
                 Some(ClipboardBlock::Blockquote(extracted))
             } else {
+                let editable_slots = editable_slots
+                    .as_ref()
+                    .filter(|slots| slots.names().len() == extracted.len())
+                    .cloned();
                 Some(ClipboardBlock::CustomContainer {
                     kind: kind.clone(),
                     data: data.clone(),
                     children: extracted,
+                    editable_slots,
                 })
             }
         }
@@ -1163,6 +1196,7 @@ fn clipboard_block_to_node(
             kind,
             data,
             children,
+            editable_slots,
         } => {
             let mut child_nodes: Vec<BlockNode> = children
                 .iter()
@@ -1183,7 +1217,12 @@ fn clipboard_block_to_node(
             };
             BlockNode::new(
                 id,
-                BlockKind::raw_container(kind.clone(), data.clone(), child_nodes),
+                BlockKind::Container {
+                    kind: kind.clone(),
+                    data: data.clone(),
+                    children: child_nodes,
+                    editable_slots: editable_slots.clone(),
+                },
                 style,
             )
         }
@@ -1306,6 +1345,7 @@ fn block_to_plain_text(block: &ClipboardBlock, formatter: &dyn ClipboardCustomFo
             kind,
             data,
             children,
+            ..
         } => {
             let body = children
                 .iter()

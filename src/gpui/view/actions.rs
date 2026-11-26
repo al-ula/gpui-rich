@@ -297,6 +297,10 @@ pub enum RichDocumentEvent {
     },
     /// A [`Transaction`] mutated the underlying [`Document`].
     DocumentMutated { change_set: ChangeSet },
+    /// The exact source was edited, undone, or redone. Presentation changes do not emit this.
+    SourceEdited {
+        change: crate::model::SourceChangeSet,
+    },
     /// A [`RichCommand`] completed, no-oped, or was rejected/cancelled in the dispatcher.
     CommandExecuted {
         command_id: &'static str,

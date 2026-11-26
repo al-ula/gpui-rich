@@ -17,14 +17,51 @@ use gpui_rich::layout::{InlineBoxMetrics, Insets, pt_to_px};
 use gpui_rich::model::{
     BaselineShift, BlockByteRange, BlockKind, BlockNode, BlockSpec, BlockStyle, BlockWidth,
     ChipKind, ColumnSpec, DecorationContext, DecorationProvider, DecorationWriter, Document, Edges,
-    EquationBlockData, EquationBlockSpec, ExportDocument, FontWeight, HorizontalLayout,
-    ImageAssetId, InlineContent, InlineDecorationStyle, InlineEquationData, InlineEquationSpec,
-    InlineObject, InlineSpec, InlineStyle, InlineVAlign, InteractionPolicy, ListId, ListKind,
-    MarkKind, MarkdownCodec, MermaidData, MermaidSpec, NumberStyle, PaperSpec, RgbaColor,
-    RichCommand, SelectionValue, StyleId, TableBlock, TableBorderStyle, TableCell, TableRow,
-    TextAlign, UnderlineKind, block_shape,
+    EditableSlotLayout, EquationBlockData, EquationBlockSpec, ExportDocument, FontWeight,
+    HorizontalLayout, ImageAssetId, InlineContent, InlineDecorationStyle, InlineEquationData,
+    InlineEquationSpec, InlineObject, InlineSpec, InlineStyle, InlineVAlign, InteractionPolicy,
+    ListId, ListKind, MarkKind, MarkdownCodec, MermaidData, MermaidSpec, NumberStyle, PaperSpec,
+    RgbaColor, RichCommand, SelectionValue, StyleId, TableBlock, TableBorderStyle, TableCell,
+    TableRow, TextAlign, UnderlineKind, block_shape,
 };
+use gpui_rich::model::{SourceBuffer, SourceChangeSet, SourceLinePresentation, SourcePresentation};
 use serde::{Deserialize, Serialize};
+
+struct SourceDemoPresentation;
+
+impl SourcePresentation for SourceDemoPresentation {
+    fn project(
+        &mut self,
+        source: &SourceBuffer,
+        _change: Option<&SourceChangeSet>,
+    ) -> Vec<SourceLinePresentation> {
+        source
+            .lines()
+            .iter()
+            .enumerate()
+            .filter_map(|(line, range)| {
+                let text = &source.text()[range.clone()];
+                if text.starts_with("# ") {
+                    return Some(SourceLinePresentation {
+                        line,
+                        style: BlockStyle::named(StyleId::HEADING_1),
+                        hidden: std::iter::once(0..2).collect(),
+                    });
+                }
+                let (_, value) = text.split_once(" = ")?;
+                let value_start = text.len() - value.len();
+                let value_end = text.len();
+                (value.len() >= 2 && value.starts_with('"') && value.ends_with('"')).then(|| {
+                    SourceLinePresentation {
+                        line,
+                        style: BlockStyle::default(),
+                        hidden: vec![value_start..value_start + 1, value_end - 1..value_end],
+                    }
+                })
+            })
+            .collect()
+    }
+}
 
 struct RustSyntaxDecorationProvider;
 
@@ -870,6 +907,10 @@ impl DocsViewerApp {
                         format!("Mutated {} block(s)", change_set.dirty_blocks.len()).into();
                     cx.notify();
                 }
+                RichDocumentEvent::SourceEdited { change } => {
+                    this.status_message = format!("Source revision {}", change.revision).into();
+                    cx.notify();
+                }
                 RichDocumentEvent::SelectionChanged { .. } => {
                     view.update(cx, |document_view, cx| {
                         sync_selection_bubble_overlay(document_view, cx);
@@ -980,6 +1021,7 @@ impl Render for DocsViewerApp {
         let active_margins = view_state.margins_pt;
         let debug_active = view_state.debug_overlay;
         let policy = view_state.policy;
+        let reveal_source = self.document_view.read(cx).source_syntax_revealed();
         if !policy.editing.enabled {
             self.font_menu_open = false;
         }
@@ -1015,6 +1057,41 @@ impl Render for DocsViewerApp {
                     .text_color(title_color)
                     .mr(px(6.0))
                     .child("gpui-rich"),
+            )
+            .child(
+                Self::toolbar_button(
+                    "source-demo",
+                    match reveal_source {
+                        None => "Source Demo",
+                        Some(false) => "Show Syntax",
+                        Some(true) => "Hide Syntax",
+                    },
+                    reveal_source == Some(true),
+                    dark,
+                )
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(|this, _event, _window, cx| {
+                        this.document_view.update(cx, |view, cx| {
+                            if let Some(revealed) = view.source_syntax_revealed() {
+                                view.reveal_source(!revealed, cx);
+                            } else {
+                                let source = "# Source-backed editing\r\n\
+                                    Click before the heading and press Backspace to delete its hidden space.\n\
+                                    \n\
+                                    title = \"A TOML-style value\"\n\
+                                    Show Syntax reveals the original delimiters without editing the file.";
+                                view.set_source_buffer(SourceBuffer::new(source.into()), cx);
+                                view.set_source_presentation(
+                                    Some(Box::new(SourceDemoPresentation)),
+                                    cx,
+                                );
+                                view.set_policy(InteractionPolicy::editable(), cx);
+                            }
+                        });
+                        cx.notify();
+                    }),
+                ),
             )
             .child(
                 Self::toolbar_button("mode-paper", "Paper", !is_fill, dark).on_mouse_down(
@@ -2522,20 +2599,36 @@ fn build_sample_document(assets: &MemoryAssetProvider) -> Document {
     );
     document.add_paragraph(ext_intro, BlockStyle::default());
 
+    let mut title = InlineContent::empty();
+    title.push_text("Editable card title", InlineStyle::bold());
+    let callout_title = BlockNode::new(
+        document.alloc_block_id(),
+        BlockKind::paragraph(title),
+        BlockStyle::default(),
+    );
     let callout_body_id = document.alloc_block_id();
     let callout_body = BlockNode::new(
         callout_body_id,
         BlockKind::paragraph(InlineContent::plain(
-            "This paragraph lives inside a BlockKind::Container(\"callout\") with a strongly typed CalloutData payload. Click here to select, format, or press Enter to split paragraphs inside the card.",
+            "This body and the title are native text slots. Select across them, or press Enter to add a line without creating a new slot.",
         )),
         BlockStyle::default(),
     );
-    document.add_container_block::<CalloutBlockSpec>(
+    if let Some(kind) = BlockKind::slotted_container::<CalloutBlockSpec>(
         CalloutData {
-            title: "Editable Custom Container Block".into(),
+            title: "EDITABLE CARD".into(),
         },
-        vec![callout_body],
-    );
+        EditableSlotLayout::SideBySide,
+        vec![
+            ("title".into(), callout_title),
+            ("body".into(), callout_body),
+        ],
+    ) {
+        let card = BlockNode::new(document.alloc_block_id(), kind, BlockStyle::default());
+        document.push_block(card);
+    } else {
+        eprintln!("docs_viewer: invalid editable card slots");
+    }
 
     document.add_leaf_block::<MermaidSpec>(
         MermaidData::new(

@@ -224,6 +224,7 @@ fn write_single_block_html(
             kind,
             data,
             children,
+            ..
         } => {
             if let Some(custom_html) = formatter.html_block(BlockShapeKind::Container, kind, data) {
                 output.push_str(&custom_html);

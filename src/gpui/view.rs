@@ -51,6 +51,7 @@ pub(crate) mod components;
 mod input;
 mod navigation;
 mod queries;
+mod source;
 mod structure;
 mod table;
 
@@ -73,6 +74,7 @@ const CLIPBOARD_FRAGMENT_METADATA_KEY: &str = "gpui_rich_fragment_v1";
 /// Interactive viewer and rich text editor host for a non-paginated document.
 pub struct RichDocumentView {
     pub document: Document,
+    source: Option<Box<source::SourceView>>,
     pub history: History,
     pub flow: FlowLayout<GpuiGlyphBackend>,
     pub selection: Option<DocumentSelection>,
@@ -135,6 +137,7 @@ impl RichDocumentView {
     pub fn new(document: Document, cx: &mut Context<Self>) -> Self {
         Self {
             document,
+            source: None,
             history: History::default(),
             flow: FlowLayout::default(),
             selection: None,
@@ -369,6 +372,11 @@ impl RichDocumentView {
     /// Builds the GPUI [`ClipboardItem`] for the active selection, carrying plain text plus
     /// HTML and versioned structured fragment metadata for same-process rich paste.
     pub fn clipboard_item_for_selection(&self) -> Option<ClipboardItem> {
+        if let Some(source) = self.source_buffer() {
+            let range = self.source_selection()?;
+            return (!range.is_empty())
+                .then(|| ClipboardItem::new_string(source.text()[range].to_owned()));
+        }
         let fragment = self.selected_fragment()?;
         let formatter = clipboard::ComponentClipboardFormatter::new(self);
         let plain_text = fragment.to_plain_text_with(&formatter);
@@ -403,7 +411,7 @@ impl RichDocumentView {
         cx: &mut Context<Self>,
     ) -> CommandOutcome {
         let plain_text = item.text();
-        if !plain_text_only && self.policy.can_paste_rich_text() {
+        if self.source.is_none() && !plain_text_only && self.policy.can_paste_rich_text() {
             let html = extract_clipboard_html(item);
             if let Some(fragment) = extract_clipboard_fragment(item) {
                 return self.dispatch_command(
@@ -487,6 +495,7 @@ impl RichDocumentView {
 
     /// Replaces the displayed [`Document`], resetting selection, undo history, and layout cache.
     pub fn replace_document(&mut self, document: Document, cx: &mut Context<Self>) {
+        self.source = None;
         self.document = document;
         self.document_revision = self.document_revision.wrapping_add(1);
         self._paste_task = Task::ready(());
@@ -519,6 +528,9 @@ impl RichDocumentView {
         delta: &SyncDelta,
         cx: &mut Context<Self>,
     ) -> bool {
+        if self.source.is_some() {
+            return false;
+        }
         let Some(transaction) = bridge.apply_remote_delta(delta, &self.document) else {
             return false;
         };

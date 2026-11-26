@@ -5,7 +5,7 @@ use crate::layout::shaper::{
 };
 use crate::model::{
     Affinity, BlockId, BlockStyle, DocumentLayoutConfig, InlineContent, InlineObject,
-    InlineObjectId, InlineVAlign, LineHeight, LinkTarget, OBJECT_REPLACEMENT_CHAR,
+    InlineObjectId, InlineStyle, InlineVAlign, LineHeight, LinkTarget, OBJECT_REPLACEMENT_CHAR,
     ResolvedTextStyle, RgbaColor, StyleSheet, TextAlign, TextDirection, UnderlineKind,
 };
 use std::ops::Range;
@@ -347,10 +347,34 @@ pub struct ParagraphLayout<B: GlyphBackend> {
     pub width: f32,
     pub height: f32,
     pub lines: Vec<VisualLine<B>>,
+    hidden_ranges: Vec<Range<usize>>,
 }
 
 impl<B: GlyphBackend> ParagraphLayout<B> {
     pub fn hit_test(&self, local_point: Point) -> HitResult {
+        let mut hit = self.hit_test_geometry(local_point);
+        if let Some(range) = self
+            .hidden_ranges
+            .iter()
+            .find(|range| range.start <= hit.offset && hit.offset <= range.end)
+        {
+            let line = &self.lines[self.line_index_for_pos(hit.offset, hit.affinity)];
+            if !line.fragments.is_empty()
+                && range.start > line.doc_range.start
+                && self
+                    .lines
+                    .last()
+                    .is_some_and(|last| range.end == last.doc_range.end)
+            {
+                hit.offset = range.start;
+            } else {
+                hit.offset = range.end;
+            }
+        }
+        hit
+    }
+
+    fn hit_test_geometry(&self, local_point: Point) -> HitResult {
         if self.lines.is_empty() {
             return HitResult {
                 offset: 0,
@@ -797,6 +821,7 @@ pub(crate) fn layout_paragraph_for_block<S: TextShaper>(
                 base_direction_rtl: block_style.direction == TextDirection::Rtl,
                 fragments: Vec::new(),
             }],
+            hidden_ranges: Vec::new(),
         };
     }
 
@@ -1061,7 +1086,113 @@ pub(crate) fn layout_paragraph_for_block<S: TextShaper>(
         width: max_width,
         height: y,
         lines: visual_lines,
+        hidden_ranges: Vec::new(),
     }
+}
+
+// Shape and wrap only visible text, then map geometry and glyph indices back to source.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn layout_source_paragraph<S: TextShaper>(
+    block_id: BlockId,
+    content: &InlineContent,
+    ranges: &[Range<usize>],
+    style: &BlockStyle,
+    sheet: &StyleSheet,
+    config: &DocumentLayoutConfig,
+    max_width: f32,
+    zoom: f32,
+    shaper: &mut S,
+) -> ParagraphLayout<S::Backend> {
+    let text = &content.text;
+    let mut seams: Vec<(usize, Range<usize>)> = Vec::new();
+    let mut visible = InlineContent::empty();
+    let mut cursor = 0;
+    for range in ranges {
+        if range.start < cursor || range.is_empty() || text.get(range.clone()).is_none() {
+            continue;
+        }
+        visible.push_text(&text[cursor..range.start], InlineStyle::default());
+        if let Some((_, previous)) = seams.last_mut()
+            && previous.end == range.start
+        {
+            previous.end = range.end;
+        } else {
+            seams.push((visible.len(), range.clone()));
+        }
+        cursor = range.end;
+    }
+    visible.push_text(&text[cursor..], InlineStyle::default());
+    let mut layout = layout_paragraph_for_block(
+        Some(block_id),
+        &visible,
+        style,
+        sheet,
+        config,
+        max_width,
+        zoom,
+        shaper,
+    );
+    let remap = |offset: usize, after: bool| {
+        let index = seams.partition_point(|(seam, _)| *seam < offset);
+        if let Some((seam, range)) = seams.get(index)
+            && *seam == offset
+        {
+            return if after { range.end } else { range.start };
+        }
+        index.checked_sub(1).map_or(offset, |previous| {
+            let (seam, range) = &seams[previous];
+            range.end + (offset - seam)
+        })
+    };
+    for line in &mut layout.lines {
+        let start = remap(line.doc_range.start, line.doc_range.start != 0);
+        line.doc_range = start..remap(line.doc_range.end, true);
+        for fragment in &mut line.fragments {
+            match fragment {
+                LineFragment::Text(text) => {
+                    let mut points: Vec<(usize, f32)> = Vec::with_capacity(text.x_for_byte.len());
+                    let mut seam_index =
+                        seams.partition_point(|(offset, _)| *offset < text.doc_range.start);
+                    for (offset, x) in text.x_for_byte.drain(..) {
+                        while let Some((seam, range)) = seams.get(seam_index)
+                            && *seam <= offset
+                        {
+                            let seam_x = if *seam == offset {
+                                x
+                            } else if let Some(&(previous, previous_x)) = points.last() {
+                                let ratio = (range.start - previous) as f32
+                                    / (remap(offset, false) - previous) as f32;
+                                previous_x + (x - previous_x) * ratio
+                            } else {
+                                x
+                            };
+                            points.push((range.start, seam_x));
+                            if *seam < offset {
+                                points.push((range.end, seam_x));
+                            }
+                            seam_index += 1;
+                        }
+                        points.push((remap(offset, true), x));
+                    }
+                    text.x_for_byte = points;
+                    text.doc_range =
+                        remap(text.doc_range.start, false)..remap(text.doc_range.end, true);
+                    for run in &mut text.runs {
+                        for glyph in &mut run.glyphs {
+                            glyph.byte_index = remap(glyph.byte_index, true);
+                        }
+                    }
+                }
+                LineFragment::Tab(tab) => {
+                    tab.doc_range =
+                        remap(tab.doc_range.start, true)..remap(tab.doc_range.end, false);
+                }
+                LineFragment::InlineBox(_) => {}
+            }
+        }
+    }
+    layout.hidden_ranges = seams.into_iter().map(|(_, range)| range).collect();
+    layout
 }
 
 fn resolve_line_height(spec: LineHeight, natural: f32, zoom: f32) -> f32 {
@@ -1165,7 +1296,12 @@ fn itemize_and_shape<S: TextShaper>(
         for (rel_idx, ch) in content.text[span.range.clone()].char_indices() {
             let abs_idx = span.range.start + rel_idx;
             let ch_len = ch.len_utf8();
-            if ch == OBJECT_REPLACEMENT_CHAR || ch == '\t' || ch == '\n' {
+            let object = if ch == OBJECT_REPLACEMENT_CHAR {
+                content.object_at(abs_idx)
+            } else {
+                None
+            };
+            if object.is_some() || ch == '\t' || ch == '\n' {
                 if abs_idx > cursor {
                     push_text_run(
                         &mut pending_text,
@@ -1187,7 +1323,7 @@ fn itemize_and_shape<S: TextShaper>(
                     items.push(ShapedItem::HardBreak {
                         doc_range: abs_idx..(abs_idx + ch_len),
                     });
-                } else if let Some(entry) = content.object_at(abs_idx) {
+                } else if let Some(entry) = object {
                     let object = shaper
                         .resolve_inline_object(&entry.object)
                         .unwrap_or_else(|| entry.object.clone());
@@ -1683,5 +1819,61 @@ fn apply_justification<B: GlyphBackend>(
                 t.x += cumulative_shift;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod source_tests {
+    use super::*;
+    use crate::layout::MockShaper;
+
+    #[test]
+    fn source_preserving_layout_keeps_collapsed_boundaries_and_glyph_offsets() {
+        let content = InlineContent::plain("# key=\"é\"");
+        let hidden = [0..2, 6..7, 9..10];
+        let style = BlockStyle::default();
+        let sheet = StyleSheet::default();
+        let config = DocumentLayoutConfig::default();
+        let layout = layout_source_paragraph(
+            BlockId(1),
+            &content,
+            &hidden,
+            &style,
+            &sheet,
+            &config,
+            500.0,
+            1.0,
+            &mut MockShaper,
+        );
+        let caret = |offset| layout.caret_rect(offset, Affinity::Downstream);
+        for range in hidden {
+            assert_eq!(caret(range.start).x, caret(range.end).x);
+            assert!(layout.selection_rects(range, false).is_empty());
+        }
+        let line = &layout.lines[0];
+        assert_eq!(
+            layout
+                .hit_test(Point::new(caret(2).x, line.rect.center().y))
+                .offset,
+            2
+        );
+        assert_eq!(
+            layout
+                .hit_test(Point::new(caret(9).x + 4.0, line.rect.center().y))
+                .offset,
+            9
+        );
+        let bytes: Vec<_> = line
+            .fragments
+            .iter()
+            .filter_map(|fragment| match fragment {
+                LineFragment::Text(text) => Some(text),
+                _ => None,
+            })
+            .flat_map(|text| &text.runs)
+            .flat_map(|run| &run.glyphs)
+            .map(|glyph| glyph.byte_index)
+            .collect();
+        assert_eq!(bytes, vec![2, 3, 4, 5, 7]);
     }
 }
